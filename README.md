@@ -1,6 +1,7 @@
 ## Fork of forge to use Chroma!
 
-This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled. I am only making this to simplify things. all credit goes to croquelois!  
+This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks @croquelois && @lllyasviel !  
+I am going to keep updating it with new features. Suggestions are welcome.  
 
 To use:  
 Download one of the t5xxl text encoders from https://huggingface.co/silveroxides/t5xxl_flan_enc and place in models/text_encoder.  

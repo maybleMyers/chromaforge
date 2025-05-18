@@ -51,82 +51,26 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
     p.scripts = modules.scripts.scripts_txt2img
     p.script_args = args
 
-    p.user = request.username
+    p.user = request.username if request else None
 
     if shared.opts.enable_console_prompts:
         print(f"\ntxt2img: {prompt}", file=shared.progress_print_out)
-
+    
     return p
 
 
-def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
-    assert len(gallery) > 0, 'No image to upscale'
-
-    if gallery_index < 0 or gallery_index >= len(gallery):
-        return gallery, generation_info, f'Bad image index: {gallery_index}', ''
-
-    geninfo = json.loads(generation_info)
-
-    #   catch situation where user tries to hires-fix the grid: probably a mistake, results can be bad aspect ratio - just don't do it
-    first_image_index = geninfo.get('index_of_first_image', 0)
-    #   catch if user tries to upscale a control image, this function will fail later trying to get infotext that doesn't exist
-    count_images = len(geninfo.get('infotexts'))        #   note: we have batch_size in geninfo, but not batch_count
-    if len(gallery) > 1 and (gallery_index < first_image_index or gallery_index >= count_images):
-        return gallery, generation_info, 'Unable to upscale grid or control images.', ''
-
-    p = txt2img_create_processing(id_task, request, *args, force_enable_hr=True)
-    p.batch_size = 1
-    p.n_iter = 1
-    # txt2img_upscale attribute that signifies this is called by txt2img_upscale
-    p.txt2img_upscale = True
-
-    image_info = gallery[gallery_index]
-    p.firstpass_image = infotext_utils.image_from_url_text(image_info)
-
-    parameters = parse_generation_parameters(geninfo.get('infotexts')[gallery_index], [])
-    p.seed = parameters.get('Seed', -1)
-    p.subseed = parameters.get('Variation seed', -1)
-
-    #   update processing width/height based on actual dimensions of source image
-    p.width = gallery[gallery_index][0].size[0]
-    p.height = gallery[gallery_index][0].size[1]
-    p.extra_generation_params['Original Size'] = f'{args[8]}x{args[7]}'
-
-    p.override_settings['save_images_before_highres_fix'] = False
+def txt2img_function_wrapper(id_task_gradio_progress: str, request: gr.Request, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt_str, hr_cfg: float, hr_distilled_cfg_float, override_settings_texts, *script_args):
+    p = txt2img_create_processing(
+        id_task_gradio_progress, request, prompt, negative_prompt, prompt_styles,
+        n_iter, batch_size, cfg_scale, distilled_cfg_scale, height, width, enable_hr,
+        denoising_strength, hr_scale, hr_upscaler, hr_second_pass_steps,
+        hr_resize_x, hr_resize_y, hr_checkpoint_name, hr_additional_modules,
+        hr_sampler_name, hr_scheduler, hr_prompt, hr_negative_prompt_str, hr_cfg, hr_distilled_cfg_float,
+        override_settings_texts, *script_args
+    )
 
     with closing(p):
         processed = modules.scripts.scripts_txt2img.run(p, *p.script_args)
-
-        if processed is None:
-            processed = processing.process_images(p)
-
-    shared.total_tqdm.clear()
-
-    insert = getattr(shared.opts, 'hires_button_gallery_insert', False)
-    new_gallery = []
-    for i, image in enumerate(gallery):
-        if insert or i != gallery_index:
-            image[0].already_saved_as = image[0].filename.rsplit('?', 1)[0]
-            new_gallery.append(image)
-        if i == gallery_index:
-            new_gallery.extend(processed.images)
-        
-    new_index = gallery_index
-    if insert:
-        new_index += 1
-        geninfo["infotexts"].insert(new_index, processed.info)
-    else:
-        geninfo["infotexts"][gallery_index] = processed.info
-
-    return new_gallery, json.dumps(geninfo), plaintext_to_html(processed.info), plaintext_to_html(processed.comments, classname="comments")
-
-
-def txt2img_function(id_task: str, request: gr.Request, *args):
-    p = txt2img_create_processing(id_task, request, *args)
-
-    with closing(p):
-        processed = modules.scripts.scripts_txt2img.run(p, *p.script_args)
-
         if processed is None:
             processed = processing.process_images(p)
 
@@ -141,10 +85,112 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
 
     return processed.images + processed.extra_images, generation_info_js, plaintext_to_html(processed.info), plaintext_to_html(processed.comments, classname="comments")
 
+def txt2img_upscale_function_wrapper(id_task_gradio_progress: str, request: gr.Request, gallery, gallery_index, generation_info, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt_str, hr_cfg: float, hr_distilled_cfg_float, override_settings_texts, *script_args):
+    assert len(gallery) > 0, 'No image to upscale'
 
-def txt2img_upscale(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
-    return main_thread.run_and_wait_result(txt2img_upscale_function, id_task, request, gallery, gallery_index, generation_info, *args)
+    if gallery_index < 0 or gallery_index >= len(gallery):
+        error_html = plaintext_to_html(f'Bad image index: {gallery_index}', classname="error")
+        return gallery, generation_info, error_html, ""
+    
+    p = txt2img_create_processing(
+        id_task_gradio_progress, request, prompt, negative_prompt, prompt_styles,
+        n_iter, batch_size, cfg_scale, distilled_cfg_scale, height, width, True, 
+        denoising_strength, hr_scale, hr_upscaler, hr_second_pass_steps,
+        hr_resize_x, hr_resize_y, hr_checkpoint_name, hr_additional_modules,
+        hr_sampler_name, hr_scheduler, hr_prompt, hr_negative_prompt_str, hr_cfg, hr_distilled_cfg_float,
+        override_settings_texts, *script_args
+    )
+    p.batch_size = 1
+    p.n_iter = 1
+    p.txt2img_upscale = True
+
+    geninfo = json.loads(generation_info)
+    image_info = gallery[gallery_index]
+    
+    image_path_or_url = None
+    if isinstance(image_info, dict) and "name" in image_info:
+        image_path_or_url = image_info["name"]
+    elif isinstance(image_info, list) and image_info and isinstance(image_info[0], dict) and "name" in image_info[0]:
+        image_path_or_url = image_info[0]["name"]
+    else:
+        image_path_or_url = image_info
+
+    p.firstpass_image = infotext_utils.image_from_url_text(image_path_or_url)
+
+    infotexts_array = geninfo.get('infotexts', [])
+    if not infotexts_array or gallery_index >= len(infotexts_array):
+         error_html = plaintext_to_html(f'Infotext not found for image index: {gallery_index}', classname="error")
+         return gallery, generation_info, error_html, ""
+
+    parameters = parse_generation_parameters(infotexts_array[gallery_index], [])
+    p.seed = parameters.get('Seed', -1)
+    p.subseed = parameters.get('Variation seed', -1)
+
+    p.width = p.firstpass_image.width
+    p.height = p.firstpass_image.height
+    p.extra_generation_params['Original Size'] = f'{width}x{height}'
+
+    p.override_settings['save_images_before_highres_fix'] = False
+
+    with closing(p):
+        processed = modules.scripts.scripts_txt2img.run(p, *p.script_args)
+        if processed is None:
+            processed = processing.process_images(p)
+
+    shared.total_tqdm.clear()
+
+    insert = getattr(shared.opts, 'hires_button_gallery_insert', False)
+    new_gallery_output = []
+    
+    original_gallery_filepaths = [g_item[0].get("name") if isinstance(g_item, list) and g_item and isinstance(g_item[0], dict) else g_item.get("name") if isinstance(g_item, dict) else g_item for g_item in gallery]
+
+    for i, img_path_or_pil in enumerate(original_gallery_filepaths):
+        if insert or i != gallery_index:
+            current_gallery_item = gallery[i]
+            if isinstance(current_gallery_item, str):
+                 new_gallery_output.append(current_gallery_item)
+            elif isinstance(current_gallery_item, list) and current_gallery_item and isinstance(current_gallery_item[0], dict) and "name" in current_gallery_item[0]:
+                 new_gallery_output.append(current_gallery_item)
+            elif isinstance(current_gallery_item, dict) and "name" in current_gallery_item:
+                 new_gallery_output.append(current_gallery_item)
+            else: 
+                if hasattr(img_path_or_pil, 'filename'):
+                    dummy_pil = Image.new("RGB", (1,1)) 
+                    dummy_pil.already_saved_as = img_path_or_pil.filename.rsplit('?',1)[0]
+                    new_gallery_output.append(dummy_pil)
+                else: 
+                    new_gallery_output.append(img_path_or_pil)
+
+        if i == gallery_index:
+            new_gallery_output.extend(processed.images) 
+    
+    new_geninfo_infotexts = list(geninfo["infotexts"])
+    new_active_index = gallery_index
+    if insert:
+        new_active_index += 1
+        new_geninfo_infotexts.insert(new_active_index, processed.info)
+    else:
+        if gallery_index < len(new_geninfo_infotexts):
+             new_geninfo_infotexts[gallery_index] = processed.info
+        else:
+             new_geninfo_infotexts.append(processed.info)
+
+    geninfo["infotexts"] = new_geninfo_infotexts
+    
+    return new_gallery_output, json.dumps(geninfo), plaintext_to_html(processed.info), plaintext_to_html(processed.comments, classname="comments")
 
 
 def txt2img(id_task: str, request: gr.Request, *args):
-    return main_thread.run_and_wait_result(txt2img_function, id_task, request, *args)
+    return main_thread.run_and_wait_result(txt2img_function_wrapper, 
+                                           id_task, 
+                                           request, 
+                                           *args, 
+                                           gradio_progress_id=id_task)
+
+
+def txt2img_upscale(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
+    return main_thread.run_and_wait_result(txt2img_upscale_function_wrapper,
+                                           id_task, 
+                                           request, gallery, gallery_index, generation_info, 
+                                           *args, 
+                                           gradio_progress_id=id_task)

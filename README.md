@@ -1,6 +1,6 @@
 ## Fork of forge to use Chroma!
 
-This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks @croquelois && @lllyasviel !  
+This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks Thanks to [@croquelois](https://github.com/croquelois) && [@lllyasviel](https://github.com/lllyasviel)!   
 I am going to keep updating it with new features. Suggestions are welcome.  
 
 To use:  

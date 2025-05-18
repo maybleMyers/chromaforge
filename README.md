@@ -9,6 +9,7 @@ Download the vae from https://huggingface.co/black-forest-labs/FLUX.1-schnell/tr
 Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie chroma-unlocked-v29.5.safetensors and place in models/Stable-diffusion.  
 
 run webui-user.bat or install manually for linux.  
+After you first run webui-user.bat it might error, if so, close it and re run it.  
 
 in Forge, on the top left select all and not flux  
 select the checkpoint and then in the next field select the text encoder and vae.  

@@ -102,16 +102,17 @@ def compile_conditions(cond):
         return [result, ]
 
     cross_attn = cond['crossattn']
-    pooled_output = cond['vector']
 
     result = dict(
         cross_attn=cross_attn,
-        pooled_output=pooled_output,
         model_conds=dict(
-            c_crossattn=ConditionCrossAttn(cross_attn),
-            y=Condition(pooled_output)
+            c_crossattn=ConditionCrossAttn(cross_attn)
         )
     )
+
+    if 'vector' in cond:
+        result['pooled_output'] = cond['vector']
+        result['model_conds']['y'] = Condition(cond['vector'])
 
     if 'guidance' in cond:
         result['model_conds']['guidance'] = Condition(cond['guidance'])

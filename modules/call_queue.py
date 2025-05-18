@@ -23,25 +23,35 @@ def wrap_queued_call(func):
 def wrap_gradio_gpu_call(func, extra_outputs=None):
     @wraps(func)
     def f(*args, **kwargs):
-
-        # if the first argument is a string that says "task(...)", it is treated as a job id
         if args and type(args[0]) == str and args[0].startswith("task(") and args[0].endswith(")"):
             id_task = args[0]
-            progress.add_task_to_queue(id_task)
+            #print(f"PYTHON call_queue: Received task_id='{id_task}' from JS as args[0]. Timestamp: {time.time()}")
+            progress.add_task_to_queue(id_task) # Task is added here
+            #print(f"PYTHON call_queue: Added task_id='{id_task}' to pending_tasks. Pending: {list(progress.pending_tasks.keys())}. Timestamp: {time.time()}")
         else:
-            id_task = None
+            id_task = None # This should ideally not happen for user-initiated generations
+            #print(f"PYTHON call_queue: No task_id received from JS. args[0]={args[0] if args else 'No args'}. Timestamp: {time.time()}")
 
+        # The queue_lock serializes the execution of the main part of the task
+        # If another task is running, this call will block here until the lock is acquired.
+        # The task_id is already in pending_tasks *before* this lock.
+        #print(f"PYTHON call_queue: Task '{id_task}' attempting to acquire queue_lock. Timestamp: {time.time()}")
         with queue_lock:
+            #print(f"PYTHON call_queue: Task '{id_task}' acquired queue_lock. Timestamp: {time.time()}")
             shared.state.begin(job=id_task)
-            progress.start_task(id_task)
+            # start_task moves it from pending_tasks to current_task
+            progress.start_task(id_task) 
+            #print(f"PYTHON call_queue: Task '{id_task}' started (moved from pending to current). Pending: {list(progress.pending_tasks.keys())}, Current: {progress.current_task}. Timestamp: {time.time()}")
 
             try:
                 res = func(*args, **kwargs)
                 progress.record_results(id_task, res)
             finally:
                 progress.finish_task(id_task)
+                #print(f"PYTHON call_queue: Task '{id_task}' finished. Pending: {list(progress.pending_tasks.keys())}, Current: {progress.current_task}. Timestamp: {time.time()}")
 
             shared.state.end()
+            #print(f"PYTHON call_queue: Task '{id_task}' released queue_lock. Timestamp: {time.time()}")
 
         return res
 

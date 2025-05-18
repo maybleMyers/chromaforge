@@ -47,9 +47,15 @@ function formatTime(secs) {
 
 
 var originalAppTitle = undefined;
+var browserSessionId = null;
 
 onUiLoaded(function() {
     originalAppTitle = document.title;
+    // Generate a unique session ID for this browser window
+    if (!browserSessionId) {
+        browserSessionId = 'session-' + Math.random().toString(36).substring(2, 15);
+        console.log('Browser session ID:', browserSessionId);
+    }
 });
 
 function setTitle(progress) {
@@ -64,7 +70,7 @@ function setTitle(progress) {
     }
 }
 
-
+//to
 function randomId() {
     return "task(" + Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7) + ")";
 }
@@ -72,19 +78,19 @@ function randomId() {
 // starts sending progress requests to "/internal/progress" uri, creating progressbar above progressbarContainer element and
 // preview inside gallery element. Cleans up all created stuff when the task is over and calls atEnd.
 // calls onProgress every time there is a progress update
-function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgress, inactivityTimeout = 6000) {
+function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgress, inactivityTimeout = 40) {
+    // We'll use browserSessionId for tracking but keep the original task ID
     var dateStart = new Date();
     var wasEverActive = false;
     var parentProgressbar = progressbarContainer.parentNode;
     var wakeLock = null;
 
     var requestWakeLock = async function() {
-        if (!opts.prevent_screen_sleep_during_generation || wakeLock !== null) return;
+        if (!opts.prevent_screen_sleep_during_generation || wakeLock) return;
         try {
             wakeLock = await navigator.wakeLock.request('screen');
         } catch (err) {
             console.error('Wake Lock is not supported.');
-            wakeLock = false;
         }
     };
 
@@ -169,7 +175,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
             }
 
             setTimeout(() => {
-                funProgress(id_task); // CORRECTED: Only pass id_task
+                funProgress(id_task, res.id_live_preview);
             }, opts.live_preview_refresh_period || 500);
         }, function() {
             removeProgressBar();

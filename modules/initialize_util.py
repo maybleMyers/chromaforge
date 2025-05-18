@@ -177,18 +177,39 @@ def configure_sigint_handler():
 
 
 def configure_opts_onchange():
-    from modules import shared, sd_models, sd_vae, ui_tempdir
-    from modules.call_queue import wrap_queued_call
-    from modules_forge import main_thread
+    from modules import shared, sd_models, sd_vae, ui_tempdir #, sd_hijack
+    from modules.call_queue import wrap_queued_call # Keep for non-main_thread onchange if any
+    from modules_forge import main_thread # For g_queue_lock
 
-    # shared.opts.onchange("sd_model_checkpoint", wrap_queued_call(lambda: main_thread.run_and_wait_result(sd_models.reload_model_weights)), call=False)
-    # shared.opts.onchange("sd_vae", wrap_queued_call(lambda: main_thread.run_and_wait_result(sd_vae.reload_vae_weights)), call=False)
-    shared.opts.onchange("sd_vae_overrides_per_model_preferences", wrap_queued_call(lambda: main_thread.run_and_wait_result(sd_vae.reload_vae_weights)), call=False)
-    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
-    shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
+    # For onchange handlers that MUST run synchronously during init if triggered
+    def sync_reload_vae_weights():
+        with main_thread.g_queue_lock: # Use the same lock as main_thread.Task.work
+                                       # to ensure serialization if other tasks are somehow running.
+                                       # This assumes sd_vae.reload_vae_weights() is safe to call directly.
+            sd_vae.reload_vae_weights()
+
+    def sync_reload_model_weights():
+        with main_thread.g_queue_lock:
+            sd_models.reload_model_weights()
+    
+    def sync_reload_model_weights_forced():
+        with main_thread.g_queue_lock:
+            sd_models.reload_model_weights(forced_reload=True)
+
+    # Option A: Call directly (might not need wrap_queued_call if it's just this)
+    # shared.opts.onchange("sd_model_checkpoint", sync_reload_model_weights, call=False)
+    # shared.opts.onchange("sd_vae", sync_reload_vae_weights, call=False)
+    shared.opts.onchange("sd_vae_overrides_per_model_preferences", sync_reload_vae_weights, call=False) # Use the sync version
+
+    # For other onchange handlers that are safe to be queued or don't involve main_thread:
+    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed) # This seems fine as is
+    shared.opts.onchange("gradio_theme", shared.reload_gradio_theme) # This seems fine
+
+    # Commented out ones, if re-enabled and they are critical model ops, would also need sync versions or careful thought
     # shared.opts.onchange("cross_attention_optimization", wrap_queued_call(lambda: sd_hijack.model_hijack.redo_hijack(shared.sd_model)), call=False)
-    # shared.opts.onchange("fp8_storage", wrap_queued_call(lambda: sd_models.reload_model_weights()), call=False)
-    # shared.opts.onchange("cache_fp16_weight", wrap_queued_call(lambda: sd_models.reload_model_weights(forced_reload=True)), call=False)
+    # shared.opts.onchange("fp8_storage", sync_reload_model_weights, call=False)
+    # shared.opts.onchange("cache_fp16_weight", sync_reload_model_weights_forced, call=False)
+    
     startup_timer.record("opts onchange")
 
 

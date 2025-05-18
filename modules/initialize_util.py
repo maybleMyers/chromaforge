@@ -177,39 +177,47 @@ def configure_sigint_handler():
 
 
 def configure_opts_onchange():
-    from modules import shared, sd_models, sd_vae, ui_tempdir #, sd_hijack
-    from modules.call_queue import wrap_queued_call # Keep for non-main_thread onchange if any
-    from modules_forge import main_thread # For g_queue_lock
+    from modules import shared, sd_models, sd_vae, ui_tempdir #, sd_hijack (if cross_attention needed)
+    # from modules.call_queue import wrap_queued_call # We might not need this for these critical onchanges
+    from modules_forge import main_thread # Needed for g_queue_lock
 
-    # For onchange handlers that MUST run synchronously during init if triggered
-    def sync_reload_vae_weights():
-        with main_thread.g_queue_lock: # Use the same lock as main_thread.Task.work
-                                       # to ensure serialization if other tasks are somehow running.
-                                       # This assumes sd_vae.reload_vae_weights() is safe to call directly.
-            sd_vae.reload_vae_weights()
+    # --- Synchronous handler for VAE reload ---
+    def vae_override_onchange_sync():
+        print("DEBUG: sd_vae_overrides_per_model_preferences changed, calling reload_vae_weights synchronously.")
+        # If this needs to be serialized with other GPU ops, use main_thread's lock
+        # However, during init, main_thread.loop isn't running yet.
+        # sd_vae.reload_vae_weights likely handles its own internal state safely.
+        # If it internally tries to use main_thread.run_and_wait_result, *that* would be the problem.
+        # For now, assume sd_vae.reload_vae_weights() is safe to call directly here.
+        # If it needs heavy locking, it should use main_thread.g_queue_lock internally.
+        # Let's try calling it directly without any external locking from here first.
+        # If sd_vae.reload_vae_weights() ITSELF uses main_thread.run_and_wait_result(),
+        # then *that function* needs to be refactored for init-time calls.
+        
+        # Simplest direct call:
+        sd_vae.reload_vae_weights()
+        # If serialization is paramount even during init before main_thread.loop starts:
+        # with main_thread.g_queue_lock:
+        #     print("DEBUG: Acquired g_queue_lock for VAE reload during init.")
+        #     sd_vae.reload_vae_weights()
+        #     print("DEBUG: Released g_queue_lock for VAE reload during init.")
 
-    def sync_reload_model_weights():
-        with main_thread.g_queue_lock:
-            sd_models.reload_model_weights()
+    shared.opts.onchange("sd_vae_overrides_per_model_preferences", vae_override_onchange_sync, call=False)
     
-    def sync_reload_model_weights_forced():
-        with main_thread.g_queue_lock:
-            sd_models.reload_model_weights(forced_reload=True)
+    # --- Other handlers ---
+    # These seem less likely to cause deadlocks with main_thread if they don't call main_thread.run_and_wait_result
+    # and are just simple state changes or UI updates.
+    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed, call=False) # call=False is important if on_tmpdir_changed is not idempotent
+    shared.opts.onchange("gradio_theme", shared.reload_gradio_theme, call=False)
 
-    # Option A: Call directly (might not need wrap_queued_call if it's just this)
-    # shared.opts.onchange("sd_model_checkpoint", sync_reload_model_weights, call=False)
-    # shared.opts.onchange("sd_vae", sync_reload_vae_weights, call=False)
-    shared.opts.onchange("sd_vae_overrides_per_model_preferences", sync_reload_vae_weights, call=False) # Use the sync version
+    # If other onchange handlers for critical model ops (like the commented out ones) are re-enabled,
+    # they MUST NOT use main_thread.run_and_wait_result() if they can be triggered during initialization
+    # before main_thread.loop() has started. They'd need a similar synchronous approach.
+    # For example, if "fp8_storage" onchange was active and its handler did significant model work:
+    # def fp8_onchange_sync():
+    #     sd_models.reload_model_weights() # Assuming this is safe to call directly
+    # shared.opts.onchange("fp8_storage", fp8_onchange_sync, call=False)
 
-    # For other onchange handlers that are safe to be queued or don't involve main_thread:
-    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed) # This seems fine as is
-    shared.opts.onchange("gradio_theme", shared.reload_gradio_theme) # This seems fine
-
-    # Commented out ones, if re-enabled and they are critical model ops, would also need sync versions or careful thought
-    # shared.opts.onchange("cross_attention_optimization", wrap_queued_call(lambda: sd_hijack.model_hijack.redo_hijack(shared.sd_model)), call=False)
-    # shared.opts.onchange("fp8_storage", sync_reload_model_weights, call=False)
-    # shared.opts.onchange("cache_fp16_weight", sync_reload_model_weights_forced, call=False)
-    
     startup_timer.record("opts onchange")
 
 

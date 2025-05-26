@@ -20,5 +20,10 @@ forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work
 
 ## Changlog  
 
+5/25/2025  
+    Add support for sage and flash attention from this pr: https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2881  from @spawner1145  
+    use the methods by adding --use-sage-attention or --use-flash-attention  
 5/18/2025  
     Update to latest version of forge. Fix broken queuing.  
+
+    

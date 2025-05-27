@@ -20,13 +20,15 @@ set the distilled config scale to 1, and the normal config scale to something li
 use a very long positive prompt and a very long negative prompt.  
 forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work  
 
-To update to torch 2.7.0 with cuda 12.8 on windows, navigate to your home directory ie c:/chromaforge and run these commands:
+To update to torch 2.7.0 with cuda 12.8 on windows and install sage attention, navigate to your home directory ie c:/chromaforge and run these commands:  
 venv/scripts/activate  
- pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
-
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
+pip install -U "triton-windows<3.4"  
+pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
 
 ## Changlog  
-
+5/27/2025  
+    Fixed the sage attention implementation to work with chroma.  
 5/25/2025  
     Add support for sage and flash attention from this pr: https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2881  from @spawner1145  
     use the methods by adding --use-sage-attention or --use-flash-attention  ... upon testing by a few people does not seem to have an increase on speed at all.  

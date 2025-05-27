@@ -12,11 +12,12 @@ Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie
 
 run webui-user.bat or install manually for linux.  
 After you first run webui-user.bat it might error, if so, close it and re run it.  
+To update to the latest version navigate to your root directory in a terminal and type "git pull"  
 
 in Forge, on the top left select all and not flux  
 select the checkpoint and then in the next field select the text encoder and vae.  
 Use euler simple scheduler.  
-set the distilled config scale to 1, and the normal config scale to something like 3.5  
+set the distilled config scale to 1, and the normal config scale to something like 3.5-7  
 use a very long positive prompt and a very long negative prompt.  
 forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work  
 

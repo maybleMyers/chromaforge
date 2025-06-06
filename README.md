@@ -12,7 +12,7 @@ Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie
 
 run webui-user.bat or install manually for linux.  
 After you first run webui-user.bat it might error, if so, close it and re run it.  
-To update to the latest version navigate to your root directory in a terminal and type "git pull"  
+To update to the latest version navigate to your root directory in a terminal and type "git pull"  c
 
 in Forge, on the top left select all and not flux  
 select the checkpoint and then in the next field select the text encoder and vae.  
@@ -26,6 +26,11 @@ venv/scripts/activate
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
 pip install -U "triton-windows<3.4"  
 pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
+
+Here are experimental high resolution checkpoints for chroma:  
+https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/staging_large_3  
+They can be converted to safetensors with convertpth.py  
+for example modify the source.pth and output.safetensors on the last line in the script: convert_pth_to_safetensors("source.pth", "output.safetensors") to what you want them to be, then run the script with python convertpth.py.  
 
 ## Changlog  
 5/27/2025  

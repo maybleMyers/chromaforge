@@ -7,7 +7,7 @@ I am going to keep updating it with new features. Suggestions are welcome.
 
 To use:  
 Download one of the t5xxl text encoders from https://huggingface.co/silveroxides/t5xxl_flan_enc and place in models/text_encoder.  
-Download the vae from https://huggingface.co/black-forest-labs/FLUX.1-schnell/tree/main/vae and put it in models/vae.  
+Download the vae from https://huggingface.co/lodestones/Chroma/tree/main ae.safetenstors and put it in models/vae.  
 Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie chroma-unlocked-v29.5.safetensors and place in models/Stable-diffusion.  
 
 run webui-user.bat or install manually for linux.  

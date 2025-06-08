@@ -27,6 +27,11 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://dow
 pip install -U "triton-windows<3.4"  
 pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
 
+Extra samplers:
+there's a bunch of extra samplers/schedulers
+https://github.com/DenOfEquity/webUI_ExtraSchedulers
+https://github.com/MisterChief95/sd-forge-extra-samplers
+
 Here are experimental high resolution checkpoints for chroma:  
 https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/staging_large_3  
 They can be converted to safetensors with convertpth.py  

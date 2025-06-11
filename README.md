@@ -10,9 +10,9 @@ Download one of the t5xxl text encoders from https://huggingface.co/silveroxides
 Download the vae from https://huggingface.co/lodestones/Chroma/tree/main ae.safetenstors and put it in models/vae.  
 Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie chroma-unlocked-v29.5.safetensors and place in models/Stable-diffusion.  
 
-run webui-user.bat or install manually for linux.  
+run webui-user.bat or install manually for linux, if you need linux instructions create an issue and I will provide them.  
 After you first run webui-user.bat it might error, if so, close it and re run it.  
-To update to the latest version navigate to your root directory in a terminal and type "git pull"  c
+To update to the latest version navigate to your root directory in a terminal and type "git pull"  
 
 in Forge, on the top left select all and not flux  
 select the checkpoint and then in the next field select the text encoder and vae.  
@@ -20,6 +20,7 @@ Use euler simple scheduler.
 set the distilled config scale to 1, and the normal config scale to something like 3.5-7  
 use a very long positive prompt and a very long negative prompt.  
 forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work  
+refer to screenshot for working settings.  
 
 To update to torch 2.7.0 with cuda 12.8 on windows and install sage attention, navigate to your root directory after initial installation ie c:/chromaforge/ and run these commands:  
 venv/scripts/activate  
@@ -27,8 +28,7 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://dow
 pip install -U "triton-windows<3.4"  
 pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
 
-Extra samplers:
-there's a bunch of extra samplers/schedulers
+there's a bunch of extra samplers/schedulers at these places:  
 https://github.com/DenOfEquity/webUI_ExtraSchedulers
 https://github.com/MisterChief95/sd-forge-extra-samplers
 
@@ -37,7 +37,11 @@ https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/stagin
 They can be converted to safetensors with convertpth.py  
 for example modify the source.pth and output.safetensors on the last line in the script: convert_pth_to_safetensors("source.pth", "output.safetensors") to what you want them to be, then run the script with python convertpth.py.  
 
+Training: https://github.com/lodestone-rock/flow/  
+
 ## Changlog  
+6/11/2025  
+    Add links, fix euler a simple sampler via croq's PR in forge https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2915.  
 5/27/2025  
     Fixed the sage attention implementation to work with chroma.  
 5/25/2025  

@@ -41,7 +41,7 @@ Training: https://github.com/lodestone-rock/flow/
 
 ## Changlog  
 6/11/2025  
-    Add links, fix euler a simple sampler via croq's PR in forge https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2915.  
+    Add links, Sigmoid Offset scheduler (thanks to croq and silveroxides https://github.com/silveroxides/ComfyUI_SigmoidOffsetScheduler), fix euler a simple sampler via croq's PR in forge https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2915.  
 5/27/2025  
     Fixed the sage attention implementation to work with chroma.  
 5/25/2025  
@@ -49,5 +49,3 @@ Training: https://github.com/lodestone-rock/flow/
     use the methods by adding --use-sage-attention or --use-flash-attention  ... upon testing by a few people does not seem to have an increase on speed at all.  
 5/18/2025  
     Update to latest version of forge. Fix broken queuing.  
-
-    

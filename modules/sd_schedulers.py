@@ -207,6 +207,33 @@ def ays_32_sigmas(n, sigma_min, sigma_max, device='cpu'):
         sigmas.append(0.0)
     return torch.FloatTensor(sigmas).to(device)
 
+def sigmoid_offset_sigmas(n, sigma_min, sigma_max, inner_model, device):
+    square_k = shared.opts.sigmoid_square_k
+    base_c = shared.opts.sigmoid_base_c
+    print(f"using sigmoid_offset_sigmas with k^2={square_k} c={base_c}")
+    total_timesteps = len(inner_model.sigmas)-1
+    ts = np.linspace(0, 1, n, endpoint=False)
+    shift = 2.0 * (base_c - 0.5)
+    def sigmoid(x):
+        x = (8.0 * x - 4.0) + (shift * 4.0)
+        if square_k * x > 700:
+            return 1.0
+        if square_k * x < -700:
+            return 0.0
+        return 1.0 / (1.0 + np.exp(-square_k * x))
+    transformed_ts = 1.0 - np.array([sigmoid(t) for t in ts])
+    mapped_ts = np.rint(transformed_ts * total_timesteps).astype(int)
+    sigs = []
+    last_t = -1
+    for t in mapped_ts:
+        if t != last_t:
+            if isinstance(inner_model.sigmas, torch.Tensor):
+                sigs.append(float(inner_model.sigmas[t].item()))
+            else:
+                sigs.append(float(inner_model.sigmas[t]))
+        last_t = t
+    sigs.append(0.0)
+    return torch.FloatTensor(sigs).to(device)
 
 schedulers = [
     Scheduler('automatic', 'Automatic', None),
@@ -225,6 +252,7 @@ schedulers = [
     Scheduler('align_your_steps_GITS', 'Align Your Steps GITS', get_align_your_steps_sigmas_GITS),
     Scheduler('align_your_steps_11', 'Align Your Steps 11', ays_11_sigmas),
     Scheduler('align_your_steps_32', 'Align Your Steps 32', ays_32_sigmas),
+    Scheduler('sigmoid_offset', 'Sigmoid Offset', sigmoid_offset_sigmas, need_inner_model=True),
 ]
 
 schedulers_map = {**{x.name: x for x in schedulers}, **{x.label: x for x in schedulers}}

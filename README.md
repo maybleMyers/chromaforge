@@ -38,6 +38,8 @@ They can be converted to safetensors with convertpth.py
 for example modify the source.pth and output.safetensors on the last line in the script: convert_pth_to_safetensors("source.pth", "output.safetensors") to what you want them to be, then run the script with python convertpth.py.  
 
 Training: https://github.com/lodestone-rock/flow/  
+Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-fi.com/lodestonerock  
+Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog  
 6/11/2025  

@@ -6,11 +6,12 @@ This is a fork with the patch from https://github.com/croquelois/forgeChroma pre
 I am going to keep updating it with new features. Suggestions are welcome.  
 
 To use:  
+git clone https://github.com/maybleMyers/chromaforge  
 Download one of the t5xxl text encoders from https://huggingface.co/silveroxides/t5xxl_flan_enc and place in models/text_encoder.  
 Download the vae from https://huggingface.co/lodestones/Chroma/tree/main ae.safetenstors and put it in models/vae.  
 Download a checkpoint from https://huggingface.co/lodestones/Chroma/tree/main ie chroma-unlocked-v29.5.safetensors and place in models/Stable-diffusion.  
 
-run webui-user.bat or install manually for linux, if you need linux instructions create an issue and I will provide them.  
+Run webui-user.bat for windows installation.  Run webui.sh for linux installation (./webui.sh) from the chromaforge root directory.  
 After you first run webui-user.bat it might error, if so, close it and re run it.  
 To update to the latest version navigate to your root directory in a terminal and type "git pull"  
 

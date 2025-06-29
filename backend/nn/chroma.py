@@ -9,160 +9,7 @@ from torch import nn
 from einops import rearrange, repeat
 from backend.attention import attention_function
 from backend.utils import fp16_fix, tensor2parameter
-
-
-def attention(q, k, v, pe):
-    q, k = apply_rope(q, k, pe)
-    x = attention_function(q, k, v, q.shape[1], skip_reshape=True)
-    return x
-
-
-def rope(pos, dim, theta):
-    if pos.device.type == "mps" or pos.device.type == "xpu":
-        scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
-    else:
-        scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta ** scale)
-
-    # out = torch.einsum("...n,d->...nd", pos, omega)
-    out = pos.unsqueeze(-1) * omega.unsqueeze(0)
-
-    cos_out = torch.cos(out)
-    sin_out = torch.sin(out)
-    out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
-    del cos_out, sin_out
-
-    # out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    b, n, d, _ = out.shape
-    out = out.view(b, n, d, 2, 2)
-
-    return out.float()
-
-
-def apply_rope(xq, xk, freqs_cis):
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    del xq_, xk_
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
-
-
-def timestep_embedding(t, dim, max_period=10000, time_factor=1000.0):
-    t = time_factor * t
-    half = dim // 2
-
-    # TODO: Once A trainer for flux get popular, make timestep_embedding consistent to that trainer
-
-    # Do not block CUDA steam, but having about 1e-4 differences with Flux official codes:
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
-
-    # Block CUDA steam, but consistent with official codes:
-    # freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(t.device)
-
-    args = t[:, None].float() * freqs[None]
-    del freqs
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    del args
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    if torch.is_floating_point(t):
-        embedding = embedding.to(t)
-    return embedding
-
-
-class EmbedND(nn.Module):
-    def __init__(self, dim, theta, axes_dim):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids):
-        n_axes = ids.shape[-1]
-        emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
-        )
-        del ids, n_axes
-        return emb.unsqueeze(1)
-
-
-class MLPEmbedder(nn.Module):
-    def __init__(self, in_dim, hidden_dim):
-        super().__init__()
-        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-
-    def forward(self, x):
-        x = self.silu(self.in_layer(x))
-        return self.out_layer(x)
-
-
-if hasattr(torch, 'rms_norm'):
-    functional_rms_norm = torch.rms_norm
-else:
-    def functional_rms_norm(x, normalized_shape, weight, eps):
-        if x.dtype in [torch.bfloat16, torch.float32]:
-            n = torch.rsqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps) * weight
-        else:
-            n = torch.rsqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True) + eps).to(x.dtype) * weight
-        return x * n
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = None  # to trigger module_profile
-        self.scale = nn.Parameter(torch.ones(dim))
-        self.eps = 1e-6
-        self.normalized_shape = [dim]
-
-    def forward(self, x):
-        if self.scale.dtype != x.dtype:
-            self.scale = tensor2parameter(self.scale.to(dtype=x.dtype))
-        return functional_rms_norm(x, self.normalized_shape, self.scale, self.eps)
-
-
-class QKNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.query_norm = RMSNorm(dim)
-        self.key_norm = RMSNorm(dim)
-
-    def forward(self, q, k, v):
-        del v
-        q = self.query_norm(q)
-        k = self.key_norm(k)
-        return q.to(k), k.to(q)
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.norm = QKNorm(head_dim)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x, pe):
-        qkv = self.qkv(x)
-
-        # q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.num_heads, -1)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        del qkv
-
-        q, k = self.norm(q, k, v)
-
-        x = attention(q, k, v, pe=pe)
-        del q, k, v
-
-        x = self.proj(x)
-        return x
+from backend.nn.flux import attention, rope, timestep_embedding, EmbedND, MLPEmbedder, RMSNorm, QKNorm, SelfAttention
 
 class Approximator(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4):
@@ -174,12 +21,9 @@ class Approximator(nn.Module):
 
     def forward(self, x):
         x = self.in_proj(x)
-
         for layer, norms in zip(self.layers, self.norms):
             x = x + layer(norms(x))
-
         x = self.out_proj(x)
-
         return x
 
 @dataclass
@@ -188,25 +32,12 @@ class ModulationOut:
     scale: torch.Tensor
     gate: torch.Tensor
 
-class Modulation(nn.Module):
-    def __init__(self, dim, double):
-        super().__init__()
-        self.is_double = double
-        self.multiplier = 6 if double else 3
-        self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
-
-    def forward(self, vec):
-        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
-        return out
-
-
 class DoubleStreamBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio, qkv_bias=False):
         super().__init__()
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        self.img_mod = Modulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -215,7 +46,6 @@ class DoubleStreamBlock(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
-        self.txt_mod = Modulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -268,7 +98,6 @@ class SingleStreamBlock(nn.Module):
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp_act = nn.GELU(approximate="tanh")
-        self.modulation = Modulation(hidden_size, double=False)
 
     def forward(self, x, mod, pe):
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
@@ -296,7 +125,6 @@ class LastLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
     def forward(self, x, mod):
         shift, scale = mod
@@ -415,18 +243,18 @@ class IntegratedChromaTransformer2DModel(nn.Module):
                 idx += 2  # Advance by 2 vectors
         return block_dict
         
-    def inner_forward(self, img, img_ids, txt, txt_ids, timesteps, guidance=None):
+    def inner_forward(self, img, img_ids, txt, txt_ids, timesteps):
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
         img = self.img_in(img)
         device = img.device
-        dtype = img.dtype
+        dtype = img.dtype # torch.bfloat16
         nb_double_block = len(self.double_blocks)
         nb_single_block = len(self.single_blocks)
         
         mod_index_length = nb_double_block*12 + nb_single_block*3 + 2
         distill_timestep = timestep_embedding(timesteps.detach().clone(), 16).to(device=device, dtype=dtype)
-        distil_guidance = timestep_embedding(guidance.detach().clone(), 16).to(device=device, dtype=dtype)
+        distil_guidance = timestep_embedding(torch.zeros_like(timesteps), 16).to(device=device, dtype=dtype)
         modulation_index = timestep_embedding(torch.arange(mod_index_length), 32).to(device=device, dtype=dtype)
         modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1)
         timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1)
@@ -435,7 +263,6 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         mod_vectors_dict = self.distribute_modulations(mod_vectors, nb_single_block, nb_double_block)
         
         txt = self.txt_in(txt)
-        del guidance
         ids = torch.cat((txt_ids, img_ids), dim=1)
         del txt_ids, img_ids
         pe = self.pe_embedder(ids)
@@ -455,7 +282,7 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         img = self.final_layer(img, final_mod)
         return img
 
-    def forward(self, x, timestep, context, guidance=None, **kwargs):
+    def forward(self, x, timestep, context, **kwargs):
         bs, c, h, w = x.shape
         input_device = x.device
         input_dtype = x.dtype
@@ -473,7 +300,7 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=input_device, dtype=input_dtype)
         del input_device, input_dtype
-        out = self.inner_forward(img, img_ids, context, txt_ids, timestep, guidance)
+        out = self.inner_forward(img, img_ids, context, txt_ids, timestep)
         del img, img_ids, txt_ids, timestep, context
         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:, :, :h, :w]
         del h_len, w_len, bs

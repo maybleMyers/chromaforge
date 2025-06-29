@@ -139,7 +139,7 @@ class ForgeOperations:
                 if prefix + 'weight' in state_dict:
                     self.weight = torch.nn.Parameter(state_dict[prefix + 'weight'].to(self.dummy))
                 if prefix + 'scale_weight' in state_dict:
-                    self.scale_weight = torch.nn.Parameter(state_dict[prefix + 'scale_weight'])
+                     self.scale_weight = torch.nn.Parameter(state_dict[prefix + 'scale_weight'])                    
                 if prefix + 'bias' in state_dict:
                     self.bias = torch.nn.Parameter(state_dict[prefix + 'bias'].to(self.dummy))
                 del self.dummy

@@ -35,6 +35,7 @@ https://github.com/MisterChief95/sd-forge-extra-samplers
 
 Here are experimental high resolution checkpoints for chroma:  
 https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/staging_large_3  
+https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/staging_large_4  
 They can be converted to safetensors with convertpth.py  
 for example modify the source.pth and output.safetensors on the last line in the script: convert_pth_to_safetensors("source.pth", "output.safetensors") to what you want them to be, then run the script with python convertpth.py.  
 

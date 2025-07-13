@@ -45,6 +45,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog  
+7/13/2025  
+    Increase max res for chroma to 3072, add dedicated chroma button.  
 6/11/2025  
     Add links, Sigmoid Offset scheduler (thanks to croq and silveroxides https://github.com/silveroxides/ComfyUI_SigmoidOffsetScheduler), fix euler a simple sampler via croq's PR in forge https://github.com/lllyasviel/stable-diffusion-webui-forge/pull/2915.  
 5/27/2025  

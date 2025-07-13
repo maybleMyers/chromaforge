@@ -510,7 +510,7 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_t2i_height":   shared.OptionInfo(1024, "txt2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
     "chroma_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
     "chroma_t2i_scheduler": shared.OptionInfo('Simple', "txt2img scheduler"),
-    "chroma_t2i_cfg":      shared.OptionInfo(1,    "txt2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
+    "chroma_t2i_cfg":      shared.OptionInfo(7,    "txt2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_t2i_hr_cfg":   shared.OptionInfo(1,    "txt2img HiRes CFG",            gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_t2i_d_cfg":    shared.OptionInfo(3.5,  "txt2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
     "chroma_t2i_hr_d_cfg": shared.OptionInfo(3.5,  "txt2img Distilled HiRes CFG",  gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
@@ -518,7 +518,7 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_height":   shared.OptionInfo(1024, "img2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
     "chroma_i2i_sampler":  shared.OptionInfo('Euler', "img2img sampler"),
     "chroma_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
-    "chroma_i2i_cfg":      shared.OptionInfo(1,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
+    "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
     "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
 }))

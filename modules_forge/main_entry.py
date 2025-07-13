@@ -435,8 +435,8 @@ def on_preset_change(preset=None):
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_width", 1024)),  # ui_img2img_width
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_height", 1024)),  # ui_txt2img_height
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_height", 1024)),  # ui_img2img_height
-            gr.update(value=getattr(shared.opts, "chroma_t2i_cfg", 1.0)),  # ui_txt2img_cfg
-            gr.update(value=getattr(shared.opts, "chroma_i2i_cfg", 1.0)),  # ui_img2img_cfg
+            gr.update(value=getattr(shared.opts, "chroma_t2i_cfg", 7.0)),  # ui_txt2img_cfg
+            gr.update(value=getattr(shared.opts, "chroma_i2i_cfg", 7.0)),  # ui_img2img_cfg
             gr.update(visible=True, value=getattr(shared.opts, "chroma_t2i_d_cfg", 3.5)),  # ui_txt2img_distilled_cfg
             gr.update(visible=True, value=getattr(shared.opts, "chroma_i2i_d_cfg", 3.5)),  # ui_img2img_distilled_cfg
             gr.update(value=getattr(shared.opts, "chroma_t2i_sampler", 'Euler')),  # ui_txt2img_sampler

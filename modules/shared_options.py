@@ -428,6 +428,17 @@ options_templates.update(options_section(('postprocessing', "Postprocessing", "p
     'postprocessing_existing_caption_action': OptionInfo("Ignore", "Action for existing captions", gr.Radio, {"choices": ["Ignore", "Keep", "Prepend", "Append"]}).info("when generating captions using postprocessing; Ignore = use generated; Keep = use original; Prepend/Append = combine both"),
 }))
 
+options_templates.update(options_section(('radiance', "Chroma Radiance", "radiance"), {
+    'radiance_default_steps': OptionInfo(20, "Default sampling steps for radiance models", gr.Slider, {"minimum": 1, "maximum": 100, "step": 1}),
+    'radiance_default_cfg': OptionInfo(7.0, "Default CFG scale for radiance models", gr.Slider, {"minimum": 1.0, "maximum": 20.0, "step": 0.1}),
+    'radiance_default_guidance': OptionInfo(0.0, "Default guidance value for radiance models", gr.Slider, {"minimum": 0.0, "maximum": 10.0, "step": 0.1}),
+    'radiance_default_attn_padding': OptionInfo(1, "Default attention padding for radiance models", gr.Slider, {"minimum": 1, "maximum": 16, "step": 1}),
+    'radiance_enable_post_processing': OptionInfo(True, "Enable automatic post-processing for radiance images"),
+    'radiance_contrast_enhance': OptionInfo(1.1, "Contrast enhancement factor", gr.Slider, {"minimum": 0.8, "maximum": 1.5, "step": 0.1}),
+    'radiance_memory_efficient': OptionInfo(True, "Use memory efficient processing for radiance models"),
+    'radiance_auto_detect_models': OptionInfo(True, "Automatically detect radiance models in model list"),
+}))
+
 options_templates.update(options_section((None, "Hidden options"), {
     "disabled_extensions": OptionInfo([], "Disable these extensions"),
     "disable_all_extensions": OptionInfo("none", "Disable all extensions (preserves the list of disabled extensions)", gr.Radio, {"choices": ["none", "extra", "all"]}),

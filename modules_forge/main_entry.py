@@ -506,6 +506,7 @@ shared.options_templates.update(shared.options_section(('ui_flux', "UI defaults 
     "flux_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
 }))
 shared.options_templates.update(shared.options_section(('ui_chroma', "UI defaults 'chroma'", "ui"), {
+    "chroma_model_type":   shared.OptionInfo('Standard', "Chroma Model Type", gr.Radio, {"choices": ["Standard", "Radiance"]}),
     "chroma_t2i_width":    shared.OptionInfo(1024,  "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
     "chroma_t2i_height":   shared.OptionInfo(1024, "txt2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
     "chroma_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
@@ -521,4 +522,33 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
     "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "chroma_radiance_guidance": shared.OptionInfo(0.0, "Radiance Guidance", gr.Slider, {"minimum": 0.0, "maximum": 10.0, "step": 0.1}),
+    "chroma_radiance_attn_padding": shared.OptionInfo(1, "Radiance Attention Padding", gr.Slider, {"minimum": 1, "maximum": 16, "step": 1}),
 }))
+
+
+def ensure_chroma_extra_options():
+    """Ensure chroma model type appears in extra options when using Chroma preset."""
+    if shared.opts.forge_preset == 'chroma':
+        # Add chroma_model_type to extra options if not already present
+        try:
+            current_txt2img = list(shared.opts.extra_options_txt2img)
+            current_img2img = list(shared.opts.extra_options_img2img)
+            
+            if "chroma_model_type" not in current_txt2img:
+                current_txt2img.append("chroma_model_type")
+                shared.opts.extra_options_txt2img = current_txt2img
+                
+            if "chroma_model_type" not in current_img2img:
+                current_img2img.append("chroma_model_type")
+                shared.opts.extra_options_img2img = current_img2img
+                
+        except Exception as e:
+            print(f"Note: Could not auto-add chroma_model_type to extra options: {e}")
+
+
+# Auto-configure extra options when using Chroma preset
+try:
+    ensure_chroma_extra_options()
+except:
+    pass  # Ignore errors during initialization

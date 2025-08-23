@@ -23,9 +23,10 @@ from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRe
 from backend.diffusion_engine.sd35 import StableDiffusion3
 from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.chroma import Chroma
+from backend.diffusion_engine.chroma_radiance import ChromaRadiance
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, Flux]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaRadiance, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -109,7 +110,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=['transformer.encoder.embed_tokens.weight', 'logit_scale'])
 
             return model
-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel']:
+        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaRadianceTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
 
             model_loader = None
@@ -121,6 +122,35 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             elif cls_name == 'ChromaTransformer2DModel':
                 from backend.nn.chroma import IntegratedChromaTransformer2DModel
                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
+            elif cls_name == 'ChromaRadianceTransformer2DModel':
+                from backend.nn.chroma_radiance import IntegratedChromaRadianceTransformer2DModel
+                def chroma_radiance_loader(c):
+                    # Filter config to only include ChromaRadiance-specific parameters
+                    chroma_radiance_params = {
+                        'in_channels': c.get('in_channels', 3),
+                        'context_in_dim': c.get('context_in_dim', 4096), 
+                        'hidden_size': c.get('hidden_size', 3072),
+                        'mlp_ratio': c.get('mlp_ratio', 4.0),
+                        'num_heads': c.get('num_heads', 24),
+                        'depth': c.get('depth', 19),
+                        'depth_single_blocks': c.get('depth_single_blocks', 38),
+                        'axes_dim': c.get('axes_dim', [16, 56, 56]),
+                        'theta': c.get('theta', 10000),
+                        'qkv_bias': c.get('qkv_bias', True),
+                        'guidance_embed': c.get('guidance_embed', False),
+                        'approximator_in_dim': c.get('approximator_in_dim', c.get('in_dim', 3)),
+                        'approximator_depth': c.get('approximator_depth', c.get('n_layers', 5)),
+                        'approximator_hidden_size': c.get('approximator_hidden_size', c.get('hidden_dim', 5120)),
+                        'patch_size': c.get('patch_size', 16),
+                        'nerf_hidden_size': c.get('nerf_hidden_size', 64),
+                        'nerf_mlp_ratio': c.get('nerf_mlp_ratio', 4),
+                        'nerf_depth': c.get('nerf_depth', 4),
+                        'nerf_max_freqs': c.get('nerf_max_freqs', 8),
+                        'nerf_tile_size': c.get('nerf_tile_size', 16),
+                        'nerf_final_head_type': c.get('nerf_final_head_type', 'linear'),
+                    }
+                    return IntegratedChromaRadianceTransformer2DModel(**chroma_radiance_params)
+                model_loader = chroma_radiance_loader
             elif cls_name == 'SD3Transformer2DModel':
                 from backend.nn.mmditx import MMDiTX
                 model_loader = lambda c: MMDiTX(**c)
@@ -493,6 +523,33 @@ if not chroma_is_in_huggingface_guess:
             'guidance_n_layers': 5
         }
         unet_remove_config = ['guidance_embed']
+
+    class GuessChromaRadiance:
+        huggingface_repo = 'ChromaRadiance'
+        unet_extra_config = {
+            'in_channels': 3,
+            'context_in_dim': 4096,
+            'hidden_size': 3072,
+            'mlp_ratio': 4.0,
+            'num_heads': 24,
+            'depth': 19,
+            'depth_single_blocks': 38,
+            'axes_dim': [16, 56, 56],
+            'theta': 10000,
+            'qkv_bias': True,
+            'guidance_embed': True,
+            'approximator_in_dim': 64,
+            'approximator_depth': 5,
+            'approximator_hidden_size': 5120,
+            'patch_size': 16,
+            'nerf_hidden_size': 64,
+            'nerf_mlp_ratio': 4,
+            'nerf_depth': 4,
+            'nerf_max_freqs': 8,
+            'nerf_final_head_type': 'conv',
+            '_use_compiled': False
+        }
+        unet_remove_config = ['guidance_embed']
 @torch.inference_mode()
 def forge_loader(sd, additional_state_dicts=None):
     try:
@@ -504,11 +561,25 @@ def forge_loader(sd, additional_state_dicts=None):
         and estimated_config.huggingface_repo == "black-forest-labs/FLUX.1-schnell"  \
         and "transformer" in state_dicts \
         and "distilled_guidance_layer.layers.0.in_layer.bias" in state_dicts["transformer"]:
-        estimated_config.huggingface_repo = GuessChroma.huggingface_repo
-        for x in GuessChroma.unet_extra_config:
-            estimated_config.unet_config[x] = GuessChroma.unet_extra_config[x]
-        for x in GuessChroma.unet_remove_config:
-            del estimated_config.unet_config[x]
+        
+        # Check if this is a radiance model by looking for NeRF components
+        if "nerf_image_embedder.embedder.0.weight" in state_dicts["transformer"] or \
+           "nerf_blocks.0.param_generator.weight" in state_dicts["transformer"] or \
+           "nerf_final_layer_conv.conv.weight" in state_dicts["transformer"]:
+            estimated_config.huggingface_repo = GuessChromaRadiance.huggingface_repo
+            for x in GuessChromaRadiance.unet_extra_config:
+                estimated_config.unet_config[x] = GuessChromaRadiance.unet_extra_config[x]
+            for x in GuessChromaRadiance.unet_remove_config:
+                if x in estimated_config.unet_config:
+                    del estimated_config.unet_config[x]
+        else:
+            estimated_config.huggingface_repo = GuessChroma.huggingface_repo
+            for x in GuessChroma.unet_extra_config:
+                estimated_config.unet_config[x] = GuessChroma.unet_extra_config[x]
+            for x in GuessChroma.unet_remove_config:
+                if x in estimated_config.unet_config:
+                    del estimated_config.unet_config[x]
+        
         state_dicts['text_encoder'] = state_dicts['text_encoder_2']
         del state_dicts['text_encoder_2'] 
     repo_name = estimated_config.huggingface_repo
@@ -567,6 +638,8 @@ def forge_loader(sd, additional_state_dicts=None):
 
     if not chroma_is_in_huggingface_guess and estimated_config.huggingface_repo == "Chroma":
         return Chroma(estimated_config=estimated_config, huggingface_components=huggingface_components)
+    if not chroma_is_in_huggingface_guess and estimated_config.huggingface_repo == "ChromaRadiance":
+        return ChromaRadiance(estimated_config=estimated_config, huggingface_components=huggingface_components)
     for M in possible_models:
         if any(isinstance(estimated_config, x) for x in M.matched_guesses):
             return M(estimated_config=estimated_config, huggingface_components=huggingface_components)

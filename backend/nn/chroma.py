@@ -12,14 +12,19 @@ from backend.utils import fp16_fix, tensor2parameter
 from backend.nn.flux import attention, rope, timestep_embedding, EmbedND, MLPEmbedder, RMSNorm, QKNorm, SelfAttention
 
 class Approximator(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4):
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4, operations=None):
         super().__init__()
-        self.in_proj = nn.Linear(in_dim, hidden_dim, bias=True)
+        if operations is None:
+            operations = nn
+        self.in_proj = operations.Linear(in_dim, hidden_dim, bias=True)
         self.layers = nn.ModuleList([MLPEmbedder(hidden_dim, hidden_dim) for x in range( n_layers)])
         self.norms = nn.ModuleList([RMSNorm( hidden_dim) for x in range( n_layers)])
-        self.out_proj = nn.Linear(hidden_dim, out_dim)
+        self.out_proj = operations.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
+        # Ensure input matches the dtype of the layer weights for proper computation
+        if hasattr(self.in_proj, 'weight') and self.in_proj.weight is not None:
+            x = x.to(dtype=self.in_proj.weight.dtype)
         x = self.in_proj(x)
         for layer, norms in zip(self.layers, self.norms):
             x = x + layer(norms(x))

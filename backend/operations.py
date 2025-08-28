@@ -107,18 +107,9 @@ def main_stream_worker(weight, bias, signal):
 
 
 def cleanup_cache():
-    import traceback
-    print(f"\n[DEBUG CLEANUP CACHE] Cleaning up operations cache")
-    print(f"[DEBUG CLEANUP CACHE] Stack trace:")
-    for line in traceback.format_stack()[:-1]:
-        print(f"[DEBUG CLEANUP CACHE] {line.strip()}")
-    print(f"[DEBUG CLEANUP CACHE] End stack trace\n")
-    
     if not stream.should_use_stream():
-        print(f"[DEBUG CLEANUP CACHE] Stream not enabled, skipping")
         return
 
-    print(f"[DEBUG CLEANUP CACHE] Synchronizing streams and clearing stash")
     stream.current_stream.synchronize()
     stream.mover_stream.synchronize()
     stash.clear()

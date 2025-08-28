@@ -527,13 +527,6 @@ class LoadedModel:
         return self.real_model
 
     def model_unload(self, avoid_model_moving=False):
-        import traceback
-        print(f"\n[DEBUG MODEL UNLOAD] Unloading {self.model.model.__class__.__name__} model")
-        print(f"[DEBUG MODEL UNLOAD] Stack trace:")
-        for line in traceback.format_stack()[:-1]:
-            print(f"[DEBUG MODEL UNLOAD] {line.strip()}")
-        print(f"[DEBUG MODEL UNLOAD] End stack trace\n")
-        
         if self.model_accelerated:
             for m in self.real_model.modules():
                 if hasattr(m, "prev_parameters_manual_cast"):
@@ -561,33 +554,16 @@ def minimum_inference_memory():
 
 
 def unload_model_clones(model):
-    import traceback
-    print(f"\n[DEBUG UNLOAD CLONES] Unloading clones of {model.model.__class__.__name__}")
-    print(f"[DEBUG UNLOAD CLONES] Stack trace:")
-    for line in traceback.format_stack()[:-1]:
-        print(f"[DEBUG UNLOAD CLONES] {line.strip()}")
-    print(f"[DEBUG UNLOAD CLONES] End stack trace\n")
-    
     to_unload = []
     for i in range(len(current_loaded_models)):
         if model.is_clone(current_loaded_models[i].model):
-            print(f"[DEBUG UNLOAD CLONES] Found clone of {current_loaded_models[i].model.model.__class__.__name__} to unload")
             to_unload = [i] + to_unload
 
     for i in to_unload:
-        print(f"[DEBUG UNLOAD CLONES] Unloading clone at index {i}")
         current_loaded_models.pop(i).model_unload(avoid_model_moving=True)
 
 
 def free_memory(memory_required, device, keep_loaded=[], free_all=False):
-    import traceback
-    print(f"\n[DEBUG FREE MEMORY] Requested: {memory_required / (1024*1024):.2f} MB on {device}")
-    print(f"[DEBUG FREE MEMORY] Keep loaded: {len(keep_loaded)} models, Free all: {free_all}")
-    print(f"[DEBUG FREE MEMORY] Stack trace:")
-    for line in traceback.format_stack()[:-1]:
-        print(f"[DEBUG FREE MEMORY] {line.strip()}")
-    print(f"[DEBUG FREE MEMORY] End stack trace\n")
-    
     # this check fully unloads any 'abandoned' models
     for i in range(len(current_loaded_models) - 1, -1, -1):
         if sys.getrefcount(current_loaded_models[i].model) <= 2:
@@ -723,17 +699,9 @@ def load_model_gpu(model):
 
 
 def cleanup_models():
-    import traceback
-    print(f"\n[DEBUG CLEANUP MODELS] Cleaning up models, currently have {len(current_loaded_models)} loaded")
-    print(f"[DEBUG CLEANUP MODELS] Stack trace:")
-    for line in traceback.format_stack()[:-1]:
-        print(f"[DEBUG CLEANUP MODELS] {line.strip()}")
-    print(f"[DEBUG CLEANUP MODELS] End stack trace\n")
-    
     to_delete = []
     for i in range(len(current_loaded_models)):
         if sys.getrefcount(current_loaded_models[i].model) <= 2:
-            print(f"[DEBUG CLEANUP MODELS] Model {current_loaded_models[i].model.model.__class__.__name__} has low ref count, marking for deletion")
             to_delete = [i] + to_delete
 
     for i in to_delete:
@@ -1233,23 +1201,13 @@ signal_empty_cache = False
 
 
 def soft_empty_cache(force=False):
-    import traceback
-    print(f"\n[DEBUG SOFT EMPTY CACHE] Force: {force}")
-    print(f"[DEBUG SOFT EMPTY CACHE] Stack trace:")
-    for line in traceback.format_stack()[:-1]:
-        print(f"[DEBUG SOFT EMPTY CACHE] {line.strip()}")
-    print(f"[DEBUG SOFT EMPTY CACHE] End stack trace\n")
-    
     global cpu_state, signal_empty_cache
     if cpu_state == CPUState.MPS:
-        print(f"[DEBUG SOFT EMPTY CACHE] Emptying MPS cache")
         torch.mps.empty_cache()
     elif is_intel_xpu():
-        print(f"[DEBUG SOFT EMPTY CACHE] Emptying XPU cache")
         torch.xpu.empty_cache()
     elif torch.cuda.is_available():
         if force or is_nvidia():  # This seems to make things worse on ROCm so I only do it for cuda
-            print(f"[DEBUG SOFT EMPTY CACHE] Emptying CUDA cache and collecting IPC")
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
     signal_empty_cache = False

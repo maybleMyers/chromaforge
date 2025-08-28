@@ -40,11 +40,17 @@ https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/stagin
 They can be converted to safetensors with convertpth.py  
 for example modify the source.pth and output.safetensors on the last line in the script: convert_pth_to_safetensors("source.pth", "output.safetensors") to what you want them to be, then run the script with python convertpth.py.  
 
-Training: https://github.com/lodestone-rock/flow/  
+## Radiance Model
+
+Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
+
+Training: https://github.com/lodestone-rock/flow/  https://github.com/kohya-ss/sd-scripts/tree/sd3  
 Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-fi.com/lodestonerock  
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog  
+8/28/2025  
+    Added initial support for the radiance model class.  
 7/13/2025  
     Increase max res for chroma to 3072, add dedicated chroma button.  
 6/11/2025  

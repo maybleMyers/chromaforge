@@ -270,11 +270,20 @@ class ModelPatcher:
         return self.model
 
     def forge_unpatch_model(self, target_device=None):
+        import traceback
+        print(f"\n[DEBUG FORGE UNPATCH] Unpatching {self.model.__class__.__name__} model, target_device: {target_device}")
+        print(f"[DEBUG FORGE UNPATCH] Stack trace:")
+        for line in traceback.format_stack()[:-1]:
+            print(f"[DEBUG FORGE UNPATCH] {line.strip()}")
+        print(f"[DEBUG FORGE UNPATCH] End stack trace\n")
+        
         if target_device is not None:
+            print(f"[DEBUG FORGE UNPATCH] Moving model to {target_device}")
             self.model.to(target_device)
             self.current_device = target_device
 
         keys = list(self.object_patches_backup.keys())
+        print(f"[DEBUG FORGE UNPATCH] Restoring {len(keys)} object patches")
 
         for k in keys:
             utils.set_attr_raw(self.model, k, self.object_patches_backup[k])

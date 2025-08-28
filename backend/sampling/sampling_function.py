@@ -400,9 +400,19 @@ def sampling_prepare(unet, x):
 
 
 def sampling_cleanup(unet):
+    import traceback
+    print(f"\n[DEBUG SAMPLING CLEANUP] Cleaning up sampling for {unet.model.__class__.__name__}")
+    print(f"[DEBUG SAMPLING CLEANUP] Stack trace:")
+    for line in traceback.format_stack()[:-1]:
+        print(f"[DEBUG SAMPLING CLEANUP] {line.strip()}")
+    print(f"[DEBUG SAMPLING CLEANUP] End stack trace\n")
+    
     if unet.has_online_lora():
+        print(f"[DEBUG SAMPLING CLEANUP] Moving LoRA patches to offload device")
         utils.nested_move_to_device(unet.lora_patches, device=unet.offload_device)
     for cnet in unet.list_controlnets():
+        print(f"[DEBUG SAMPLING CLEANUP] Cleaning up ControlNet")
         cnet.cleanup()
+    print(f"[DEBUG SAMPLING CLEANUP] Calling cleanup_cache()")
     cleanup_cache()
     return

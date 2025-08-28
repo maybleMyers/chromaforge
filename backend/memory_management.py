@@ -520,6 +520,10 @@ class LoadedModel:
         if is_intel_xpu() and not args.disable_ipex_hijack:
             self.real_model = torch.xpu.optimize(self.real_model.eval(), inplace=True, auto_kernel_selection=True, graph_mode=True)
 
+        # Reset signal_empty_cache after model loading is complete to prevent
+        # unnecessary cache clearing during inference
+        signal_empty_cache = False
+        
         return self.real_model
 
     def model_unload(self, avoid_model_moving=False):

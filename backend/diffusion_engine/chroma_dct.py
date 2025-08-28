@@ -35,6 +35,9 @@ class ChromaDCT(ForgeDiffusionEngine):
             k_predictor=k_predictor,
             config=estimated_config
         )
+        
+        # Use default k_model memory estimation for proper sampling preparation
+        # ChromaDCT will use the same memory estimation as normal Chroma models
 
         self.text_processing_engine_t5 = T5TextProcessingEngine(
             text_encoder=clip.cond_stage_model.t5xxl,

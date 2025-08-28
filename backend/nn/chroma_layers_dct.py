@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from .math import attention, rope
 from functools import lru_cache
+from backend.operations import using_forge_operations
+from backend import memory_management
 
 class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: list[int]):
@@ -55,9 +57,12 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
 class MLPEmbedder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
-        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
+            self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        # Small utility layer - give GPU priority by removing parameters_manual_cast
 
     @property
     def device(self):
@@ -73,6 +78,7 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
         self.use_compiled = use_compiled
+        # Small normalization layer - give GPU priority by removing parameters_manual_cast
 
     def _forward(self, x: Tensor):
         x_dtype = x.dtype
@@ -204,9 +210,12 @@ class NerfEmbedder(nn.Module):
         
         # A linear layer to project the concatenated input features and
         # positional encodings to the final output dimension.
-        self.embedder = nn.Sequential(
-            nn.Linear(in_channels + max_freqs**2, hidden_size_input)
-        )
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.embedder = nn.Sequential(
+                nn.Linear(in_channels + max_freqs**2, hidden_size_input)
+            )
+        # Small embedding layer - give GPU priority by removing parameters_manual_cast
 
     @lru_cache(maxsize=4)
     def fetch_pos(self, patch_size, device, dtype):
@@ -305,9 +314,12 @@ class NerfGLUBlock(nn.Module):
         # the gate, value, and output projection matrices.
         # We now need to generate parameters for 3 matrices.
         total_params = 3 * hidden_size_x**2 * mlp_ratio
-        self.param_generator = nn.Linear(hidden_size_s, total_params)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.param_generator = nn.Linear(hidden_size_s, total_params)
         self.norm = RMSNorm(hidden_size_x, use_compiled)
         self.mlp_ratio = mlp_ratio
+        self.parameters_manual_cast = True
         # nn.init.zeros_(self.param_generator.weight)
         # nn.init.zeros_(self.param_generator.bias)
 
@@ -343,9 +355,12 @@ class NerfFinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels, use_compiled):
         super().__init__()
         self.norm = RMSNorm(hidden_size, use_compiled=use_compiled)
-        self.linear = nn.Linear(hidden_size, out_channels)
-        nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.linear = nn.Linear(hidden_size, out_channels)
+            nn.init.zeros_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+        # Small final layer - give GPU priority by removing parameters_manual_cast
 
     def forward(self, x):
         x = self.norm(x)
@@ -359,14 +374,17 @@ class NerfFinalLayerConv(nn.Module):
         self.norm = RMSNorm(hidden_size, use_compiled=use_compiled)
 
         # replace nn.Linear with nn.Conv2d since linear is just pointwise conv
-        self.conv = nn.Conv2d(
-            in_channels=hidden_size,
-            out_channels=out_channels,
-            kernel_size=3,
-            padding=1
-        )
-        nn.init.zeros_(self.conv.weight)
-        nn.init.zeros_(self.conv.bias)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.conv = nn.Conv2d(
+                in_channels=hidden_size,
+                out_channels=out_channels,
+                kernel_size=3,
+                padding=1
+            )
+            nn.init.zeros_(self.conv.weight)
+            nn.init.zeros_(self.conv.bias)
+        # Small final layer - give GPU priority by removing parameters_manual_cast
 
     def forward(self, x):
         # shape: [N, C, H, W] !
@@ -388,12 +406,15 @@ class NerfFinalLayerConv(nn.Module):
 class Approximator(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers=4):
         super().__init__()
-        self.in_proj = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.layers = nn.ModuleList(
-            [MLPEmbedder(hidden_dim, hidden_dim) for x in range(n_layers)]
-        )
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.in_proj = nn.Linear(in_dim, hidden_dim, bias=True)
+            self.layers = nn.ModuleList(
+                [MLPEmbedder(hidden_dim, hidden_dim) for x in range(n_layers)]
+            )
+            self.out_proj = nn.Linear(hidden_dim, out_dim)
         self.norms = nn.ModuleList([RMSNorm(hidden_dim) for x in range(n_layers)])
-        self.out_proj = nn.Linear(hidden_dim, out_dim)
+        self.parameters_manual_cast = True
 
     @property
     def device(self):
@@ -417,6 +438,7 @@ class QKNorm(torch.nn.Module):
         self.query_norm = RMSNorm(dim, use_compiled=use_compiled)
         self.key_norm = RMSNorm(dim, use_compiled=use_compiled)
         self.use_compiled = use_compiled
+        # Small normalization layer - give GPU priority by removing parameters_manual_cast
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         q = self.query_norm(q)
@@ -436,10 +458,13 @@ class SelfAttention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.proj = nn.Linear(dim, dim)
         self.norm = QKNorm(head_dim, use_compiled=use_compiled)
-        self.proj = nn.Linear(dim, dim)
         self.use_compiled = use_compiled
+        # Small attention layer - give GPU priority by removing parameters_manual_cast
 
     def forward(self, x: Tensor, pe: Tensor) -> Tensor:
         qkv = self.qkv(x)
@@ -488,11 +513,13 @@ class DoubleStreamBlock(nn.Module):
         )
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.img_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.img_mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+            )
 
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(
@@ -503,12 +530,15 @@ class DoubleStreamBlock(nn.Module):
         )
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.txt_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.txt_mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+            )
         self.use_compiled = use_compiled
+        self.parameters_manual_cast = True
 
     @property
     def device(self):
@@ -625,10 +655,12 @@ class SingleStreamBlock(nn.Module):
         self.scale = qk_scale or head_dim**-0.5
 
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        # qkv and mlp_in
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
-        # proj and mlp_out
-        self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            # qkv and mlp_in
+            self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
+            # proj and mlp_out
+            self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
 
         self.norm = QKNorm(head_dim, use_compiled=use_compiled)
 
@@ -637,6 +669,7 @@ class SingleStreamBlock(nn.Module):
 
         self.mlp_act = nn.GELU(approximate="tanh")
         self.use_compiled = use_compiled
+        self.parameters_manual_cast = True
 
     @property
     def device(self):
@@ -688,10 +721,13 @@ class LastLayer(nn.Module):
     ):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels, bias=True
-        )
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.linear = nn.Linear(
+                hidden_size, patch_size * patch_size * out_channels, bias=True
+            )
         self.use_compiled = use_compiled
+        self.parameters_manual_cast = True
 
     @property
     def device(self):

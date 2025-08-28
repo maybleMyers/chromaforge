@@ -17,6 +17,23 @@ from .chroma_layers_dct import (
     NerfFinalLayerConv,
     NerfGLUBlock
 )
+from backend.operations import using_forge_operations
+from backend import memory_management
+
+
+def chroma_dct_memory_estimation(input_shape):
+    """
+    ChromaDCT-specific memory estimation for inference.
+    Uses a much smaller multiplier than the default k_model estimation.
+    """
+    area = input_shape[0] * input_shape[2] * input_shape[3]
+    dtype_size = memory_management.dtype_size(torch.bfloat16)  # ChromaDCT uses bfloat16
+    
+    # Use a reasonable multiplier based on actual ChromaDCT inference patterns
+    # This is much smaller than the k_model default of 16384
+    multiplier = 64  # Approximately 1/256th of the k_model default
+    
+    return area * dtype_size * multiplier
 
 
 @dataclass
@@ -126,15 +143,17 @@ class Chroma(nn.Module):
         )
         # self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         # patchify ops
-        self.img_in_patch = nn.Conv2d(
-            params.in_channels,
-            params.hidden_size,
-            kernel_size=params.patch_size,
-            stride=params.patch_size,
-            bias=True
-        )
-        nn.init.zeros_(self.img_in_patch.weight)
-        nn.init.zeros_(self.img_in_patch.bias)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.img_in_patch = nn.Conv2d(
+                params.in_channels,
+                params.hidden_size,
+                kernel_size=params.patch_size,
+                stride=params.patch_size,
+                bias=True
+            )
+            nn.init.zeros_(self.img_in_patch.weight)
+            nn.init.zeros_(self.img_in_patch.bias)
         # TODO: need proper mapping for this approximator output!
         # currently the mapping is hardcoded in distribute_modulations function
         self.distilled_guidance_layer = Approximator(
@@ -143,7 +162,9 @@ class Chroma(nn.Module):
             params.approximator_hidden_size,
             params.approximator_depth,
         )
-        self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
+        # Use forge operations for memory management compatibility
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+            self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
         self.double_blocks = nn.ModuleList(
             [

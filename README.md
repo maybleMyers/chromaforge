@@ -42,9 +42,10 @@ for example modify the source.pth and output.safetensors on the last line in the
 
 ## Radiance Model
 
-Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
+Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use. Needs 18gb vram atm, gonna work on getting offloading working better.  
 
-Training: https://github.com/lodestone-rock/flow/  https://github.com/kohya-ss/sd-scripts/tree/sd3  
+Training: https://github.com/lodestone-rock/flow/  
+          https://github.com/kohya-ss/sd-scripts/tree/sd3  
 Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-fi.com/lodestonerock  
 Discord: http://discord.gg/SQVcWVbqKx  
 

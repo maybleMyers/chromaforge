@@ -23,9 +23,10 @@ from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRe
 from backend.diffusion_engine.sd35 import StableDiffusion3
 from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.chroma import Chroma
+from backend.diffusion_engine.chroma_dct import ChromaDCT
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, Flux]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -109,7 +110,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=['transformer.encoder.embed_tokens.weight', 'logit_scale'])
 
             return model
-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel']:
+        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
 
             model_loader = None
@@ -121,6 +122,20 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             elif cls_name == 'ChromaTransformer2DModel':
                 from backend.nn.chroma import IntegratedChromaTransformer2DModel
                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
+            elif cls_name == 'ChromaDCTTransformer2DModel':
+                from backend.nn.model_dct import Chroma, ChromaParams
+                # Filter config to only include parameters that ChromaParams expects
+                def create_dct_model(c):
+                    dct_config = {k: v for k, v in c.items() if k in [
+                        'in_channels', 'context_in_dim', 'hidden_size', 'mlp_ratio', 
+                        'num_heads', 'depth', 'depth_single_blocks', 'axes_dim', 
+                        'theta', 'qkv_bias', 'guidance_embed', 'approximator_in_dim',
+                        'approximator_depth', 'approximator_hidden_size', 'patch_size',
+                        'nerf_hidden_size', 'nerf_mlp_ratio', 'nerf_depth', 
+                        'nerf_max_freqs', '_use_compiled'
+                    ]}
+                    return Chroma(ChromaParams(**dct_config))
+                model_loader = create_dct_model
             elif cls_name == 'SD3Transformer2DModel':
                 from backend.nn.mmditx import MMDiTX
                 model_loader = lambda c: MMDiTX(**c)
@@ -500,7 +515,44 @@ def forge_loader(sd, additional_state_dicts=None):
     except:
         raise ValueError('Failed to recognize model type!')
     
-    if not chroma_is_in_huggingface_guess \
+    # Debug: Print transformer keys to understand the structure
+    if "transformer" in state_dicts:
+        transformer_keys = list(state_dicts["transformer"].keys())
+        print(f"DEBUG: Found {len(transformer_keys)} transformer keys")
+        dct_keys = [k for k in transformer_keys if k.startswith("img_in_patch.") or k.startswith("nerf_blocks.")]
+        print(f"DEBUG: DCT keys found: {dct_keys[:5]}..." if len(dct_keys) > 5 else f"DEBUG: DCT keys found: {dct_keys}")
+    
+    # Detect ChromaDCT models FIRST by checking for DCT-specific layers
+    if "transformer" in state_dicts and any(key.startswith("img_in_patch.") or key.startswith("nerf_blocks.") for key in state_dicts["transformer"]):
+        estimated_config.huggingface_repo = "ChromaDCT"
+        # Configure DCT-specific parameters
+        estimated_config.unet_config.update({
+            'in_channels': 3,
+            'context_in_dim': 4096,
+            'hidden_size': 3072,
+            'mlp_ratio': 4.0,
+            'num_heads': 24,
+            'depth': 19,
+            'depth_single_blocks': 38,
+            'axes_dim': [16, 56, 56],
+            'theta': 10000,
+            'qkv_bias': True,
+            'guidance_embed': True,
+            'approximator_in_dim': 64,
+            'approximator_depth': 5,
+            'approximator_hidden_size': 5120,
+            'patch_size': 16,
+            'nerf_hidden_size': 64,
+            'nerf_mlp_ratio': 4,
+            'nerf_depth': 4,
+            'nerf_max_freqs': 8,
+            '_use_compiled': False
+        })
+        # ChromaDCT uses same text encoder setup as regular Chroma
+        if 'text_encoder_2' in state_dicts:
+            state_dicts['text_encoder'] = state_dicts['text_encoder_2']
+            del state_dicts['text_encoder_2'] 
+    elif not chroma_is_in_huggingface_guess \
         and estimated_config.huggingface_repo == "black-forest-labs/FLUX.1-schnell"  \
         and "transformer" in state_dicts \
         and "distilled_guidance_layer.layers.0.in_layer.bias" in state_dicts["transformer"]:
@@ -510,11 +562,24 @@ def forge_loader(sd, additional_state_dicts=None):
         for x in GuessChroma.unet_remove_config:
             del estimated_config.unet_config[x]
         state_dicts['text_encoder'] = state_dicts['text_encoder_2']
-        del state_dicts['text_encoder_2'] 
+        del state_dicts['text_encoder_2']
+    
     repo_name = estimated_config.huggingface_repo
 
-    local_path = os.path.join(dir_path, 'huggingface', repo_name)
-    config: dict = DiffusionPipeline.load_config(local_path)
+    # Handle ChromaDCT with direct config to avoid HuggingFace directory structure requirements
+    if repo_name == "ChromaDCT":
+        config = {
+            "_class_name": "FluxPipeline",
+            "_diffusers_version": "0.30.0.dev0",
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            "text_encoder": ["transformers", "T5EncoderModel"],
+            "tokenizer": ["transformers", "T5TokenizerFast"],
+            "transformer": ["diffusers", "ChromaDCTTransformer2DModel"]
+        }
+        local_path = os.path.join(dir_path, 'huggingface', 'Chroma')  # Use Chroma configs for components
+    else:
+        local_path = os.path.join(dir_path, 'huggingface', repo_name)
+        config: dict = DiffusionPipeline.load_config(local_path)
     huggingface_components = {}
     for component_name, v in config.items():
         if isinstance(v, list) and len(v) == 2:
@@ -565,8 +630,15 @@ def forge_loader(sd, additional_state_dicts=None):
         else:
             huggingface_components['scheduler'].config.prediction_type = prediction_types.get(estimated_config.model_type.name, huggingface_components['scheduler'].config.prediction_type)
 
+    # Debug: Print final repo detection
+    print(f"DEBUG: Final repo name: {estimated_config.huggingface_repo}")
+    
     if not chroma_is_in_huggingface_guess and estimated_config.huggingface_repo == "Chroma":
+        print("DEBUG: Loading regular Chroma engine")
         return Chroma(estimated_config=estimated_config, huggingface_components=huggingface_components)
+    if estimated_config.huggingface_repo == "ChromaDCT":
+        print("DEBUG: Loading ChromaDCT engine")
+        return ChromaDCT(estimated_config=estimated_config, huggingface_components=huggingface_components)
     for M in possible_models:
         if any(isinstance(estimated_config, x) for x in M.matched_guesses):
             return M(estimated_config=estimated_config, huggingface_components=huggingface_components)

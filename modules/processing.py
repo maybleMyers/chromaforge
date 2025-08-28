@@ -940,8 +940,16 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             p.seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
             p.subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
 
-            latent_channels = shared.sd_model.forge_objects.vae.latent_channels
-            p.rng = rng.ImageRNG((latent_channels, p.height // opt_f, p.width // opt_f), p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
+            # Handle ChromaDCT models that work in pixel space (no VAE)
+            if shared.sd_model.forge_objects.vae is None:
+                # ChromaDCT works in pixel space - use RGB channels and no downscaling
+                latent_channels = 3  # RGB channels
+                scale_factor = 1     # No downscaling for pixel space
+                p.rng = rng.ImageRNG((latent_channels, p.height // scale_factor, p.width // scale_factor), p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
+            else:
+                # Regular models with VAE - use latent space
+                latent_channels = shared.sd_model.forge_objects.vae.latent_channels
+                p.rng = rng.ImageRNG((latent_channels, p.height // opt_f, p.width // opt_f), p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
 
             if p.scripts is not None:
                 p.scripts.before_process_batch(p, batch_number=n, prompts=p.prompts, seeds=p.seeds, subseeds=p.subseeds)

@@ -1,0 +1,20 @@
+{
+  "_class_name": "FluxPipeline",
+  "_diffusers_version": "0.30.0.dev0",
+  "scheduler": [
+    "diffusers",
+    "FlowMatchEulerDiscreteScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "T5EncoderModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "T5TokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "ChromaDCTTransformer2DModel"
+  ]
+}

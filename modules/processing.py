@@ -803,8 +803,13 @@ def manage_model_and_prompt_cache(p: StableDiffusionProcessing):
 
     p.sd_model, just_reloaded = forge_model_reload()
 
+    # Skip unloading for ChromaDCT models that don't use VAE
+    skip_unload_due_to_chroma_dct = (hasattr(shared.sd_model, 'forge_objects') and
+                                     hasattr(shared.sd_model.forge_objects, 'vae') and
+                                     shared.sd_model.forge_objects.vae is None)
+
     if need_global_unload and not just_reloaded:
-        memory_management.unload_all_models()
+        memory_management.unload_all_models(skip_chroma_dct=skip_unload_due_to_chroma_dct)
 
     if need_global_unload:
         p.clear_prompt_cache()

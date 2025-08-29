@@ -449,7 +449,15 @@ def reload_model_weights(sd_model=None, info=None, forced_reload=False):
 
 
 def unload_model_weights(sd_model=None, info=None):
-    memory_management.unload_all_models()
+    # Check if current model is ChromaDCT before unloading
+    try:
+        skip_chroma_dct = (hasattr(shared.sd_model, 'forge_objects') and
+                          hasattr(shared.sd_model.forge_objects, 'vae') and
+                          shared.sd_model.forge_objects.vae is None)
+    except:
+        skip_chroma_dct = False
+        
+    memory_management.unload_all_models(skip_chroma_dct=skip_chroma_dct)
     return
 
 
@@ -481,8 +489,16 @@ def forge_model_reload():
     timer = Timer()
 
     if model_data.sd_model:
+        # Check if current model is ChromaDCT before unloading
+        try:
+            skip_chroma_dct = (hasattr(model_data.sd_model, 'forge_objects') and
+                              hasattr(model_data.sd_model.forge_objects, 'vae') and
+                              model_data.sd_model.forge_objects.vae is None)
+        except:
+            skip_chroma_dct = False
+            
         model_data.sd_model = None
-        memory_management.unload_all_models()
+        memory_management.unload_all_models(skip_chroma_dct=skip_chroma_dct)
         memory_management.soft_empty_cache()
         gc.collect()
 

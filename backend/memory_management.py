@@ -564,6 +564,23 @@ def unload_model_clones(model):
 
 
 def free_memory(memory_required, device, keep_loaded=[], free_all=False):
+    # Check if we should skip unloading ChromaDCT models
+    skip_chroma_dct_unload = False
+    try:
+        # Try to import shared module and check for ChromaDCT model
+        import modules.shared as shared
+        if (hasattr(shared, 'sd_model') and 
+            hasattr(shared.sd_model, 'forge_objects') and
+            hasattr(shared.sd_model.forge_objects, 'vae') and
+            shared.sd_model.forge_objects.vae is None):
+            skip_chroma_dct_unload = True
+    except:
+        pass  # If import fails or model is not available, proceed normally
+
+    if skip_chroma_dct_unload:
+        print(f"[Memory Management] Skipping memory cleanup for ChromaDCT model")
+        return
+
     # this check fully unloads any 'abandoned' models
     for i in range(len(current_loaded_models) - 1, -1, -1):
         if sys.getrefcount(current_loaded_models[i].model) <= 2:
@@ -1214,5 +1231,9 @@ def soft_empty_cache(force=False):
     return
 
 
-def unload_all_models():
+def unload_all_models(skip_chroma_dct=False):
+    if skip_chroma_dct:
+        # Skip unloading for ChromaDCT models
+        print("[Memory Management] Skipping unload for ChromaDCT model")
+        return
     free_memory(1e30, get_torch_device(), free_all=True)

@@ -11,7 +11,17 @@ from backend import memory_management
 
 def prepare_free_memory(aggressive=False):
     if aggressive:
-        memory_management.unload_all_models()
+        # Check if current model is ChromaDCT before unloading
+        try:
+            import modules.shared as shared
+            skip_chroma_dct = (hasattr(shared, 'sd_model') and 
+                             hasattr(shared.sd_model, 'forge_objects') and
+                             hasattr(shared.sd_model.forge_objects, 'vae') and
+                             shared.sd_model.forge_objects.vae is None)
+        except:
+            skip_chroma_dct = False
+            
+        memory_management.unload_all_models(skip_chroma_dct=skip_chroma_dct)
         print('Cleanup all memory.')
         return
 

@@ -37,7 +37,15 @@ approximation_indexes = {"Full": 0, "Approx NN": 1, "Approx cheap": 2, "TAESD": 
 
 
 def samples_to_images_tensor(sample, approximation=None, model=None):
-    """Transforms 4-channel latent space images into 3-channel RGB image tensors, with values in range [-1, 1]."""
+    """Transforms latent/pixel space tensors into RGB image tensors, with values in range [-1, 1]."""
+
+    if model is None:
+        model = shared.sd_model
+    
+    # Handle ChromaDCT models that work in pixel space
+    if hasattr(model, '__class__') and 'ChromaDCT' in model.__class__.__name__:
+        # ChromaDCT outputs are already in pixel space (B, 3, H, W) with range [-1, 1]
+        return sample.clamp(-1.0, 1.0)
 
     if approximation is None or (shared.state.interrupted and opts.live_preview_fast_interrupt):
         approximation = approximation_indexes.get(opts.show_progress_type, 0)
@@ -60,8 +68,6 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
             x_sample = m(sample.to(devices.device, devices.dtype)).detach()
             x_sample = x_sample * 2 - 1
     else:
-        if model is None:
-            model = shared.sd_model
         x_sample = model.decode_first_stage(sample)
 
     return x_sample

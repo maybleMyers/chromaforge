@@ -49,6 +49,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog  
+8/29/2025  
+    Fixed previews w/ radiance chroma models, fixed memory management and offloading mechanisms for radiance.  
 8/28/2025  
     Added initial support for the radiance model class.  
 7/13/2025  

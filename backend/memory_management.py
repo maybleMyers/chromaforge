@@ -415,13 +415,19 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             legacy_modules.append(m)
 
     # Check if this is a ChromaDCT model and apply specialized profiling
+    is_chromadct = False
     try:
-        from backend.chromadct_memory_strategy import is_chromadct_model, apply_chromadct_swapping_strategy
+        # Detect ChromaDCT by checking for distinctive components
+        if hasattr(model, 'img_in_patch') or any(hasattr(m, 'img_in_patch') for m in all_modules + legacy_modules):
+            is_chromadct = True
+        elif any('img_in_patch' in str(m).lower() for m in all_modules + legacy_modules):
+            is_chromadct = True
         
-        if is_chromadct_model(model):
-            print("Using ChromaDCT-optimized module profiling...")
+        if is_chromadct:
+            print("Detected ChromaDCT model - using optimized module profiling...")
             return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
-    except ImportError:
+    except Exception as e:
+        print(f"ChromaDCT detection failed: {e}")
         pass
 
     # Default profiling for non-ChromaDCT models
@@ -455,24 +461,39 @@ def build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu
     """
     Build module profile optimized for ChromaDCT access patterns
     """
-    from backend.chromadct_memory_strategy import get_chromadct_memory_priority_groups
     
-    # Get priority groups for ChromaDCT components
-    priority_groups = get_chromadct_memory_priority_groups(model)
-    
-    # Create priority mapping for modules
-    module_priorities = {}
-    for priority_level, component_names in priority_groups.items():
-        for component_name in component_names:
-            module_priorities[component_name] = priority_level
-    
-    # Helper function to get module priority
+    # Helper function to categorize modules based on ChromaDCT component names
     def get_module_priority(module):
-        # Try to identify module by common patterns
-        module_name = module.__class__.__name__.lower()
-        for component_name in module_priorities:
-            if component_name.lower() in str(module).lower():
-                return module_priorities[component_name]
+        module_str = str(module).lower()
+        class_name = module.__class__.__name__.lower()
+        
+        # Critical components - always keep on GPU
+        critical_components = ['img_in_patch', 'txt_in', 'pe_embedder', 'distilled_guidance']
+        for comp in critical_components:
+            if comp in module_str or comp in class_name:
+                return 'critical'
+        
+        # High priority - early blocks processed first
+        if 'double_block' in module_str:
+            # Extract block number if possible
+            for i in range(10):  # blocks 0-9 are high priority
+                if f'double_blocks.{i}' in module_str or f'double_block_{i}' in module_str:
+                    return 'high_priority'
+            return 'medium_priority'  # blocks 10+ are medium priority
+        
+        if 'single_block' in module_str:
+            # Extract block number if possible  
+            for i in range(19):  # blocks 0-18 are high priority
+                if f'single_blocks.{i}' in module_str or f'single_block_{i}' in module_str:
+                    return 'high_priority'
+            return 'medium_priority'  # blocks 19+ are medium priority
+        
+        # Low priority - NeRF components (processed as group at end)
+        nerf_components = ['nerf_block', 'nerf_image_embedder', 'nerf_final_layer']
+        for comp in nerf_components:
+            if comp in module_str or comp in class_name:
+                return 'low_priority'
+        
         return 'unknown'
     
     # Separate modules by priority
@@ -512,20 +533,29 @@ def build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu
         ("Unknown", unknown_modules)
     ]
     
+    print(f"ChromaDCT Memory Allocation (Available: {model_gpu_memory_when_using_cpu_swap / (1024**2):.0f} MB):")
+    
     for group_name, modules in module_groups:
         modules_added_to_gpu = 0
         modules_moved_to_cpu = 0
+        group_memory = 0
         
-        for m in modules:
+        # Sort modules by size (larger first for better packing)
+        modules_sorted = sorted(modules, key=lambda m: m.total_mem, reverse=True)
+        
+        for m in modules_sorted:
             if mem_counter + m.total_mem < model_gpu_memory_when_using_cpu_swap:
                 # Can fit entire module on GPU
                 gpu_modules.append(m)
                 mem_counter += m.total_mem
+                group_memory += m.total_mem
                 modules_added_to_gpu += 1
-            elif mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap:
-                # Can fit extra mem on GPU, weights on CPU
+            elif (group_name in ["Critical", "High Priority"] and 
+                  mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap):
+                # For important modules, try to keep extras on GPU even if weights go to CPU
                 gpu_modules_only_extras.append(m)
                 mem_counter += m.extra_mem
+                group_memory += m.extra_mem
                 modules_added_to_gpu += 1
             else:
                 # Must go to CPU
@@ -533,13 +563,13 @@ def build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu
                 modules_moved_to_cpu += 1
         
         if len(modules) > 0:
-            print(f"  {group_name:15}: {modules_added_to_gpu:2d} GPU, {modules_moved_to_cpu:2d} CPU")
+            print(f"  {group_name:15}: {modules_added_to_gpu:2d} GPU, {modules_moved_to_cpu:2d} CPU ({group_memory / (1024**2):.0f} MB)")
     
     total_modules = len(all_categorized_modules)
     gpu_total = len(gpu_modules) + len(gpu_modules_only_extras)
     cpu_total = len(cpu_modules)
     
-    print(f"ChromaDCT Profile: {gpu_total}/{total_modules} modules on GPU ({gpu_total/total_modules*100:.1f}%)")
+    print(f"ChromaDCT Profile: {gpu_total}/{total_modules} modules on GPU ({gpu_total/total_modules*100:.1f}%), Memory used: {mem_counter / (1024**2):.0f} MB")
     
     return gpu_modules, gpu_modules_only_extras, cpu_modules
 
@@ -657,12 +687,25 @@ def minimum_inference_memory():
     
     # Apply ChromaDCT-specific memory optimization
     try:
-        from backend.chromadct_memory_strategy import get_chromadct_inference_memory_multiplier
-        multiplier = get_chromadct_inference_memory_multiplier()
-        if multiplier != 1.0:
-            adjusted_memory = int(current_inference_memory * multiplier)
-            return adjusted_memory
-    except ImportError:
+        from modules import shared
+        if (hasattr(shared, 'sd_model') and shared.sd_model is not None and
+            hasattr(shared.sd_model, 'forge_objects') and 
+            hasattr(shared.sd_model.forge_objects, 'vae') and 
+            shared.sd_model.forge_objects.vae is None):
+            
+            # ChromaDCT models are more memory efficient - reduce inference memory requirement
+            # ChromaDCT works in pixel space (3 channels) vs latent space (16 channels)
+            # and has more efficient patch-based processing
+            chromadct_inference_memory = int(current_inference_memory * 0.4)  # 40% of normal requirement
+            
+            # Only print message once per session
+            if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
+                print(f"ChromaDCT detected - reducing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
+                minimum_inference_memory._chromadct_message_shown = True
+            
+            return chromadct_inference_memory
+    except:
+        # Fallback to normal memory if detection fails
         pass
     
     return current_inference_memory

@@ -326,6 +326,7 @@ def forge_main_entry():
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
     ui_forge_preset.change(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
+    ui_forge_preset.change(js="toggleChromaDCTControls", fn=None, inputs=[ui_forge_preset], queue=False, show_progress=False)
     Context.root_block.load(on_preset_change, inputs=None, outputs=output_targets, queue=False, show_progress=False)
 
     refresh_model_loading_parameters()
@@ -520,5 +521,10 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
     "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "chroma_x0_prediction": shared.OptionInfo(False, "X0 Prediction Mode", gr.Checkbox, 
+                                             {"info": "Use direct image prediction instead of velocity prediction"}),
+    "chroma_pos_offset": shared.OptionInfo(0, "Position Offset", gr.Slider, 
+                                          {"minimum": 0, "maximum": 16, "step": 1,
+                                           "info": "Random position offset for better generalization"}),
     "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
 }))

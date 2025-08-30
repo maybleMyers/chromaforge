@@ -18,6 +18,7 @@ from .chroma_layers_dct import (
     NerfGLUBlock
 )
 from backend.operations import using_forge_operations
+from backend.nn.chroma_utils import prepare_latent_image_ids
 from backend import memory_management
 
 
@@ -432,16 +433,18 @@ class Chroma(nn.Module):
         elif timestep.shape[0] == 1 and bs > 1:
             timestep = timestep.repeat(bs)
         
-        # Create image position IDs (similar to regular Chroma)
+        # Create image position IDs using prepare_latent_image_ids with position_offset support
         patch_size = self.params.patch_size  # Use the actual patch size from params
         h_patches = h // patch_size
         w_patches = w // patch_size
         
-        img_ids = torch.zeros((h_patches, w_patches, 3), device=input_device, dtype=input_dtype)
-        img_ids[..., 1] = img_ids[..., 1] + torch.linspace(0, h_patches - 1, steps=h_patches, device=input_device, dtype=input_dtype)[:, None]
-        img_ids[..., 2] = img_ids[..., 2] + torch.linspace(0, w_patches - 1, steps=w_patches, device=input_device, dtype=input_dtype)[None, :]
-        img_ids = img_ids[None, :].repeat(bs, 1, 1, 1)
-        img_ids = img_ids.reshape(bs, h_patches * w_patches, 3)
+        # Get position_offset from kwargs/transformer_options if available
+        transformer_options = kwargs.get('transformer_options', {})
+        position_offset = transformer_options.get('position_offset', 0)
+        
+        # Use prepare_latent_image_ids with position_offset support
+        img_ids = prepare_latent_image_ids(bs, h, w, patch_size=patch_size, max_offset=position_offset)
+        img_ids = img_ids.to(device=input_device, dtype=input_dtype)
         
         # Create text position IDs (all zeros)
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=input_device, dtype=input_dtype)

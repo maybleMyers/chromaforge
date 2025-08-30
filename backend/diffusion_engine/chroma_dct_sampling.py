@@ -48,17 +48,28 @@ def get_schedule(
     base_shift: float = 0.5,
     max_shift: float = 1.15,
     shift: bool = True,
+    prediction_mode: str = "v",
 ) -> list[float]:
-    # extra step for zero
-    timesteps = torch.linspace(1, 0, num_steps + 1)
+    """Enhanced scheduler that adapts to prediction mode"""
+    
+    if prediction_mode == "x0":
+        # X0 prediction typically uses uniform timestep distribution
+        # Force timestep=1 for X0 training compatibility
+        timesteps = torch.ones(num_steps + 1)
+        timesteps[-1] = 0  # End at 0
+        return timesteps.tolist()
+    else:
+        # Standard velocity prediction schedule
+        # extra step for zero
+        timesteps = torch.linspace(1, 0, num_steps + 1)
 
-    # shifting the schedule to favor high timesteps for higher signal images
-    if shift:
-        # eastimate mu based on linear estimation between two points
-        mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
-        timesteps = time_shift(mu, 1.0, timesteps)
+        # shifting the schedule to favor high timesteps for higher signal images
+        if shift:
+            # eastimate mu based on linear estimation between two points
+            mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
+            timesteps = time_shift(mu, 1.0, timesteps)
 
-    return timesteps.tolist()
+        return timesteps.tolist()
 
 
 def denoise(
@@ -205,6 +216,7 @@ def denoise_cfg(
     guidance: float = 4.0,
     cfg: float = 2.0,
     first_n_steps_without_cfg: int = 4,
+    prediction_mode: str = "v",  # "v" for velocity, "x0" for direct prediction
 ):
     # this is ignored for schnell
     guidance_vec = torch.full(
@@ -224,7 +236,14 @@ def denoise_cfg(
         )
         # disable cfg for x steps before using cfg
         if step_count < first_n_steps_without_cfg or first_n_steps_without_cfg == -1:
-            img = img.to(pred) + (t_prev - t_curr) * pred
+            if prediction_mode == "x0":
+                # X0 prediction: model predicts clean image directly
+                # For X0 mode at t=1 (pure noise), prediction should be the clean image
+                noise = torch.randn_like(img) if step_count == 0 else img
+                img = noise - pred if step_count == 0 else pred
+            else:
+                # Standard velocity prediction
+                img = img.to(pred) + (t_prev - t_curr) * pred
         else:
             pred_neg = model(
                 img=img,
@@ -238,7 +257,12 @@ def denoise_cfg(
 
             pred_cfg = pred_neg + (pred - pred_neg) * cfg
 
-            img = img + (t_prev - t_curr) * pred_cfg
+            if prediction_mode == "x0":
+                # X0 prediction: model predicts clean image directly
+                img = pred_cfg  # Direct assignment for X0 prediction
+            else:
+                # Standard velocity prediction
+                img = img + (t_prev - t_curr) * pred_cfg
 
         step_count += 1
 
@@ -264,6 +288,7 @@ def denoise_cfg_batched_timesteps(
     guidance: float = 0.0,
     cfg: float = 2.0,
     first_n_steps_without_cfg: int = 4,
+    prediction_mode: str = "v",  # "v" for velocity, "x0" for direct prediction
 ):
     """
     Performs ODE solving using the Euler method with Classifier-Free Guidance (CFG)
@@ -381,9 +406,18 @@ def denoise_cfg_batched_timesteps(
         # Reshape dt for broadcasting: (B,) -> (B, 1, 1)
         dt_batch_reshaped = dt_batch.view(batch_size, 1, 1)
 
-        # Euler step update: x_{t+1} = x_t + dt * v(x_t, t)
-        # Ensure img is on the correct device/dtype if pred_final changes it (unlikely but safe)
-        img = img.to(pred_final) + dt_batch_reshaped * pred_final
+        # Apply prediction mode specific integration
+        if prediction_mode == "x0":
+            # X0 prediction: model predicts clean image directly
+            if i == 0:  # First step from pure noise
+                noise = torch.randn_like(img)
+                img = noise - pred_final
+            else:
+                img = pred_final  # Direct assignment for X0 prediction
+        else:
+            # Standard velocity prediction - Euler step update: x_{t+1} = x_t + dt * v(x_t, t)
+            # Ensure img is on the correct device/dtype if pred_final changes it (unlikely but safe)
+            img = img.to(pred_final) + dt_batch_reshaped * pred_final
 
     return img
 

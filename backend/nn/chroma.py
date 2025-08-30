@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 from backend.attention import attention_function
 from backend.utils import fp16_fix, tensor2parameter
 from backend.nn.flux import attention, rope, timestep_embedding, EmbedND, MLPEmbedder, RMSNorm, QKNorm, SelfAttention
+from backend.nn.chroma_utils import prepare_latent_image_ids
 
 class Approximator(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4):
@@ -294,10 +295,16 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         del x, pad_h, pad_w
         h_len = ((h + (patch_size // 2)) // patch_size)
         w_len = ((w + (patch_size // 2)) // patch_size)
-        img_ids = torch.zeros((h_len, w_len, 3), device=input_device, dtype=input_dtype)
-        img_ids[..., 1] = img_ids[..., 1] + torch.linspace(0, h_len - 1, steps=h_len, device=input_device, dtype=input_dtype)[:, None]
-        img_ids[..., 2] = img_ids[..., 2] + torch.linspace(0, w_len - 1, steps=w_len, device=input_device, dtype=input_dtype)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
+        
+        # Get position_offset from kwargs/transformer_options if available
+        transformer_options = kwargs.get('transformer_options', {})
+        position_offset = transformer_options.get('position_offset', 0)
+        
+        # Use prepare_latent_image_ids with position_offset support
+        img_ids = prepare_latent_image_ids(bs, h_len * patch_size, w_len * patch_size, 
+                                          patch_size=patch_size, max_offset=position_offset)
+        img_ids = img_ids.to(device=input_device, dtype=input_dtype)
+        
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=input_device, dtype=input_dtype)
         del input_device, input_dtype
         out = self.inner_forward(img, img_ids, context, txt_ids, timestep)

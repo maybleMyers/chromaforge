@@ -167,6 +167,10 @@ class StableDiffusionProcessing:
     token_merging_ratio_hr = 0
     disable_extra_networks: bool = False
     firstpass_image: Image = None
+    
+    # ChromaDCT specific parameters
+    x0_prediction_mode: bool = False
+    position_offset: int = 0
 
     scripts_value: scripts.ScriptRunner = field(default=None, init=False)
     script_args_value: list = field(default=None, init=False)

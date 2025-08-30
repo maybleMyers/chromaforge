@@ -255,6 +255,12 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
 
         transformer_options["cond_mark"] = compute_cond_mark(cond_or_uncond=cond_or_uncond, sigmas=timestep)
         transformer_options["cond_indices"], transformer_options["uncond_indices"] = compute_cond_indices(cond_or_uncond=cond_or_uncond, sigmas=timestep)
+        
+        # Pass ChromaDCT specific parameters to transformer_options
+        if 'position_offset' in model_options:
+            transformer_options['position_offset'] = model_options['position_offset']
+        if 'x0_prediction_mode' in model_options:
+            transformer_options['x0_prediction_mode'] = model_options['x0_prediction_mode']
 
         c['transformer_options'] = transformer_options
 
@@ -331,8 +337,13 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition):
     timestep = denoiser_params.sigma
     uncond = compile_conditions(denoiser_params.text_uncond)
     cond = compile_weighted_conditions(denoiser_params.text_cond, cond_composition)
-    model_options = unet_patcher.model_options
+    model_options = unet_patcher.model_options.copy()
     seed = self.p.seeds[0]
+    
+    # Add ChromaDCT specific parameters to model_options from processing object
+    if hasattr(self, 'p') and self.p is not None:
+        model_options['x0_prediction_mode'] = getattr(self.p, 'x0_prediction_mode', False)
+        model_options['position_offset'] = getattr(self.p, 'position_offset', 0)
 
     if extra_concat_condition is not None:
         image_cond_in = extra_concat_condition

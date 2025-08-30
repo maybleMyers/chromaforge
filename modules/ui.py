@@ -326,6 +326,13 @@ def create_ui():
                     elif category == "checkboxes":
                         with FormRow(elem_classes="checkboxes-row", variant="compact"):
                             pass
+                            
+                        # ChromaDCT specific controls
+                        with FormRow(elem_classes="chromadct-controls", variant="compact", visible=False, elem_id="txt2img_chromadct_controls") as txt2img_chromadct_controls:
+                            txt2img_x0_prediction_mode = gr.Checkbox(label="X0 Prediction Mode", value=False, elem_id="txt2img_x0_prediction", 
+                                                           info="Use direct image prediction instead of velocity prediction")
+                            txt2img_position_offset = gr.Slider(minimum=0, maximum=16, step=1, label="Position Offset", value=0, elem_id="txt2img_position_offset",
+                                                      info="Random position offset for better generalization")
 
                     elif category == "accordions":
                         with gr.Row(elem_id="txt2img_accordions", elem_classes="accordions"):
@@ -450,6 +457,9 @@ def create_ui():
                 hr_cfg,
                 hr_distilled_cfg,
                 override_settings,
+                # ChromaDCT specific parameters
+                txt2img_x0_prediction_mode,
+                txt2img_position_offset,
             ] + custom_inputs
 
             txt2img_outputs = [

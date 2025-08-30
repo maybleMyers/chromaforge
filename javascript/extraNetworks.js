@@ -481,6 +481,18 @@ function extraNetworksControlTreeViewOnClick(event, tabname, extra_networks_tabn
     pane.classList.toggle("extra-network-dirs-hidden", show);
 }
 
+function toggleChromaDCTControls(preset) {
+    const chromadctControls = gradioApp().getElementById('txt2img_chromadct_controls');
+    if (chromadctControls) {
+        if (preset === 'chroma') {
+            chromadctControls.style.display = 'flex';
+        } else {
+            chromadctControls.style.display = 'none';
+        }
+    }
+    return preset;
+}
+
 function clickLoraRefresh() {
     const targets = ['txt2img_lora', 'txt2img_checkpoints', 'txt2img_textural_inversion', 'img2img_lora', 'img2img_checkpoints', 'img2img_textural_inversion'];
     targets.forEach(function(t) {

@@ -23,15 +23,19 @@ from backend import memory_management
 
 def chroma_dct_memory_estimation(input_shape):
     """
-    ChromaDCT-specific memory estimation for inference.
-    Uses a much smaller multiplier than the default k_model estimation.
+    ChromaDCT-specific memory estimation optimized for pixel-space operations.
+    Uses an improved multiplier that accounts for DCT model characteristics.
     """
     area = input_shape[0] * input_shape[2] * input_shape[3]
     dtype_size = memory_management.dtype_size(torch.bfloat16)  # ChromaDCT uses bfloat16
     
-    # Use a reasonable multiplier based on actual ChromaDCT inference patterns
-    # This is much smaller than the k_model default of 16384
-    multiplier = 64  # Approximately 1/256th of the k_model default
+    # DCT models have different memory patterns than VAE models:
+    # - No VAE encode/decode overhead
+    # - Pixel-space operations (3 channels vs 16 latent channels)  
+    # - NeRF blocks are smaller and more efficient
+    # - Block-group offloading reduces peak memory requirements
+    multiplier = 128  # 2x increase from previous 64, enables less aggressive offloading
+                     # Still 128x less than k_model default of 16384
     
     return area * dtype_size * multiplier
 

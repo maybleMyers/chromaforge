@@ -424,7 +424,10 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             is_chromadct = True
         
         if is_chromadct:
-            print("Detected ChromaDCT model - using optimized module profiling...")
+            # Only print message once per session
+            if not hasattr(build_module_profile, '_chromadct_profiling_message_shown'):
+                print("Detected ChromaDCT model - using optimized module profiling...")
+                build_module_profile._chromadct_profiling_message_shown = True
             return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
     except Exception as e:
         print(f"ChromaDCT detection failed: {e}")

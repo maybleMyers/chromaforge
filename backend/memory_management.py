@@ -414,6 +414,17 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
             legacy_modules.append(m)
 
+    # Check if this is a ChromaDCT model and apply specialized profiling
+    try:
+        from backend.chromadct_memory_strategy import is_chromadct_model, apply_chromadct_swapping_strategy
+        
+        if is_chromadct_model(model):
+            print("Using ChromaDCT-optimized module profiling...")
+            return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
+    except ImportError:
+        pass
+
+    # Default profiling for non-ChromaDCT models
     gpu_modules = []
     gpu_modules_only_extras = []
     mem_counter = 0
@@ -437,6 +448,99 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             gpu_modules_only_extras.remove(m)
             mem_counter += m.weight_mem
 
+    return gpu_modules, gpu_modules_only_extras, cpu_modules
+
+
+def build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap):
+    """
+    Build module profile optimized for ChromaDCT access patterns
+    """
+    from backend.chromadct_memory_strategy import get_chromadct_memory_priority_groups
+    
+    # Get priority groups for ChromaDCT components
+    priority_groups = get_chromadct_memory_priority_groups(model)
+    
+    # Create priority mapping for modules
+    module_priorities = {}
+    for priority_level, component_names in priority_groups.items():
+        for component_name in component_names:
+            module_priorities[component_name] = priority_level
+    
+    # Helper function to get module priority
+    def get_module_priority(module):
+        # Try to identify module by common patterns
+        module_name = module.__class__.__name__.lower()
+        for component_name in module_priorities:
+            if component_name.lower() in str(module).lower():
+                return module_priorities[component_name]
+        return 'unknown'
+    
+    # Separate modules by priority
+    critical_modules = []
+    high_priority_modules = []
+    medium_priority_modules = []  
+    low_priority_modules = []
+    unknown_modules = []
+    
+    all_categorized_modules = all_modules + legacy_modules
+    
+    for m in all_categorized_modules:
+        priority = get_module_priority(m)
+        if priority == 'critical':
+            critical_modules.append(m)
+        elif priority == 'high_priority':
+            high_priority_modules.append(m) 
+        elif priority == 'medium_priority':
+            medium_priority_modules.append(m)
+        elif priority == 'low_priority':
+            low_priority_modules.append(m)
+        else:
+            unknown_modules.append(m)
+    
+    # Allocate modules to GPU/CPU based on priority and memory constraints
+    gpu_modules = []
+    gpu_modules_only_extras = []
+    cpu_modules = []
+    mem_counter = 0
+    
+    # Priority order: critical -> high -> medium -> low -> unknown
+    module_groups = [
+        ("Critical", critical_modules),
+        ("High Priority", high_priority_modules), 
+        ("Medium Priority", medium_priority_modules),
+        ("Low Priority", low_priority_modules),
+        ("Unknown", unknown_modules)
+    ]
+    
+    for group_name, modules in module_groups:
+        modules_added_to_gpu = 0
+        modules_moved_to_cpu = 0
+        
+        for m in modules:
+            if mem_counter + m.total_mem < model_gpu_memory_when_using_cpu_swap:
+                # Can fit entire module on GPU
+                gpu_modules.append(m)
+                mem_counter += m.total_mem
+                modules_added_to_gpu += 1
+            elif mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap:
+                # Can fit extra mem on GPU, weights on CPU
+                gpu_modules_only_extras.append(m)
+                mem_counter += m.extra_mem
+                modules_added_to_gpu += 1
+            else:
+                # Must go to CPU
+                cpu_modules.append(m)
+                modules_moved_to_cpu += 1
+        
+        if len(modules) > 0:
+            print(f"  {group_name:15}: {modules_added_to_gpu:2d} GPU, {modules_moved_to_cpu:2d} CPU")
+    
+    total_modules = len(all_categorized_modules)
+    gpu_total = len(gpu_modules) + len(gpu_modules_only_extras)
+    cpu_total = len(cpu_modules)
+    
+    print(f"ChromaDCT Profile: {gpu_total}/{total_modules} modules on GPU ({gpu_total/total_modules*100:.1f}%)")
+    
     return gpu_modules, gpu_modules_only_extras, cpu_modules
 
 
@@ -550,6 +654,17 @@ current_inference_memory = 1024 * 1024 * 1024
 
 def minimum_inference_memory():
     global current_inference_memory
+    
+    # Apply ChromaDCT-specific memory optimization
+    try:
+        from backend.chromadct_memory_strategy import get_chromadct_inference_memory_multiplier
+        multiplier = get_chromadct_inference_memory_multiplier()
+        if multiplier != 1.0:
+            adjusted_memory = int(current_inference_memory * multiplier)
+            return adjusted_memory
+    except ImportError:
+        pass
+    
     return current_inference_memory
 
 

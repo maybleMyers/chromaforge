@@ -39,6 +39,9 @@ class ChromaDCT(ForgeDiffusionEngine):
         # Import and set ChromaDCT-specific memory estimation to prevent overestimation
         from backend.nn.model_dct import chroma_dct_memory_estimation
         unet.set_memory_peak_estimation_modifier(chroma_dct_memory_estimation)
+        
+        # Enable optimized offloading for ChromaDCT models
+        self.use_optimized_offloading = True
 
         self.text_processing_engine_t5 = T5TextProcessingEngine(
             text_encoder=clip.cond_stage_model.t5xxl,

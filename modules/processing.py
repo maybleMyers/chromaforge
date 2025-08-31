@@ -897,6 +897,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     print(f"[PROCESSING DEBUG] Starting initial torch garbage collection...")
     devices.torch_gc()
     print(f"[PROCESSING DEBUG] Initial torch garbage collection complete")
+    
+    # Reset ChromaDCT optimization state for new generation
+    try:
+        from backend.chromadct_memory_strategy import reset_chromadct_optimization_state
+        reset_chromadct_optimization_state()
+    except (ImportError, AttributeError) as e:
+        print(f"[PROCESSING DEBUG] ChromaDCT optimization reset not available: {e}")
+        pass
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)

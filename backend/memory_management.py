@@ -817,6 +817,43 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
     print(f"[MEMORY DEBUG] Minimum inference memory: {minimum_inference_memory() / (1024**2):.1f} MB")
     print(f"[MEMORY DEBUG] Total memory to free: {memory_to_free / (1024**2):.1f} MB")
     print(f"[MEMORY DEBUG] Memory for inference: {memory_for_inference / (1024**2):.1f} MB")
+    
+    # Check for ChromaDCT models and apply rolling window strategy
+    chromadct_models = []
+    for model in models:
+        if hasattr(model, 'model') and hasattr(model.model, 'model'):
+            try:
+                from backend.chromadct_memory_strategy import (is_chromadct_model, _chromadct_window_manager, 
+                                                             _chromadct_prefetcher, _chromadct_nerf_batcher,
+                                                             get_chromadct_execution_order)
+                if is_chromadct_model(model.model.model):
+                    chromadct_models.append(model)
+                    print(f"[MEMORY DEBUG] ChromaDCT model detected, using optimized memory strategy")
+                    # Mark this component as being loaded for rolling window tracking
+                    component_name = getattr(model, 'name', 'unknown_component')
+                    _chromadct_window_manager.mark_component_loaded(component_name)
+                    
+                    # Check for NeRF batch loading opportunity
+                    if _chromadct_nerf_batcher.should_batch_load_nerf(component_name):
+                        print(f"[MEMORY DEBUG] ChromaDCT NeRF batch loading triggered by {component_name}")
+                        _chromadct_nerf_batcher.mark_nerf_phase_start()
+                    
+                    # Start prefetching for upcoming components  
+                    try:
+                        execution_order = get_chromadct_execution_order()
+                        if component_name in execution_order:
+                            current_pos = execution_order.index(component_name)
+                            prefetch_candidates = _chromadct_prefetcher.get_next_prefetch_candidates(
+                                execution_order, current_pos
+                            )
+                            for candidate in prefetch_candidates[:2]:  # Prefetch next 2 components
+                                _chromadct_prefetcher.start_prefetch_component(candidate, model)
+                    except (ValueError, IndexError, NameError):
+                        # Handle case where function may not be available yet
+                        pass
+                        
+            except ImportError:
+                pass
 
     models_to_load = []
     models_already_loaded = []

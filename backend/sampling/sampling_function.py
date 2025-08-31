@@ -344,6 +344,18 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition):
     if hasattr(self, 'p') and self.p is not None:
         model_options['x0_prediction_mode'] = getattr(self.p, 'x0_prediction_mode', False)
         model_options['position_offset'] = getattr(self.p, 'position_offset', 0)
+        
+        # Update ChromaDCT rolling window manager with current step
+        try:
+            from backend.chromadct_memory_strategy import is_chromadct_model, _chromadct_window_manager
+            if hasattr(model, 'model') and is_chromadct_model(model.model):
+                current_step = getattr(self, '_current_step', 0)
+                total_steps = getattr(self.p, 'steps', 28) if hasattr(self.p, 'steps') else 28
+                _chromadct_window_manager.update_inference_step(current_step, total_steps)
+                # Increment step counter
+                self._current_step = current_step + 1
+        except (ImportError, AttributeError) as e:
+            pass
 
     if extra_concat_condition is not None:
         image_cond_in = extra_concat_condition

@@ -131,9 +131,11 @@ def apply_chromadct_swapping_strategy(model, available_gpu_memory: int):
     
     if not is_chromadct_model(model):
         # Use default strategy for non-ChromaDCT models
+        print(f"[CHROMADCT DEBUG] Model is not ChromaDCT, using default strategy")
         return None
     
-    print(f"Applying ChromaDCT-optimized memory strategy with {available_gpu_memory / (1024**3):.1f}GB available")
+    print(f"\n=== CHROMADCT MEMORY DEBUG: Applying ChromaDCT-optimized memory strategy ===")
+    print(f"[CHROMADCT DEBUG] Available GPU memory: {available_gpu_memory / (1024**3):.2f} GB ({available_gpu_memory / (1024**2):.1f} MB)")
     
     memory_profile = calculate_chromadct_memory_profile(model, available_gpu_memory)
     
@@ -142,9 +144,9 @@ def apply_chromadct_swapping_strategy(model, available_gpu_memory: int):
     cpu_count = sum(len(components) for components in memory_profile['cpu_components'].values())
     total_count = gpu_count + cpu_count
     
-    print(f"ChromaDCT Memory Allocation:")
-    print(f"  GPU: {gpu_count}/{total_count} components ({gpu_count/total_count*100:.1f}%)")
-    print(f"  CPU: {cpu_count}/{total_count} components ({cpu_count/total_count*100:.1f}%)")
+    print(f"[CHROMADCT DEBUG] ChromaDCT Memory Allocation Summary:")
+    print(f"[CHROMADCT DEBUG]   GPU: {gpu_count}/{total_count} components ({gpu_count/total_count*100:.1f}%)")
+    print(f"[CHROMADCT DEBUG]   CPU: {cpu_count}/{total_count} components ({cpu_count/total_count*100:.1f}%)")
     
     for priority in ['critical', 'high_priority', 'medium_priority', 'low_priority']:
         gpu_in_priority = len(memory_profile['gpu_components'].get(priority, []))
@@ -152,7 +154,7 @@ def apply_chromadct_swapping_strategy(model, available_gpu_memory: int):
         total_in_priority = gpu_in_priority + cpu_in_priority
         
         if total_in_priority > 0:
-            print(f"  {priority:15}: {gpu_in_priority:2d}/{total_in_priority:2d} on GPU")
+            print(f"[CHROMADCT DEBUG]   {priority:15}: {gpu_in_priority:2d}/{total_in_priority:2d} on GPU")
     
     return memory_profile
 
@@ -183,11 +185,12 @@ def optimize_chromadct_model_loading(model, available_memory: int, inference_mem
     # More memory available for model weights
     adjusted_available_memory = available_memory + (inference_memory - adjusted_inference_memory)
     
-    print(f"ChromaDCT Memory Optimization:")
-    print(f"  Original inference memory: {inference_memory / (1024**2):.0f} MB")
-    print(f"  Optimized inference memory: {adjusted_inference_memory / (1024**2):.0f} MB")  
-    print(f"  Additional model memory: {(inference_memory - adjusted_inference_memory) / (1024**2):.0f} MB")
-    print(f"  Total available for model: {adjusted_available_memory / (1024**2):.0f} MB")
+    print(f"\n[CHROMADCT DEBUG] === ChromaDCT Memory Optimization ===")
+    print(f"[CHROMADCT DEBUG]   Original inference memory: {inference_memory / (1024**2):.0f} MB")
+    print(f"[CHROMADCT DEBUG]   Optimized inference memory: {adjusted_inference_memory / (1024**2):.0f} MB")  
+    print(f"[CHROMADCT DEBUG]   Memory saved: {(inference_memory - adjusted_inference_memory) / (1024**2):.0f} MB")
+    print(f"[CHROMADCT DEBUG]   Total available for model: {adjusted_available_memory / (1024**2):.0f} MB")
+    print(f"[CHROMADCT DEBUG] === ChromaDCT Memory Optimization Complete ===")
     
     return {
         'adjusted_inference_memory': adjusted_inference_memory,

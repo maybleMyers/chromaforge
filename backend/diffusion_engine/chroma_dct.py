@@ -60,8 +60,24 @@ class ChromaDCT(ForgeDiffusionEngine):
         
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
+        print(f"[CHROMADCT DEBUG] Loading CLIP model for text conditioning...")
+        
+        # Check memory before loading
+        if hasattr(memory_management, 'get_free_memory'):
+            free_mem = memory_management.get_free_memory()
+            print(f"[CHROMADCT DEBUG] Free memory before CLIP load: {free_mem / (1024**2):.1f} MB")
+        
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
-        return self.text_processing_engine_t5(prompt)
+        
+        # Check memory after loading
+        if hasattr(memory_management, 'get_free_memory'):
+            free_mem = memory_management.get_free_memory()
+            print(f"[CHROMADCT DEBUG] Free memory after CLIP load: {free_mem / (1024**2):.1f} MB")
+        
+        print(f"[CHROMADCT DEBUG] Processing text conditioning for {len(prompt)} prompts...")
+        result = self.text_processing_engine_t5(prompt)
+        print(f"[CHROMADCT DEBUG] Text conditioning complete, result shape: {result.shape if hasattr(result, 'shape') else 'N/A'}")
+        return result
 
     @torch.inference_mode()
     def get_prompt_lengths_on_ui(self, prompt):
@@ -75,6 +91,9 @@ class ChromaDCT(ForgeDiffusionEngine):
         # Input x is expected to be in [-1, 1] range from UI
         # DCT model expects pixel values in [0, 1] or [-1, 1] depending on training
         # Based on the training code, it seems to expect values in standard range
+        
+        print(f"[CHROMADCT DEBUG] Encode first stage - input shape: {x.shape}, dtype: {x.dtype}, range: [{x.min():.3f}, {x.max():.3f}]")
+        print(f"[CHROMADCT DEBUG] DCT model operates directly in pixel space, no VAE encoding needed")
         return x
 
     @torch.inference_mode()
@@ -82,4 +101,8 @@ class ChromaDCT(ForgeDiffusionEngine):
         # DCT model outputs directly in pixel space
         # No decoding needed, just ensure proper range
         # Output should be in [-1, 1] range for UI compatibility
-        return x.clamp(-1.0, 1.0)
+        
+        print(f"[CHROMADCT DEBUG] Decode first stage - input shape: {x.shape}, dtype: {x.dtype}, range: [{x.min():.3f}, {x.max():.3f}]")
+        result = x.clamp(-1.0, 1.0)
+        print(f"[CHROMADCT DEBUG] DCT model outputs directly in pixel space, clamped to range: [{result.min():.3f}, {result.max():.3f}]")
+        return result

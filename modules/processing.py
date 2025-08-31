@@ -823,6 +823,21 @@ def manage_model_and_prompt_cache(p: StableDiffusionProcessing):
 
 def process_images(p: StableDiffusionProcessing) -> Processed:
     """applies settings overrides (if any) before processing images, then restores settings as applicable."""
+    
+    print(f"\n=== PROCESSING DEBUG: process_images START ===")
+    print(f"[PROCESSING DEBUG] Processing type: {type(p).__name__}")
+    print(f"[PROCESSING DEBUG] Batch size: {p.batch_size}, Iterations: {p.n_iter}")
+    print(f"[PROCESSING DEBUG] Image size: {p.width}x{p.height}")
+    
+    # Check initial memory state
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.mem_get_info()[0]
+            print(f"[PROCESSING DEBUG] Initial GPU memory free: {free_mem / (1024**2):.1f} MB")
+    except Exception as e:
+        print(f"[PROCESSING DEBUG] Could not check GPU memory: {e}")
+    
     if p.scripts is not None:
         p.scripts.before_process(p)
         
@@ -854,6 +869,17 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         # restore original options
         if p.override_settings_restore_afterwards:
             set_config(stored_opts, save_config=False)
+        
+        # Final memory check
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.mem_get_info()[0]
+                print(f"[PROCESSING DEBUG] Final GPU memory free: {free_mem / (1024**2):.1f} MB")
+        except Exception as e:
+            print(f"[PROCESSING DEBUG] Could not check final GPU memory: {e}")
+        
+        print("=== PROCESSING DEBUG: process_images END ===\n")
 
     return res
 
@@ -861,12 +887,16 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
+    print(f"[PROCESSING DEBUG] process_images_inner: Starting inner processing loop")
+    
     if isinstance(p.prompt, list):
         assert(len(p.prompt) > 0)
     else:
         assert p.prompt is not None
 
+    print(f"[PROCESSING DEBUG] Starting initial torch garbage collection...")
     devices.torch_gc()
+    print(f"[PROCESSING DEBUG] Initial torch garbage collection complete")
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)

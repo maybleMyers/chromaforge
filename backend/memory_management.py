@@ -703,7 +703,12 @@ def minimum_inference_memory():
             
             # Only print message once per session
             if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
-                print(f"ChromaDCT detected - reducing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
+                print(f"\n[CHROMADCT DEBUG] === ChromaDCT Inference Memory Optimization ===")
+                print(f"[CHROMADCT DEBUG] ChromaDCT detected - reducing inference memory:")
+                print(f"[CHROMADCT DEBUG]   Standard inference memory: {current_inference_memory / (1024**2):.0f} MB")
+                print(f"[CHROMADCT DEBUG]   ChromaDCT optimized memory: {chromadct_inference_memory / (1024**2):.0f} MB")
+                print(f"[CHROMADCT DEBUG]   Memory savings: {(current_inference_memory - chromadct_inference_memory) / (1024**2):.0f} MB (60% reduction)")
+                print(f"[CHROMADCT DEBUG] === ChromaDCT Inference Memory Optimization Complete ===")
                 minimum_inference_memory._chromadct_message_shown = True
             
             return chromadct_inference_memory
@@ -725,30 +730,44 @@ def unload_model_clones(model):
 
 
 def free_memory(memory_required, device, keep_loaded=[], free_all=False):
+    print(f"\n[MEMORY DEBUG] === FREEING MEMORY ON {device} ===")
+    
+    # Check current memory state before cleanup
+    if device.type != 'cpu':
+        current_free = get_free_memory(device)
+        print(f"[MEMORY DEBUG] Current free memory before cleanup: {current_free / (1024**2):.1f} MB")
+    
     # this check fully unloads any 'abandoned' models
+    abandoned_count = 0
     for i in range(len(current_loaded_models) - 1, -1, -1):
         if sys.getrefcount(current_loaded_models[i].model) <= 2:
-            current_loaded_models.pop(i).model_unload(avoid_model_moving=True)
+            model = current_loaded_models.pop(i)
+            print(f"[MEMORY DEBUG] Unloading abandoned model: {model.model.__class__.__name__}")
+            model.model_unload(avoid_model_moving=True)
+            abandoned_count += 1
+    
+    if abandoned_count > 0:
+        print(f"[MEMORY DEBUG] Removed {abandoned_count} abandoned models")
 
     if free_all:
         memory_required = 1e30
-        print(f"[Unload] Trying to free all memory for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
+        print(f"[MEMORY DEBUG] [Unload] Trying to free ALL memory for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
     else:
-        print(f"[Unload] Trying to free {memory_required / (1024 * 1024):.2f} MB for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
+        print(f"[MEMORY DEBUG] [Unload] Trying to free {memory_required / (1024 * 1024):.2f} MB for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
 
     offload_everything = ALWAYS_VRAM_OFFLOAD or vram_state == VRAMState.NO_VRAM
     unloaded_model = False
     for i in range(len(current_loaded_models) - 1, -1, -1):
         if not offload_everything:
             free_memory = get_free_memory(device)
-            print(f"Current free memory is {free_memory / (1024 * 1024):.2f} MB ... ", end="")
+            print(f"[MEMORY DEBUG] Current free memory is {free_memory / (1024 * 1024):.2f} MB ... ", end="")
             if free_memory > memory_required:
                 break
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded:
                 m = current_loaded_models.pop(i)
-                print(f"Unload model {m.model.model.__class__.__name__} ", end="")
+                print(f"[MEMORY DEBUG] Unload model {m.model.model.__class__.__name__} ", end="")
                 m.model_unload()
                 del m
                 unloaded_model = True
@@ -761,7 +780,13 @@ def free_memory(memory_required, device, keep_loaded=[], free_all=False):
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
 
-    print('Done.')
+    print('[MEMORY DEBUG] Done.')
+    
+    # Final memory check
+    if device.type != 'cpu':
+        final_free = get_free_memory(device)
+        print(f"[MEMORY DEBUG] Final free memory after cleanup: {final_free / (1024**2):.1f} MB")
+    print(f"[MEMORY DEBUG] === MEMORY CLEANUP COMPLETE ON {device} ===")
     return
 
 
@@ -779,9 +804,19 @@ def compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, inference_mem
 def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
     global vram_state
 
+    print("\n=== MEMORY DEBUG: load_models_gpu START ===")
+    print(f"[MEMORY DEBUG] Models to load: {len(models)}")
+    print(f"[MEMORY DEBUG] Memory required: {memory_required / (1024**2):.1f} MB")
+    print(f"[MEMORY DEBUG] Hard preservation: {hard_memory_preservation / (1024**2):.1f} MB")
+    print(f"[MEMORY DEBUG] Current VRAM state: {vram_state.name}")
+    
     execution_start_time = time.perf_counter()
     memory_to_free = max(minimum_inference_memory(), memory_required) + hard_memory_preservation
     memory_for_inference = minimum_inference_memory() + hard_memory_preservation
+    
+    print(f"[MEMORY DEBUG] Minimum inference memory: {minimum_inference_memory() / (1024**2):.1f} MB")
+    print(f"[MEMORY DEBUG] Total memory to free: {memory_to_free / (1024**2):.1f} MB")
+    print(f"[MEMORY DEBUG] Memory for inference: {memory_for_inference / (1024**2):.1f} MB")
 
     models_to_load = []
     models_already_loaded = []
@@ -796,15 +831,17 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
             models_to_load.append(loaded_model)
 
     if len(models_to_load) == 0:
+        print(f"[MEMORY DEBUG] No models to load, performing cleanup only")
         devs = set(map(lambda a: a.device, models_already_loaded))
         for d in devs:
             if d != torch.device("cpu"):
+                print(f"[MEMORY DEBUG] Freeing memory on device: {d}")
                 free_memory(memory_to_free, d, models_already_loaded)
 
         moving_time = time.perf_counter() - execution_start_time
         if moving_time > 0.1:
-            print(f'Memory cleanup has taken {moving_time:.2f} seconds')
-
+            print(f'[MEMORY DEBUG] Memory cleanup has taken {moving_time:.2f} seconds')
+        print("=== MEMORY DEBUG: load_models_gpu END (cleanup only) ===")
         return
 
     for loaded_model in models_to_load:
@@ -850,8 +887,15 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
         current_loaded_models.insert(0, loaded_model)
 
     moving_time = time.perf_counter() - execution_start_time
-    print(f'Moving model(s) has taken {moving_time:.2f} seconds')
-
+    print(f'[MEMORY DEBUG] Moving model(s) has taken {moving_time:.2f} seconds')
+    
+    # Final memory status
+    for device in [get_torch_device()]:
+        if device.type != 'cpu':
+            free_mem = get_free_memory(device)
+            print(f"[MEMORY DEBUG] Final free memory on {device}: {free_mem / (1024**2):.1f} MB")
+    
+    print("=== MEMORY DEBUG: load_models_gpu END ===")
     return
 
 

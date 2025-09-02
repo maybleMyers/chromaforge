@@ -19,4 +19,7 @@ def build_constructor(sampler_name):
 
 samplers_data_alter = [
     sd_samplers_common.SamplerData('DDPM', build_constructor(sampler_name='ddpm'), ['ddpm'], {}),
+    sd_samplers_common.SamplerData('RES 2s', build_constructor(sampler_name='res_2s'), ['res_2s', 'res2s'], {}),
+    sd_samplers_common.SamplerData('RES 6s', build_constructor(sampler_name='res_6s'), ['res_6s', 'res6s'], {}),
+    sd_samplers_common.SamplerData('RES 16s', build_constructor(sampler_name='res_16s'), ['res_16s', 'res16s'], {}),
 ]

@@ -183,6 +183,14 @@ def denominator(ci, *args):
         result *= (ci - arg)
     return result
 
+def gen_first_col_exp(a, b, c, φ):
+    """Generate first column for exponential RK methods - EXACT copy from RES4LYF"""
+    for i in range(len(c)): 
+        a[i][0] = c[i] * φ(1,i+1) - sum(a[i])
+    for i in range(len(b)): 
+        b[i][0] = φ(1) - sum(b[i])
+    return a, b
+
 def get_res_6s_coefficients(h):
     """Get RES 6s coefficients - copied exactly from RES4LYF"""
     # Original c-values from RES4LYF (with division by zero issue)
@@ -230,13 +238,18 @@ def get_res_6s_coefficients(h):
 
     a = [
         [0, 0, 0, 0, 0, 0],
-        [a2_1, 0, 0, 0, 0, 0],  # First column from gen_first_col_exp
+        [0, 0, 0, 0, 0, 0],  # First column will be filled by gen_first_col_exp
         [0, a3_2, 0, 0, 0, 0],
         [0, a4_2, a4_3, 0, 0, 0],
         [0, a5_2, a5_3, a5_4, 0, 0],
         [0, a6_2, a6_3, a6_4, a6_5, 0],
     ]
-    b = [b1, b2, b3, b4, b5, b6]
+    b = [
+        [0, b2, b3, b4, b5, b6],  # First coefficient will be filled by gen_first_col_exp
+    ]
+    
+    # CRITICAL: Apply gen_first_col_exp like RES4LYF does
+    a, b = gen_first_col_exp(a, b, ci, φ)
     
     return a, b, ci
 
@@ -279,9 +292,21 @@ def get_res_16s_coefficients(h):
             numerator = -ci[i-1]**2 * ci[d-1]*ci[k-1]*ci[l-1] * φ(2,i) + 2*ci[i-1]**3 * (ci[d-1]*ci[k-1] + ci[d-1]*ci[l-1] + ci[k-1]*ci[l-1]) * φ(3,i) - 6*ci[i-1]**4 * (ci[d-1] + ci[k-1] + ci[l-1]) * φ(4,i) + 24*ci[i-1]**5 * φ(5,i)
             a[i-1][j-1] = numerator / prod_diff(ci[j-1], ci[k-1], ci[l-1], ci[d-1])
             
+    # Final B coefficients - fixed version avoiding the syntax error from RES4LYF
     ijdkl = list(permutations([12,13,14,15,16], 5)) 
     for i,j,d,k,l in ijdkl:
-        b[0][i-1] = theta(2, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1]) * φ(2) + theta(3, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1])*φ(3) + theta(4, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1])*φ(4) + theta(5, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1])*φ(5) + theta(6, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1]) * φ(6)
+        numerator = 0
+        for jjj in range(2, 7):  # 2, 3, 4, 5, 6
+            numerator += theta_numerator(jjj, ci[d-1], ci[i-1], ci[k-1], ci[j-1], ci[l-1]) * φ(jjj)
+        # Fixed the syntax error from original RES4LYF line 3152
+        b[0][i-1] = numerator / (ci[i-1] * (ci[i-1] - ci[k-1]) * (ci[i-1] - ci[j-1]) * (ci[i-1] - ci[d-1]) * (ci[i-1] - ci[l-1]))
+
+    # CRITICAL: Apply gen_first_col_exp like RES4LYF does
+    a, b = gen_first_col_exp(a, b, ci, φ)
+
+    # Convert to float like RES4LYF does
+    a = [[float(val) for val in row] for row in a]
+    b = [[float(val) for val in row] for row in b]
 
     return a, b, ci
 
@@ -357,7 +382,7 @@ def sample_res_6s(model, x, sigmas, extra_args=None, callback=None, disable=None
         # Final integration step using RK formula: x_new = x + h * sum(b_i * k_i)
         x_new = x
         for j in range(num_stages):
-            x_new = x_new + h * b[j] * k[j]
+            x_new = x_new + h * b[0][j] * k[j]  # Note: b is nested list now
             
         x = x_new
     

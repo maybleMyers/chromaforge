@@ -51,7 +51,7 @@ Discord: http://discord.gg/SQVcWVbqKx
 
 ## Changlog
 9/2/2025  
-    Add res 2s, res 6s and res 16s samplers to main. Seems to work with beta good. Thanks to ClownsharkBatwing https://github.com/ClownsharkBatwing/RES4LYF  
+    Add res 2s, res 6s and res 16s samplers to main. Seems to work with exponential good. Thanks to ClownsharkBatwing https://github.com/ClownsharkBatwing/RES4LYF  
 8/29/2025  
     Fixed previews w/ radiance chroma models, fixed memory management and offloading mechanisms for radiance somewhat, the memory management deffinately needs some more work.  
 8/28/2025  

@@ -8,6 +8,17 @@ from itertools import permutations, combinations
 
 from tqdm import trange
 
+# Try to import mpmath for high precision arithmetic (needed for RES 16s)
+try:
+    from mpmath import mp, mpf
+    mp.dps = 50  # Set precision like RES4LYF
+    HAS_MPMATH = True
+except ImportError:
+    HAS_MPMATH = False
+    # Fallback to regular float if mpmath not available
+    def mpf(x):
+        return float(x)
+
 # Standalone RES sampler implementations
 RES_SAMPLERS_AVAILABLE = True
 
@@ -255,7 +266,7 @@ def get_res_6s_coefficients(h):
 
 
 def get_res_16s_coefficients(h):
-    """Get RES 16s coefficients - EXACT copy from RES4LYF"""
+    """Get RES 16s coefficients - EXACT copy from RES4LYF with high precision"""
     use_analytic_solution = False  # Use same as RES4LYF default
     
     c1 = 0
@@ -265,12 +276,27 @@ def get_res_16s_coefficients(h):
     c7 = c10 = c14 = 1/4
     c16 = 1
     ci = [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16]
-    φ = Phi(h, ci, analytic_solution=use_analytic_solution)
+    
+    # Use high precision like RES4LYF if available
+    if HAS_MPMATH:
+        ci = [mpf(c_val) for c_val in ci]
+        h_prec = mpf(float(h))
+        φ = Phi(h_prec, ci, analytic_solution=use_analytic_solution)
+    else:
+        φ = Phi(h, ci, analytic_solution=use_analytic_solution)
     
     a3_2 = (1/2) * φ(2,3)
 
-    a = [[0.0 for _ in range(16)] for _ in range(16)]
-    b = [[0.0 for _ in range(16)]]
+    # Initialize with high precision if available
+    if HAS_MPMATH:
+        a = [[mpf(0) for _ in range(16)] for _ in range(16)]
+        b = [[mpf(0) for _ in range(16)]]
+    else:
+        a = [[0.0 for _ in range(16)] for _ in range(16)]
+        b = [[0.0 for _ in range(16)]]
+    
+    # Set a3_2 coefficient (this was missing!)
+    a[2][1] = a3_2
 
     for i in range(3, 5): # i=3,4     j=2
         j=2

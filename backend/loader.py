@@ -186,6 +186,27 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             model.initial_device = initial_device
             model.offload_device = offload_device
 
+            # Apply RamTorch for Chroma models if enabled
+            if cls_name == 'ChromaTransformer2DModel' and backend.args.args.use_ramtorch_chroma:
+                print("[RamTorch] Enabling RamTorch memory management for Chroma model...")
+                from backend.ramtorch_integration import replace_linear_with_bouncing, configure_ramtorch_for_chroma
+
+                # Configure RamTorch for inference-only use
+                configure_ramtorch_for_chroma(
+                    memory_threshold=0.8,  # Use RamTorch when VRAM usage exceeds 80%
+                    prefetch_enabled=True,  # Enable block prefetching for better performance
+                    enable_zero=False  # No ZeRO optimizer needed for inference
+                )
+
+                # Replace Linear layers with CPU-bouncing versions
+                model = replace_linear_with_bouncing(
+                    model,
+                    device=str(load_device),
+                    enable_ramtorch=True
+                )
+
+                print("[RamTorch] Chroma model configured for CPU-GPU weight bouncing")
+
             return model
 
     print(f'Skipped: {component_name} = {lib_name}.{cls_name}')

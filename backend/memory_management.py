@@ -358,6 +358,12 @@ def module_size(module, exclude_device=None, include_device=None, return_split=F
     weight_mem = 0
     weight_patterns = ['weight']
 
+    # Check if this is a RamTorch bouncing linear module
+    is_ramtorch = False
+    module_class_name = module.__class__.__name__
+    if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
+        is_ramtorch = True
+
     for k, p in module.named_parameters():
         t = p.data
 
@@ -379,10 +385,22 @@ def module_size(module, exclude_device=None, include_device=None, return_split=F
                 # quanted
                 element_size = 1.1  # a bit more than 0.5 because of quant state parameters
 
-        module_mem += t.nelement() * element_size
+        # For RamTorch modules, weights are on CPU but we count them differently
+        # Only count the GPU memory usage (which is minimal for RamTorch)
+        if is_ramtorch and k in weight_patterns and t.device.type == 'cpu':
+            # For CPU-bouncing weights, we don't count them in GPU memory
+            # but we do need to account for temporary GPU buffer during forward pass
+            if include_device is not None and include_device.type == 'cuda':
+                # Account for temporary GPU buffer (only needed during computation)
+                weight_mem += t.nelement() * element_size * 0.1  # 10% for temporary buffer
+            elif exclude_device is None:
+                # If not filtering by device, don't count CPU weights as GPU memory
+                pass
+        else:
+            module_mem += t.nelement() * element_size
 
-        if k in weight_patterns:
-            weight_mem += t.nelement() * element_size
+            if k in weight_patterns:
+                weight_mem += t.nelement() * element_size
 
     if return_split:
         return module_mem, weight_mem, module_mem - weight_mem
@@ -618,15 +636,29 @@ class LoadedModel:
             swap_counter = 0
 
             for m in gpu_modules:
-                m.to(self.device)
+                # Check if this is a RamTorch module that should keep weights on CPU
+                module_class_name = m.__class__.__name__
+                if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
+                    # RamTorch modules keep weights on CPU, don't move them
+                    # The module's _apply method is overridden to handle this
+                    pass
+                else:
+                    m.to(self.device)
                 mem_counter += m.total_mem
 
             for m in cpu_modules:
-                m.prev_parameters_manual_cast = m.parameters_manual_cast
-                m.parameters_manual_cast = True
-                m.to(self.model.offload_device)
-                if pin_memory:
-                    m._apply(lambda x: x.pin_memory())
+                # Check if this is a RamTorch module
+                module_class_name = m.__class__.__name__
+                if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
+                    # RamTorch modules already handle their own memory management
+                    # Don't apply standard CPU offloading
+                    pass
+                else:
+                    m.prev_parameters_manual_cast = m.parameters_manual_cast
+                    m.parameters_manual_cast = True
+                    m.to(self.model.offload_device)
+                    if pin_memory:
+                        m._apply(lambda x: x.pin_memory())
                 swap_counter += m.total_mem
 
             for m in gpu_modules_only_extras:

@@ -61,6 +61,7 @@ parser.add_argument("--pin-shared-memory", action="store_true")
 parser.add_argument("--disable-gpu-warning", action="store_true")
 
 parser.add_argument("--use-ramtorch-chroma", action="store_true", help="Enable RamTorch memory management for Chroma models (CPU-GPU weight bouncing for low VRAM)")
+parser.add_argument("--pin-ramtorch", action="store_true", help="Enable RamTorch with pinned memory for faster CPU-GPU transfers (includes --use-ramtorch-chroma)")
 
 args = parser.parse_known_args()[0]
 

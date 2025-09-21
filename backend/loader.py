@@ -187,25 +187,36 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             model.offload_device = offload_device
 
             # Apply RamTorch for Chroma models if enabled
-            if cls_name == 'ChromaTransformer2DModel' and backend.args.args.use_ramtorch_chroma:
-                print("[RamTorch] Enabling RamTorch memory management for Chroma model...")
+            use_ramtorch = backend.args.args.use_ramtorch_chroma or backend.args.args.pin_ramtorch
+            use_pinned = backend.args.args.pin_ramtorch
+
+            if cls_name == 'ChromaTransformer2DModel' and use_ramtorch:
+                if use_pinned:
+                    print("[RamTorch] Enabling RamTorch with pinned memory for faster CPU-GPU transfers...")
+                else:
+                    print("[RamTorch] Enabling RamTorch memory management for Chroma model...")
                 from backend.ramtorch_integration import replace_linear_with_bouncing, configure_ramtorch_for_chroma
 
                 # Configure RamTorch for inference-only use
                 configure_ramtorch_for_chroma(
                     memory_threshold=0.8,  # Use RamTorch when VRAM usage exceeds 80%
                     prefetch_enabled=True,  # Enable block prefetching for better performance
-                    enable_zero=False  # No ZeRO optimizer needed for inference
+                    enable_zero=False,  # No ZeRO optimizer needed for inference
+                    use_pinned_memory=use_pinned  # Enable pinned memory if requested
                 )
 
                 # Replace Linear layers with CPU-bouncing versions
                 model = replace_linear_with_bouncing(
                     model,
                     device=str(load_device),
-                    enable_ramtorch=True
+                    enable_ramtorch=True,
+                    use_pinned_memory=use_pinned
                 )
 
-                print("[RamTorch] Chroma model configured for CPU-GPU weight bouncing")
+                if use_pinned:
+                    print("[RamTorch] Chroma model configured for CPU-GPU weight bouncing with pinned memory")
+                else:
+                    print("[RamTorch] Chroma model configured for CPU-GPU weight bouncing")
 
             return model
 

@@ -113,14 +113,27 @@ class ChromaBouncingForgeLinear(nn.Module):
         self.prefetch_next = prefetch_next  # Reference to next block for prefetching
 
         # Parameters live on CPU for bouncing
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device="cpu").share_memory_()
-        )
-        self.bias = (
-            nn.Parameter(torch.empty(out_features, device="cpu").share_memory_())
-            if bias
-            else None
-        )
+        # Check if pinned memory is enabled via class variable
+        use_pin = getattr(self.__class__, '_use_pinned_memory', False)
+
+        if use_pin:
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, device="cpu").share_memory_().pin_memory()
+            )
+            self.bias = (
+                nn.Parameter(torch.empty(out_features, device="cpu").share_memory_().pin_memory())
+                if bias
+                else None
+            )
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, device="cpu").share_memory_()
+            )
+            self.bias = (
+                nn.Parameter(torch.empty(out_features, device="cpu").share_memory_())
+                if bias
+                else None
+            )
 
         # Forge compatibility attributes
         self.scale_weight = None  # For potential scaling operations
@@ -617,7 +630,8 @@ def _is_forge_linear(module):
 
 
 def replace_linear_with_bouncing(module: nn.Module, device: str = "cuda",
-                                enable_ramtorch: bool = True) -> nn.Module:
+                                enable_ramtorch: bool = True,
+                                use_pinned_memory: bool = False) -> nn.Module:
     """
     Replace all Linear layers in a module with ChromaBouncingLinear layers.
 
@@ -625,6 +639,7 @@ def replace_linear_with_bouncing(module: nn.Module, device: str = "cuda",
         module: The module to convert
         device: Target device for computation
         enable_ramtorch: Whether to enable RamTorch bouncing (if False, returns original module)
+        use_pinned_memory: Enable pinned memory for faster CPU-GPU transfers
 
     Returns:
         Modified module with bouncing linear layers
@@ -913,7 +928,8 @@ def get_ramtorch_memory_stats() -> Dict[str, Any]:
 
 def configure_ramtorch_for_chroma(memory_threshold: float = 0.8,
                                  prefetch_enabled: bool = True,
-                                 enable_zero: bool = False) -> None:
+                                 enable_zero: bool = False,
+                                 use_pinned_memory: bool = False) -> None:
     """
     Configure RamTorch for optimal Chroma model performance.
 
@@ -921,11 +937,18 @@ def configure_ramtorch_for_chroma(memory_threshold: float = 0.8,
         memory_threshold: VRAM usage threshold to trigger aggressive swapping
         prefetch_enabled: Enable block prefetching for sequential processing
         enable_zero: Enable ZeRO-1 optimizer sharding for distributed training
+        use_pinned_memory: Enable pinned memory for faster CPU-GPU transfers
     """
     manager = ChromaMemoryManager.get_instance()
     manager.enable(memory_threshold, prefetch_enabled)
+
+    # Set global flag for pinned memory
+    CPUBouncingLinear._use_pinned_memory = use_pinned_memory
+    ChromaBouncingLinear._use_pinned_memory = use_pinned_memory
+    ChromaBouncingForgeLinear._use_pinned_memory = use_pinned_memory
 
     print(f"RamTorch configured for Chroma:")
     print(f"  Memory threshold: {memory_threshold:.1%}")
     print(f"  Prefetch enabled: {prefetch_enabled}")
     print(f"  ZeRO-1 enabled: {enable_zero}")
+    print(f"  Pinned memory: {use_pinned_memory}")

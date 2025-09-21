@@ -195,14 +195,27 @@ class CPUBouncingLinear(nn.Module):
         self.device = device
 
         # parameters live on CPU
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device="cpu").share_memory_()
-        )
-        self.bias = (
-            nn.Parameter(torch.empty(out_features, device="cpu").share_memory_())
-            if bias
-            else None
-        )
+        # Check if pinned memory is enabled via class variable
+        use_pin = getattr(self.__class__, '_use_pinned_memory', False)
+
+        if use_pin:
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, device="cpu").share_memory_().pin_memory()
+            )
+            self.bias = (
+                nn.Parameter(torch.empty(out_features, device="cpu").share_memory_().pin_memory())
+                if bias
+                else None
+            )
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, device="cpu").share_memory_()
+            )
+            self.bias = (
+                nn.Parameter(torch.empty(out_features, device="cpu").share_memory_())
+                if bias
+                else None
+            )
 
         # init
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)

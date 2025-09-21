@@ -731,7 +731,7 @@ def minimum_inference_memory():
             # ChromaDCT models are more memory efficient - reduce inference memory requirement
             # ChromaDCT works in pixel space (3 channels) vs latent space (16 channels)
             # and has more efficient patch-based processing
-            chromadct_inference_memory = int(current_inference_memory * 0.4)  # 40% of normal requirement
+            chromadct_inference_memory = int(current_inference_memory * 1)  # reset
             
             # Only print message once per session
             if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):

@@ -159,22 +159,23 @@ def progressapi(req: ProgressRequest):
 
     # current_live_preview remains None by default
     # current_id_live_preview is already req.id_live_preview
-    if opts.live_previews_enable and req.live_preview:
+    if opts is not None and opts.live_previews_enable and req.live_preview:
         shared.state.set_current_image() # Make sure this method exists and is safe
         if shared.state.id_live_preview != req.id_live_preview:
             image = shared.state.current_image
             if image is not None:
                 buffered = io.BytesIO()
                 save_kwargs = {}
-                if opts.live_previews_image_format == "png":
+                image_format = getattr(opts, 'live_previews_image_format', 'png') if opts else 'png'
+                if image_format == "png":
                     if max(*image.size) <= 256:
                         save_kwargs = {"optimize": True}
                     else:
                         save_kwargs = {"optimize": False, "compress_level": 1}
-                
-                image.save(buffered, format=opts.live_previews_image_format, **save_kwargs)
+
+                image.save(buffered, format=image_format, **save_kwargs)
                 base64_image = base64.b64encode(buffered.getvalue()).decode('ascii')
-                current_live_preview = f"data:image/{opts.live_previews_image_format};base64,{base64_image}"
+                current_live_preview = f"data:image/{image_format};base64,{base64_image}"
                 current_id_live_preview = shared.state.id_live_preview
 
     current_textinfo = shared.state.textinfo # This could be None

@@ -74,13 +74,18 @@ def refresh_vae_list():
     vae_dict.clear()
 
     paths = [
-        os.path.join(sd_models.model_path, '**/*.vae.ckpt'),
-        os.path.join(sd_models.model_path, '**/*.vae.pt'),
-        os.path.join(sd_models.model_path, '**/*.vae.safetensors'),
         os.path.join(vae_path, '**/*.ckpt'),
         os.path.join(vae_path, '**/*.pt'),
         os.path.join(vae_path, '**/*.safetensors'),
     ]
+
+    # Add model_path paths if available
+    if hasattr(sd_models, 'model_path') and sd_models.model_path is not None:
+        paths = [
+            os.path.join(sd_models.model_path, '**/*.vae.ckpt'),
+            os.path.join(sd_models.model_path, '**/*.vae.pt'),
+            os.path.join(sd_models.model_path, '**/*.vae.safetensors'),
+        ] + paths
 
     if shared.cmd_opts.ckpt_dir is not None and os.path.isdir(shared.cmd_opts.ckpt_dir):
         paths += [

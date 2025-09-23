@@ -35,7 +35,9 @@ https://github.com/MisterChief95/sd-forge-extra-samplers
 
 ## RamForge
 
-This supports use of the RamTorch memory management system developed by lord Loadstones. Add --use-ramtorch-chroma to your command line arguments. It will drastically lower vram usage to let you increase batch size or resolution greatly above what you could previously use. For instance you can run a batch of 8 1024x1024 images with a 12gb GPU. It does increas normal RAM usage by alot, 64GB recommended.  
+This supports use of the RamTorch memory management system. Add --use-ramtorch-chroma to your command line arguments. It will drastically lower vram usage to let you increase batch size or resolution greatly above what you could previously use. For instance you can run a batch of 8 1024x1024 images with a 12gb GPU. It does increas normal RAM usage by alot, 64GB recommended.  
+
+This was designed for training, it seems like not using it is faster.  
 
 https://github.com/lodestone-rock/RamTorch
 

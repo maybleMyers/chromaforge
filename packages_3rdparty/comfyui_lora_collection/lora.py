@@ -339,7 +339,7 @@ def model_lora_keys_unet(model, key_map={}):
     #             key_lora = k[len("diffusion_model."):-len(".weight")]
     #             key_map["base_model.model.{}".format(key_lora)] = k #official hunyuan lora format
 
-    if 'flux' in model.config.huggingface_repo.lower(): #Diffusers lora Flux
+    if 'flux' in model.config.huggingface_repo.lower() or 'chroma' in model.config.huggingface_repo.lower(): #Diffusers lora Flux and Chroma
         diffusers_keys = utils.flux_to_diffusers(model.diffusion_model.config, output_prefix="diffusion_model.")
         for k in diffusers_keys:
             if k.endswith(".weight"):

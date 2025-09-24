@@ -52,6 +52,8 @@ Discord: http://discord.gg/SQVcWVbqKx
 
 ## Changlog
 
+9/24/2025  
+    One trainer lora should load correctly now.  
 9/19/2025  
     Added support for RamTorch memory management system using normal chroma models. Use it by moidfying your webui-user.bat's set COMMANDLINE_ARGS= --use-ramtorch-chroma https://github.com/lodestone-rock/RamTorch  
 9/2/2025  

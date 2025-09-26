@@ -52,6 +52,8 @@ Discord: http://discord.gg/SQVcWVbqKx
 
 ## Changlog
 
+9/26/2025  
+    Improve memory management when offloading with async. async should be the fastest way to offload.  
 9/24/2025  
     One trainer lora should load correctly now.  
 9/19/2025  

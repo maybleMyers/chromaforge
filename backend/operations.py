@@ -8,9 +8,6 @@ from backend import stream, memory_management, utils
 from backend.patcher.lora import merge_lora_to_weight
 
 
-stash = {}
-
-
 def get_weight_and_bias(layer, weight_args=None, bias_args=None, weight_fn=None, bias_fn=None):
     scale_weight = getattr(layer, 'scale_weight', None)
     patches = getattr(layer, 'forge_online_loras', None)
@@ -56,7 +53,7 @@ def get_weight_and_bias(layer, weight_args=None, bias_args=None, weight_fn=None,
 
 def weights_manual_cast(layer, x, skip_weight_dtype=False, skip_bias_dtype=False, weight_fn=None, bias_fn=None):
     weight, bias, signal = None, None, None
-    non_blocking = True
+    non_blocking = stream.should_use_stream()  # Use async transfer if stream is enabled
 
     if getattr(x.device, 'type', None) == 'mps':
         non_blocking = False
@@ -74,45 +71,21 @@ def weights_manual_cast(layer, x, skip_weight_dtype=False, skip_bias_dtype=False
     else:
         bias_args = dict(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
 
-    if stream.should_use_stream():
-        with stream.stream_context()(stream.mover_stream):
-            weight, bias = get_weight_and_bias(layer, weight_args, bias_args, weight_fn=weight_fn, bias_fn=bias_fn)
-            signal = stream.mover_stream.record_event()
-    else:
-        weight, bias = get_weight_and_bias(layer, weight_args, bias_args, weight_fn=weight_fn, bias_fn=bias_fn)
+    # Simply get weights with async flag, no special stream handling
+    weight, bias = get_weight_and_bias(layer, weight_args, bias_args, weight_fn=weight_fn, bias_fn=bias_fn)
 
     return weight, bias, signal
 
 
 @contextlib.contextmanager
 def main_stream_worker(weight, bias, signal):
-    if signal is None or not stream.should_use_stream():
-        yield
-        return
-
-    with stream.stream_context()(stream.current_stream):
-        stream.current_stream.wait_event(signal)
-        yield
-        finished_signal = stream.current_stream.record_event()
-        stash[id(finished_signal)] = (weight, bias, finished_signal)
-
-    garbage = []
-    for k, (w, b, s) in stash.items():
-        if s.query():
-            garbage.append(k)
-
-    for k in garbage:
-        del stash[k]
+    # Simple pass-through - async transfers are handled by non_blocking flag
+    yield
     return
 
 
 def cleanup_cache():
-    if not stream.should_use_stream():
-        return
-
-    stream.current_stream.synchronize()
-    stream.mover_stream.synchronize()
-    stash.clear()
+    # No longer needed since we're not using stash
     return
 
 

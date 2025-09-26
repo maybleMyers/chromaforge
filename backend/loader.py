@@ -123,19 +123,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 from backend.nn.chroma import IntegratedChromaTransformer2DModel
                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
             elif cls_name == 'ChromaDCTTransformer2DModel':
-                from backend.nn.model_dct import Chroma, ChromaParams
-                # Filter config to only include parameters that ChromaParams expects
-                def create_dct_model(c):
-                    dct_config = {k: v for k, v in c.items() if k in [
-                        'in_channels', 'context_in_dim', 'hidden_size', 'mlp_ratio', 
-                        'num_heads', 'depth', 'depth_single_blocks', 'axes_dim', 
-                        'theta', 'qkv_bias', 'guidance_embed', 'approximator_in_dim',
-                        'approximator_depth', 'approximator_hidden_size', 'patch_size',
-                        'nerf_hidden_size', 'nerf_mlp_ratio', 'nerf_depth', 
-                        'nerf_max_freqs', '_use_compiled'
-                    ]}
-                    return Chroma(ChromaParams(**dct_config))
-                model_loader = create_dct_model
+                from backend.nn.model_dct import IntegratedChromaDCTTransformer2DModel
+                model_loader = lambda c: IntegratedChromaDCTTransformer2DModel(**c)
             elif cls_name == 'SD3Transformer2DModel':
                 from backend.nn.mmditx import MMDiTX
                 model_loader = lambda c: MMDiTX(**c)

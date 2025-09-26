@@ -35,11 +35,10 @@ class ChromaDCT(ForgeDiffusionEngine):
             k_predictor=k_predictor,
             config=estimated_config
         )
-        
-        # Import and set ChromaDCT-specific memory estimation to prevent overestimation
-        from backend.nn.model_dct import chroma_dct_memory_estimation
-        unet.set_memory_peak_estimation_modifier(chroma_dct_memory_estimation)
-        
+
+        # Removed ChromaDCT-specific memory estimation - use same as regular Chroma
+        # This fixes the performance issue where ChromaDCT was 2x slower
+
         # Enable optimized offloading for ChromaDCT models
         self.use_optimized_offloading = True
 

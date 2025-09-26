@@ -44,7 +44,7 @@ https://github.com/lodestone-rock/RamTorch
 ## Radiance Model
 
 Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
-The memory management is currently derped. It will run fast with a 24GB card when setting the gpu weights to about 19,200, but if you need to offload expect 4x slowdown. You can dick with the gpu weights setting and it might run good if you set it to like half your vram.   
+The memory management is currently derped. It will run fast with a 24GB card when setting the gpu weights to about 19,200, but if you need to offload expect 2x slowdown. You can dick with the gpu weights setting and it might run good if you set it to like half your vram or 3/4, I am working on improving the speeds with it.   
 
 Training: https://github.com/lodestone-rock/flow/  https://github.com/kohya-ss/sd-scripts/tree/sd3  
 Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-fi.com/lodestonerock  
@@ -53,7 +53,7 @@ Discord: http://discord.gg/SQVcWVbqKx
 ## Changlog
 
 9/26/2025  
-    Improve memory management when offloading with async. async should be the fastest way to offload.  
+    Improve memory management when offloading with async. async should be the fastest way to offload. Offloading with radiance improved, still slow though.   
 9/24/2025  
     One trainer lora should load correctly now.  
 9/19/2025  

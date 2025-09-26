@@ -188,7 +188,9 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
         to_batch = to_batch_temp[:1]
 
         if memory_management.signal_empty_cache:
-            memory_management.soft_empty_cache()
+            # Don't empty cache during async swap to maintain model weights on GPU
+            if not memory_management.stream.should_use_stream():
+                memory_management.soft_empty_cache()
 
         free_memory = memory_management.get_free_memory(x_in.device)
 

@@ -691,7 +691,8 @@ class LoadedModel:
 
         # Reset signal_empty_cache after model loading is complete to prevent
         # unnecessary cache clearing during inference
-        signal_empty_cache = False
+        if not stream.should_use_stream():
+            signal_empty_cache = False
         
         return self.real_model
 
@@ -719,30 +720,24 @@ current_inference_memory = 1024 * 1024 * 1024
 
 def minimum_inference_memory():
     global current_inference_memory
-    
+
     # Apply ChromaDCT-specific memory optimization
     try:
-        from modules import shared
-        if (hasattr(shared, 'sd_model') and shared.sd_model is not None and
-            hasattr(shared.sd_model, 'forge_objects') and 
-            hasattr(shared.sd_model.forge_objects, 'vae') and 
-            shared.sd_model.forge_objects.vae is None):
-            
-            # ChromaDCT models are more memory efficient - reduce inference memory requirement
-            # ChromaDCT works in pixel space (3 channels) vs latent space (16 channels)
-            # and has more efficient patch-based processing
-            chromadct_inference_memory = int(current_inference_memory * 1)  # reset
-            
+        from backend import chromadct_memory_strategy
+        if chromadct_memory_strategy.is_chromadct_model(None):
+            multiplier = chromadct_memory_strategy.get_chromadct_inference_memory_multiplier()
+            chromadct_inference_memory = int(current_inference_memory * multiplier)
+
             # Only print message once per session
             if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
-                print(f"ChromaDCT detected - reducing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
+                print(f"ChromaDCT detected - optimizing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
                 minimum_inference_memory._chromadct_message_shown = True
-            
+
             return chromadct_inference_memory
-    except:
+    except Exception as e:
         # Fallback to normal memory if detection fails
         pass
-    
+
     return current_inference_memory
 
 
@@ -800,6 +795,14 @@ def free_memory(memory_required, device, keep_loaded=[], free_all=False):
 def compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, inference_memory):
     maximum_memory_available = current_free_mem - inference_memory
 
+    # When using async swap with user-specified GPU weights, respect that setting
+    from modules_forge import main_entry
+    if hasattr(main_entry, 'user_specified_model_memory') and main_entry.user_specified_model_memory is not None:
+        # User has explicitly set GPU weights - use that value
+        user_memory = main_entry.user_specified_model_memory * 1024 * 1024  # Convert MB to bytes
+        if user_memory <= maximum_memory_available:
+            return int(user_memory)
+
     suggestion = max(
         maximum_memory_available / 1.3,
         maximum_memory_available - 1024 * 1024 * 1024 * 1.25
@@ -847,11 +850,21 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
         loaded_model.compute_inclusive_exclusive_memory()
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.exclusive_memory + loaded_model.inclusive_memory * 0.25
 
+    # When using async swap, calculate total GPU budget to properly allocate between models
+    total_models_memory = sum(loaded_model.exclusive_memory for loaded_model in models_to_load)
+    gpu_memory_budget = None
+    if stream.should_use_stream() and len(models_to_load) > 1:
+        # Get the user-specified GPU memory budget
+        from modules_forge import main_entry
+        if hasattr(main_entry, 'user_specified_model_memory') and main_entry.user_specified_model_memory is not None:
+            gpu_memory_budget = main_entry.user_specified_model_memory * 1024 * 1024  # Convert MB to bytes
+            print(f"[Async Swap] Using user-specified GPU budget: {gpu_memory_budget / (1024 * 1024):.2f} MB for {len(models_to_load)} models")
+
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_memory(total_memory_required[device] * 1.3 + memory_to_free, device, models_already_loaded)
 
-    for loaded_model in models_to_load:
+    for idx, loaded_model in enumerate(models_to_load):
         model = loaded_model.model
         torch_dev = model.load_device
         if is_device_cpu(torch_dev):
@@ -869,11 +882,22 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
 
             print(f"[Memory Management] Target: {loaded_model.model.model.__class__.__name__}, Free GPU: {current_free_mem / (1024 * 1024):.2f} MB, Model Require: {model_require / (1024 * 1024):.2f} MB, Previously Loaded: {previously_loaded / (1024 * 1024):.2f} MB, Inference Require: {memory_for_inference / (1024 * 1024):.2f} MB, Remaining: {estimated_remaining_memory / (1024 * 1024):.2f} MB, ", end="")
 
+            # Use same memory allocation logic for both async and queue methods
             if estimated_remaining_memory < 0:
                 vram_set_state = VRAMState.LOW_VRAM
-                model_gpu_memory_when_using_cpu_swap = compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, memory_for_inference)
-                if previously_loaded > 0:
-                    model_gpu_memory_when_using_cpu_swap = previously_loaded
+                if gpu_memory_budget is not None and total_models_memory > 0:
+                    # Allocate GPU memory proportionally based on model size
+                    model_proportion = loaded_model.exclusive_memory / total_models_memory
+                    model_gpu_memory_when_using_cpu_swap = int(gpu_memory_budget * model_proportion)
+                    # Ensure we leave some memory for the last model in case of rounding
+                    if idx == len(models_to_load) - 1:
+                        already_allocated = sum(getattr(m, 'allocated_gpu_memory', 0) for m in models_to_load[:idx])
+                        model_gpu_memory_when_using_cpu_swap = int(gpu_memory_budget - already_allocated)
+                    loaded_model.allocated_gpu_memory = model_gpu_memory_when_using_cpu_swap
+                else:
+                    model_gpu_memory_when_using_cpu_swap = compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, memory_for_inference)
+                    if previously_loaded > 0:
+                        model_gpu_memory_when_using_cpu_swap = previously_loaded
 
         if vram_set_state == VRAMState.NO_VRAM:
             model_gpu_memory_when_using_cpu_swap = 0

@@ -165,7 +165,8 @@ def get_chromadct_inference_memory_multiplier() -> float:
     if is_chromadct_model(None):
         # ChromaDCT processes in pixel space (3 channels) vs latent space (16 channels)
         # and has more efficient NeRF processing
-        return 1  # reset
+        # Reduce inference memory requirement for ChromaDCT
+        return 0.75  # Use 75% of normal inference memory
     return 1.0
 
 

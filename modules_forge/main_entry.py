@@ -10,6 +10,7 @@ from modules.shared import cmd_opts
 
 
 total_vram = int(memory_management.total_vram)
+user_specified_model_memory = None  # Track user-specified GPU weights
 
 ui_forge_preset: gr.Radio = None
 
@@ -173,6 +174,7 @@ def ui_refresh_memory_management_settings(model_memory, async_loading, pin_share
     )
 
 def refresh_memory_management_settings(async_loading=None, inference_memory=None, pin_shared_memory=None, model_memory=None):
+    global user_specified_model_memory
     # Fallback to defaults if values are not passed
     async_loading = async_loading if async_loading is not None else shared.opts.forge_async_loading
     inference_memory = inference_memory if inference_memory is not None else shared.opts.forge_inference_memory
@@ -181,8 +183,10 @@ def refresh_memory_management_settings(async_loading=None, inference_memory=None
     # If model_memory is provided, calculate inference memory accordingly, otherwise use inference_memory directly
     if model_memory is None:
         model_memory = total_vram - inference_memory
+        user_specified_model_memory = None  # Using inference memory slider
     else:
         inference_memory = total_vram - model_memory
+        user_specified_model_memory = model_memory  # User explicitly set GPU weights
 
     shared.opts.set('forge_async_loading', async_loading)
     shared.opts.set('forge_inference_memory', inference_memory)

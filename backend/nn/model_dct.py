@@ -20,24 +20,9 @@ from .chroma_layers_dct import (
 from backend.operations import using_forge_operations
 from backend import memory_management
 
-
-def chroma_dct_memory_estimation(input_shape):
-    """
-    ChromaDCT-specific memory estimation optimized for pixel-space operations.
-    Uses an improved multiplier that accounts for DCT model characteristics.
-    """
-    area = input_shape[0] * input_shape[2] * input_shape[3]
-    dtype_size = memory_management.dtype_size(torch.bfloat16)  # ChromaDCT uses bfloat16
-    
-    # DCT models have different memory patterns than VAE models:
-    # - No VAE encode/decode overhead
-    # - Pixel-space operations (3 channels vs 16 latent channels)  
-    # - NeRF blocks are smaller and more efficient
-    # - Block-group offloading reduces peak memory requirements
-    multiplier = 128  # 2x increase from previous 64, enables less aggressive offloading
-                     # Still 128x less than k_model default of 16384
-    
-    return area * dtype_size * multiplier
+# Removed chroma_dct_memory_estimation function
+# ChromaDCT now uses the same memory estimation as regular Chroma
+# This fixes the issue where ChromaDCT was keeping too much in CPU swap
 
 
 @dataclass
@@ -465,3 +450,23 @@ class Chroma(nn.Module):
         )
         
         return result
+
+
+class IntegratedChromaDCTTransformer2DModel(Chroma):
+    """
+    Integrated wrapper for ChromaDCT model to match the memory management
+    of IntegratedChromaTransformer2DModel.
+
+    This inherits directly from Chroma to ensure state dict keys match properly.
+    """
+
+    def __init__(self, **config):
+        # Use default ChromaDCT params (defined at the top of this file)
+        # The config passed from Flux config doesn't have the right parameters
+        params = chroma_params  # Use the predefined ChromaDCT parameters
+
+        # Call parent Chroma init directly
+        super().__init__(params)
+
+        # The model is self, not a separate attribute
+        # This ensures state dict keys match without "model." prefix

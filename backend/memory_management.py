@@ -432,24 +432,26 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
             legacy_modules.append(m)
 
-    # Check if this is a ChromaDCT model and apply specialized profiling
-    is_chromadct = False
-    try:
-        # Detect ChromaDCT by checking for distinctive components
-        if hasattr(model, 'img_in_patch') or any(hasattr(m, 'img_in_patch') for m in all_modules + legacy_modules):
-            is_chromadct = True
-        elif any('img_in_patch' in str(m).lower() for m in all_modules + legacy_modules):
-            is_chromadct = True
-        
-        if is_chromadct:
-            # Only print message once per session
-            if not hasattr(build_module_profile, '_chromadct_profiling_message_shown'):
-                print("Detected ChromaDCT model - using optimized module profiling...")
-                build_module_profile._chromadct_profiling_message_shown = True
-            return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
-    except Exception as e:
-        print(f"ChromaDCT detection failed: {e}")
-        pass
+    # Disabled ChromaDCT special profiling - use normal profiling for all models
+    # This improves ChromaDCT performance to be only ~10% slower than regular Chroma
+    # instead of 2x slower with the special profiling
+    # is_chromadct = False
+    # try:
+    #     # Detect ChromaDCT by checking for distinctive components
+    #     if hasattr(model, 'img_in_patch') or any(hasattr(m, 'img_in_patch') for m in all_modules + legacy_modules):
+    #         is_chromadct = True
+    #     elif any('img_in_patch' in str(m).lower() for m in all_modules + legacy_modules):
+    #         is_chromadct = True
+    #
+    #     if is_chromadct:
+    #         # Only print message once per session
+    #         if not hasattr(build_module_profile, '_chromadct_profiling_message_shown'):
+    #             print("Detected ChromaDCT model - using optimized module profiling...")
+    #             build_module_profile._chromadct_profiling_message_shown = True
+    #         return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
+    # except Exception as e:
+    #     print(f"ChromaDCT detection failed: {e}")
+    #     pass
 
     # Default profiling for non-ChromaDCT models
     gpu_modules = []
@@ -721,22 +723,22 @@ current_inference_memory = 1024 * 1024 * 1024
 def minimum_inference_memory():
     global current_inference_memory
 
-    # Apply ChromaDCT-specific memory optimization
-    try:
-        from backend import chromadct_memory_strategy
-        if chromadct_memory_strategy.is_chromadct_model(None):
-            multiplier = chromadct_memory_strategy.get_chromadct_inference_memory_multiplier()
-            chromadct_inference_memory = int(current_inference_memory * multiplier)
-
-            # Only print message once per session
-            if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
-                print(f"ChromaDCT detected - optimizing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
-                minimum_inference_memory._chromadct_message_shown = True
-
-            return chromadct_inference_memory
-    except Exception as e:
-        # Fallback to normal memory if detection fails
-        pass
+    # Disabled ChromaDCT-specific memory optimization - use same memory for all models
+    # try:
+    #     from backend import chromadct_memory_strategy
+    #     if chromadct_memory_strategy.is_chromadct_model(None):
+    #         multiplier = chromadct_memory_strategy.get_chromadct_inference_memory_multiplier()
+    #         chromadct_inference_memory = int(current_inference_memory * multiplier)
+    #
+    #         # Only print message once per session
+    #         if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
+    #             print(f"ChromaDCT detected - optimizing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
+    #             minimum_inference_memory._chromadct_message_shown = True
+    #
+    #         return chromadct_inference_memory
+    # except Exception as e:
+    #     # Fallback to normal memory if detection fails
+    #     pass
 
     return current_inference_memory
 

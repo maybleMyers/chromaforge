@@ -56,21 +56,8 @@ class KModel(torch.nn.Module):
             if attention.get_attn_precision() == torch.float32:
                 dtype_size = 4
 
-        # Check if this is a ChromaDCT model and apply optimized memory calculation
-        try:
-            # ChromaDCT models have distinctive components - check for img_in_patch
-            if hasattr(self.diffusion_model, 'img_in_patch'):
-                # ChromaDCT models process RGB (3 channels) directly vs latent space (16 channels)
-                # They also use patch-based processing which is more memory efficient
-                # Reduce multiplier from 16384 to 2048 (8x reduction)
-                
-                # Only print detection message once per model instance
-                if not hasattr(self, '_chromadct_detected'):
-                    print("Detected ChromaDCT model - using optimized memory estimation (2048 vs 16384)")
-                    self._chromadct_detected = True
-                
-                return scaler * area * dtype_size * 2048
-        except:
-            pass
+        # Removed ChromaDCT-specific detection and memory estimation
+        # ChromaDCT now uses the same estimation as regular models
+        # This prevents excessive CPU offloading that was causing 2x slower performance
 
         return scaler * area * dtype_size * 16384

@@ -1,5 +1,3 @@
-# Cherry-picked some good parts from ComfyUI with some bad parts fixed
-
 import sys
 import time
 import psutil
@@ -9,18 +7,10 @@ import platform
 from enum import Enum
 from backend import stream, utils
 from backend.args import args
+# Block swapping imports removed - will be replaced with sd-scripts compatible implementation
 
 
 cpu = torch.device('cpu')
-
-
-class VRAMState(Enum):
-    DISABLED = 0  # No vram present: no need to move models to vram
-    NO_VRAM = 1  # Very low vram: enable all the options to save vram
-    LOW_VRAM = 2
-    NORMAL_VRAM = 3
-    HIGH_VRAM = 4
-    SHARED = 5  # No dedicated vram: memory shared between CPU and GPU but models still need to be moved between both.
 
 
 class CPUState(Enum):
@@ -29,11 +19,8 @@ class CPUState(Enum):
     MPS = 2
 
 
-# Determine VRAM State
-vram_state = VRAMState.NORMAL_VRAM
-set_vram_to = VRAMState.NORMAL_VRAM
+# Determine device state
 cpu_state = CPUState.GPU
-
 total_vram = 0
 
 lowvram_available = True
@@ -46,7 +33,6 @@ if args.pytorch_deterministic:
 directml_enabled = False
 if args.directml is not None:
     import torch_directml
-
     directml_enabled = True
     device_index = args.directml
     if device_index < 0:
@@ -57,7 +43,6 @@ if args.directml is not None:
 
 try:
     import intel_extension_for_pytorch as ipex
-
     if torch.xpu.is_available():
         xpu_available = True
 except:
@@ -155,7 +140,6 @@ else:
     try:
         import xformers
         import xformers.ops
-
         XFORMERS_IS_AVAILABLE = True
         try:
             XFORMERS_IS_AVAILABLE = xformers._has_cpp_library
@@ -216,14 +200,6 @@ if ENABLE_PYTORCH_ATTENTION:
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-if args.always_low_vram:
-    set_vram_to = VRAMState.LOW_VRAM
-    lowvram_available = True
-elif args.always_no_vram:
-    set_vram_to = VRAMState.NO_VRAM
-elif args.always_high_vram or args.always_gpu:
-    vram_state = VRAMState.HIGH_VRAM
-
 FORCE_FP32 = False
 FORCE_FP16 = False
 if args.all_in_fp32:
@@ -234,56 +210,42 @@ if args.all_in_fp16:
     print("Forcing FP16.")
     FORCE_FP16 = True
 
-if lowvram_available:
-    if set_vram_to in (VRAMState.LOW_VRAM, VRAMState.NO_VRAM):
-        vram_state = set_vram_to
-
-if cpu_state != CPUState.GPU:
-    vram_state = VRAMState.DISABLED
-
-if cpu_state == CPUState.MPS:
-    vram_state = VRAMState.SHARED
-
-print(f"Set vram state to: {vram_state.name}")
+# Block swapping configuration - will be implemented with sd-scripts approach
 
 ALWAYS_VRAM_OFFLOAD = args.always_offload_from_vram
-
 if ALWAYS_VRAM_OFFLOAD:
     print("Always offload VRAM")
 
 PIN_SHARED_MEMORY = args.pin_shared_memory
-
 if PIN_SHARED_MEMORY:
     print("Always pin shared GPU memory")
 
 
-def get_torch_device_name(device):
-    if hasattr(device, 'type'):
-        if device.type == "cuda":
-            try:
-                allocator_backend = torch.cuda.get_allocator_backend()
-            except:
-                allocator_backend = ""
-            return "{} {} : {}".format(device, torch.cuda.get_device_name(device), allocator_backend)
-        else:
-            return "{}".format(device.type)
-    elif is_intel_xpu():
-        return "{} {}".format(device, torch.xpu.get_device_name(device))
+# Compatibility layer for extensions expecting old VRAM system
+class VRAMState(Enum):
+    DISABLED = 0
+    NO_VRAM = 1
+    LOW_VRAM = 2
+    NORMAL_VRAM = 3
+    HIGH_VRAM = 4
+    SHARED = 5
+
+vram_state = VRAMState.NORMAL_VRAM  # Default state for compatibility
+
+def set_vram_state_from_blocks(blocks):
+    """Compatibility function for GUI integration - no longer needed with sd-scripts approach."""
+    global vram_state
+    # The new sd-scripts approach doesn't use vram_state, but we keep this for GUI compatibility
+    if blocks == 0:
+        vram_state = VRAMState.HIGH_VRAM
+    elif blocks <= 10:
+        vram_state = VRAMState.NORMAL_VRAM
+    elif blocks <= 25:
+        vram_state = VRAMState.LOW_VRAM
     else:
-        return "CUDA {}: {}".format(device, torch.cuda.get_device_name(device))
-
-
-try:
-    torch_device_name = get_torch_device_name(get_torch_device())
-    print("Device: {}".format(torch_device_name))
-except:
-    torch_device_name = ''
-    print("Could not pick default device.")
-
-if 'rtx' in torch_device_name.lower():
-    if not args.cuda_malloc:
-        print('Hint: your device supports --cuda-malloc for potential speed improvements.')
-
+        vram_state = VRAMState.NO_VRAM
+    # Note: This function only updates the legacy vram_state variable for compatibility.
+    # The actual block swapping is handled by the sd-scripts approach in LoadedModel.model_load()
 
 current_loaded_models = []
 
@@ -292,11 +254,9 @@ def state_dict_size(sd, exclude_device=None):
     module_mem = 0
     for k in sd:
         t = sd[k]
-
         if exclude_device is not None:
             if t.device == exclude_device:
                 continue
-
         module_mem += t.nelement() * t.element_size()
     return module_mem
 
@@ -309,6 +269,7 @@ def state_dict_parameters(sd):
 
 
 def state_dict_dtype(state_dict):
+    """Determine the dtype of a state dict."""
     for k, v in state_dict.items():
         if hasattr(v, 'gguf_cls'):
             return 'gguf'
@@ -337,32 +298,10 @@ def state_dict_dtype(state_dict):
     return major_dtype
 
 
-def bake_gguf_model(model):
-    if getattr(model, 'gguf_baked', False):
-        return
-
-    for p in model.parameters():
-        gguf_cls = getattr(p, 'gguf_cls', None)
-        if gguf_cls is not None:
-            gguf_cls.bake(p)
-
-    global signal_empty_cache
-    signal_empty_cache = True
-
-    model.gguf_baked = True
-    return model
-
-
 def module_size(module, exclude_device=None, include_device=None, return_split=False):
     module_mem = 0
     weight_mem = 0
     weight_patterns = ['weight']
-
-    # Check if this is a RamTorch bouncing linear module
-    is_ramtorch = False
-    module_class_name = module.__class__.__name__
-    if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
-        is_ramtorch = True
 
     for k, p in module.named_parameters():
         t = p.data
@@ -379,331 +318,80 @@ def module_size(module, exclude_device=None, include_device=None, return_split=F
 
         if getattr(p, 'quant_type', None) in ['fp4', 'nf4']:
             if element_size > 1:
-                # not quanted yet
-                element_size = 0.55  # a bit more than 0.5 because of quant state parameters
+                element_size = 0.55
             else:
-                # quanted
-                element_size = 1.1  # a bit more than 0.5 because of quant state parameters
+                element_size = 1.1
 
-        # For RamTorch modules, weights are on CPU but we count them differently
-        # Only count the GPU memory usage (which is minimal for RamTorch)
-        if is_ramtorch and k in weight_patterns and t.device.type == 'cpu':
-            # For CPU-bouncing weights, we don't count them in GPU memory
-            # but we do need to account for temporary GPU buffer during forward pass
-            if include_device is not None and include_device.type == 'cuda':
-                # Account for temporary GPU buffer (only needed during computation)
-                weight_mem += t.nelement() * element_size * 0.1  # 10% for temporary buffer
-            elif exclude_device is None:
-                # If not filtering by device, don't count CPU weights as GPU memory
-                pass
-        else:
-            module_mem += t.nelement() * element_size
-
-            if k in weight_patterns:
-                weight_mem += t.nelement() * element_size
+        module_mem += t.nelement() * element_size
+        if k in weight_patterns:
+            weight_mem += t.nelement() * element_size
 
     if return_split:
         return module_mem, weight_mem, module_mem - weight_mem
-
     return module_mem
 
 
-def module_move(module, device, recursive=True, excluded_pattens=[]):
-    if recursive:
-        return module.to(device=device)
-
-    for k, p in module.named_parameters(recurse=False, remove_duplicate=True):
-        if k in excluded_pattens:
-            continue
-        setattr(module, k, utils.tensor2parameter(p.to(device=device)))
-
-    return module
-
-
-def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
-    all_modules = []
-    legacy_modules = []
-
-    for m in model.modules():
-        if hasattr(m, "parameters_manual_cast"):
-            m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
-            all_modules.append(m)
-        elif hasattr(m, "weight"):
-            m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
-            legacy_modules.append(m)
-
-    # Check if this is a ChromaDCT model and apply specialized profiling
-    is_chromadct = False
-    try:
-        # Detect ChromaDCT by checking for distinctive components
-        if hasattr(model, 'img_in_patch') or any(hasattr(m, 'img_in_patch') for m in all_modules + legacy_modules):
-            is_chromadct = True
-        elif any('img_in_patch' in str(m).lower() for m in all_modules + legacy_modules):
-            is_chromadct = True
-        
-        if is_chromadct:
-            # Only print message once per session
-            if not hasattr(build_module_profile, '_chromadct_profiling_message_shown'):
-                print("Detected ChromaDCT model - using optimized module profiling...")
-                build_module_profile._chromadct_profiling_message_shown = True
-            return build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap)
-    except Exception as e:
-        print(f"ChromaDCT detection failed: {e}")
-        pass
-
-    # Default profiling for non-ChromaDCT models
-    gpu_modules = []
-    gpu_modules_only_extras = []
-    mem_counter = 0
-
-    for m in legacy_modules.copy():
-        gpu_modules.append(m)
-        legacy_modules.remove(m)
-        mem_counter += m.total_mem
-
-    for m in sorted(all_modules, key=lambda x: x.extra_mem).copy():
-        if mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap:
-            gpu_modules_only_extras.append(m)
-            all_modules.remove(m)
-            mem_counter += m.extra_mem
-
-    cpu_modules = all_modules
-
-    for m in sorted(gpu_modules_only_extras, key=lambda x: x.weight_mem).copy():
-        if mem_counter + m.weight_mem < model_gpu_memory_when_using_cpu_swap:
-            gpu_modules.append(m)
-            gpu_modules_only_extras.remove(m)
-            mem_counter += m.weight_mem
-
-    return gpu_modules, gpu_modules_only_extras, cpu_modules
-
-
-def build_chromadct_module_profile(model, all_modules, legacy_modules, model_gpu_memory_when_using_cpu_swap):
-    """
-    Build module profile optimized for ChromaDCT access patterns
-    """
-    
-    # Helper function to categorize modules based on ChromaDCT component names
-    def get_module_priority(module):
-        module_str = str(module).lower()
-        class_name = module.__class__.__name__.lower()
-        
-        # Critical components - always keep on GPU
-        critical_components = ['img_in_patch', 'txt_in', 'pe_embedder', 'distilled_guidance']
-        for comp in critical_components:
-            if comp in module_str or comp in class_name:
-                return 'critical'
-        
-        # High priority - early blocks processed first
-        if 'double_block' in module_str:
-            # Extract block number if possible
-            for i in range(10):  # blocks 0-9 are high priority
-                if f'double_blocks.{i}' in module_str or f'double_block_{i}' in module_str:
-                    return 'high_priority'
-            return 'medium_priority'  # blocks 10+ are medium priority
-        
-        if 'single_block' in module_str:
-            # Extract block number if possible  
-            for i in range(19):  # blocks 0-18 are high priority
-                if f'single_blocks.{i}' in module_str or f'single_block_{i}' in module_str:
-                    return 'high_priority'
-            return 'medium_priority'  # blocks 19+ are medium priority
-        
-        # Low priority - NeRF components (processed as group at end)
-        nerf_components = ['nerf_block', 'nerf_image_embedder', 'nerf_final_layer']
-        for comp in nerf_components:
-            if comp in module_str or comp in class_name:
-                return 'low_priority'
-        
-        return 'unknown'
-    
-    # Separate modules by priority
-    critical_modules = []
-    high_priority_modules = []
-    medium_priority_modules = []  
-    low_priority_modules = []
-    unknown_modules = []
-    
-    all_categorized_modules = all_modules + legacy_modules
-    
-    for m in all_categorized_modules:
-        priority = get_module_priority(m)
-        if priority == 'critical':
-            critical_modules.append(m)
-        elif priority == 'high_priority':
-            high_priority_modules.append(m) 
-        elif priority == 'medium_priority':
-            medium_priority_modules.append(m)
-        elif priority == 'low_priority':
-            low_priority_modules.append(m)
-        else:
-            unknown_modules.append(m)
-    
-    # Allocate modules to GPU/CPU based on priority and memory constraints
-    gpu_modules = []
-    gpu_modules_only_extras = []
-    cpu_modules = []
-    mem_counter = 0
-    
-    # Priority order: critical -> high -> medium -> low -> unknown
-    module_groups = [
-        ("Critical", critical_modules),
-        ("High Priority", high_priority_modules), 
-        ("Medium Priority", medium_priority_modules),
-        ("Low Priority", low_priority_modules),
-        ("Unknown", unknown_modules)
-    ]
-    
-    print(f"ChromaDCT Memory Allocation (Available: {model_gpu_memory_when_using_cpu_swap / (1024**2):.0f} MB):")
-    
-    for group_name, modules in module_groups:
-        modules_added_to_gpu = 0
-        modules_moved_to_cpu = 0
-        group_memory = 0
-        
-        # Sort modules by size (larger first for better packing)
-        modules_sorted = sorted(modules, key=lambda m: m.total_mem, reverse=True)
-        
-        for m in modules_sorted:
-            if mem_counter + m.total_mem < model_gpu_memory_when_using_cpu_swap:
-                # Can fit entire module on GPU
-                gpu_modules.append(m)
-                mem_counter += m.total_mem
-                group_memory += m.total_mem
-                modules_added_to_gpu += 1
-            elif (group_name in ["Critical", "High Priority"] and 
-                  mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap):
-                # For important modules, try to keep extras on GPU even if weights go to CPU
-                gpu_modules_only_extras.append(m)
-                mem_counter += m.extra_mem
-                group_memory += m.extra_mem
-                modules_added_to_gpu += 1
-            else:
-                # Must go to CPU
-                cpu_modules.append(m)
-                modules_moved_to_cpu += 1
-        
-        if len(modules) > 0:
-            print(f"  {group_name:15}: {modules_added_to_gpu:2d} GPU, {modules_moved_to_cpu:2d} CPU ({group_memory / (1024**2):.0f} MB)")
-    
-    total_modules = len(all_categorized_modules)
-    gpu_total = len(gpu_modules) + len(gpu_modules_only_extras)
-    cpu_total = len(cpu_modules)
-    
-    print(f"ChromaDCT Profile: {gpu_total}/{total_modules} modules on GPU ({gpu_total/total_modules*100:.1f}%), Memory used: {mem_counter / (1024**2):.0f} MB")
-    
-    return gpu_modules, gpu_modules_only_extras, cpu_modules
+# Block swapping analysis functions removed - will be replaced with sd-scripts approach
 
 
 class LoadedModel:
     def __init__(self, model):
         self.model = model
-        self.model_accelerated = False
         self.device = model.load_device
-        self.inclusive_memory = 0
-        self.exclusive_memory = 0
+        # Old block swapping attributes removed
 
-    def compute_inclusive_exclusive_memory(self):
-        self.inclusive_memory = module_size(self.model.model, include_device=self.device)
-        self.exclusive_memory = module_size(self.model.model, exclude_device=self.device)
-        return
+    # Old get_blocks_to_swap method removed
 
     def model_load(self, model_gpu_memory_when_using_cpu_swap=-1):
-        patch_model_to = None
-        do_not_need_cpu_swap = model_gpu_memory_when_using_cpu_swap < 0
-
-        if do_not_need_cpu_swap:
-            patch_model_to = self.device
-
         self.model.model_patches_to(self.device)
         self.model.model_patches_to(self.model.model_dtype())
 
         try:
-            self.real_model = self.model.forge_patch_model(patch_model_to)
+            self.real_model = self.model.forge_patch_model(self.device)
             self.model.current_device = self.model.load_device
         except Exception as e:
             self.model.forge_unpatch_model(self.model.offload_device)
             self.model_unload()
             raise e
 
-        if do_not_need_cpu_swap:
-            print('All loaded to GPU.')
+        # SD-scripts compatible block swapping implementation
+        try:
+            import sys
+            if 'modules.shared' in sys.modules:
+                from modules import shared
+                if hasattr(shared, 'opts') and shared.opts is not None:
+                    blocks_to_swap = getattr(shared.opts, 'blocks_to_swap', 0)
+                else:
+                    blocks_to_swap = 0
+            else:
+                # Fallback to command line args
+                blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+        except (ImportError, AttributeError):
+            blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+
+        # Enable sd-scripts compatible block swapping if model supports it
+        if blocks_to_swap > 0 and hasattr(self.real_model, 'enable_block_swap'):
+            try:
+                print(f"[SD-Scripts Block Swapping] Found enable_block_swap method in {self.real_model.__class__.__name__}")
+                self.real_model.enable_block_swap(blocks_to_swap, self.device)
+                print(f"[SD-Scripts Block Swapping] Successfully enabled block swapping with {blocks_to_swap} blocks")
+
+                # Call prepare_block_swap_before_forward if available
+                if hasattr(self.real_model, 'prepare_block_swap_before_forward'):
+                    self.real_model.prepare_block_swap_before_forward()
+                    print(f"[SD-Scripts Block Swapping] Block devices prepared for forward pass")
+            except Exception as e:
+                print(f"[SD-Scripts Block Swapping] Failed to enable block swapping: {e}")
+        elif blocks_to_swap > 0:
+            print(f'[SD-Scripts Block Swapping] Model {self.real_model.__class__.__name__} does not support enable_block_swap method')
         else:
-            gpu_modules, gpu_modules_only_extras, cpu_modules = build_module_profile(self.real_model, model_gpu_memory_when_using_cpu_swap)
-            pin_memory = PIN_SHARED_MEMORY and is_device_cpu(self.model.offload_device)
+            print('[SD-Scripts Block Swapping] Disabled - all blocks loaded to GPU')
 
-            mem_counter = 0
-            swap_counter = 0
-
-            for m in gpu_modules:
-                # Check if this is a RamTorch module that should keep weights on CPU
-                module_class_name = m.__class__.__name__
-                if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
-                    # RamTorch modules keep weights on CPU, don't move them
-                    # The module's _apply method is overridden to handle this
-                    pass
-                else:
-                    m.to(self.device)
-                mem_counter += m.total_mem
-
-            for m in cpu_modules:
-                # Check if this is a RamTorch module
-                module_class_name = m.__class__.__name__
-                if 'ChromaBouncing' in module_class_name or 'CPUBouncing' in module_class_name:
-                    # RamTorch modules already handle their own memory management
-                    # Don't apply standard CPU offloading
-                    pass
-                else:
-                    m.prev_parameters_manual_cast = m.parameters_manual_cast
-                    m.parameters_manual_cast = True
-                    m.to(self.model.offload_device)
-                    if pin_memory:
-                        m._apply(lambda x: x.pin_memory())
-                swap_counter += m.total_mem
-
-            for m in gpu_modules_only_extras:
-                m.prev_parameters_manual_cast = m.parameters_manual_cast
-                m.parameters_manual_cast = True
-                module_move(m, device=self.device, recursive=False, excluded_pattens=['weight'])
-                if hasattr(m, 'weight') and m.weight is not None:
-                    if pin_memory:
-                        m.weight = utils.tensor2parameter(m.weight.to(self.model.offload_device).pin_memory())
-                    else:
-                        m.weight = utils.tensor2parameter(m.weight.to(self.model.offload_device))
-                mem_counter += m.extra_mem
-                swap_counter += m.weight_mem
-
-            swap_flag = 'Shared' if PIN_SHARED_MEMORY else 'CPU'
-            method_flag = 'asynchronous' if stream.should_use_stream() else 'blocked'
-            print(f"{swap_flag} Swap Loaded ({method_flag} method): {swap_counter / (1024 * 1024):.2f} MB, GPU Loaded: {mem_counter / (1024 * 1024):.2f} MB")
-
-            self.model_accelerated = True
-
-            global signal_empty_cache
-            signal_empty_cache = True
-
-        bake_gguf_model(self.real_model)
-
-        self.model.refresh_loras()
-
-        if is_intel_xpu() and not args.disable_ipex_hijack:
-            self.real_model = torch.xpu.optimize(self.real_model.eval(), inplace=True, auto_kernel_selection=True, graph_mode=True)
-
-        # Reset signal_empty_cache after model loading is complete to prevent
-        # unnecessary cache clearing during inference
-        signal_empty_cache = False
-        
         return self.real_model
 
+    # Old forward hooks methods removed
+
     def model_unload(self, avoid_model_moving=False):
-        if self.model_accelerated:
-            for m in self.real_model.modules():
-                if hasattr(m, "prev_parameters_manual_cast"):
-                    m.parameters_manual_cast = m.prev_parameters_manual_cast
-                    del m.prev_parameters_manual_cast
-
-            self.model_accelerated = False
-
         if avoid_model_moving:
             self.model.forge_unpatch_model()
         else:
@@ -711,7 +399,7 @@ class LoadedModel:
             self.model.model_patches_to(self.model.offload_device)
 
     def __eq__(self, other):
-        return self.model is other.model  # and self.memory_required == other.memory_required
+        return self.model is other.model
 
 
 current_inference_memory = 1024 * 1024 * 1024
@@ -719,492 +407,7 @@ current_inference_memory = 1024 * 1024 * 1024
 
 def minimum_inference_memory():
     global current_inference_memory
-    
-    # Apply ChromaDCT-specific memory optimization
-    try:
-        from modules import shared
-        if (hasattr(shared, 'sd_model') and shared.sd_model is not None and
-            hasattr(shared.sd_model, 'forge_objects') and 
-            hasattr(shared.sd_model.forge_objects, 'vae') and 
-            shared.sd_model.forge_objects.vae is None):
-            
-            # ChromaDCT models are more memory efficient - reduce inference memory requirement
-            # ChromaDCT works in pixel space (3 channels) vs latent space (16 channels)
-            # and has more efficient patch-based processing
-            chromadct_inference_memory = int(current_inference_memory * 1)  # reset
-            
-            # Only print message once per session
-            if not hasattr(minimum_inference_memory, '_chromadct_message_shown'):
-                print(f"ChromaDCT detected - reducing inference memory from {current_inference_memory / (1024**2):.0f} MB to {chromadct_inference_memory / (1024**2):.0f} MB")
-                minimum_inference_memory._chromadct_message_shown = True
-            
-            return chromadct_inference_memory
-    except:
-        # Fallback to normal memory if detection fails
-        pass
-    
     return current_inference_memory
-
-
-def unload_model_clones(model):
-    to_unload = []
-    for i in range(len(current_loaded_models)):
-        if model.is_clone(current_loaded_models[i].model):
-            to_unload = [i] + to_unload
-
-    for i in to_unload:
-        current_loaded_models.pop(i).model_unload(avoid_model_moving=True)
-
-
-def free_memory(memory_required, device, keep_loaded=[], free_all=False):
-    # this check fully unloads any 'abandoned' models
-    for i in range(len(current_loaded_models) - 1, -1, -1):
-        if sys.getrefcount(current_loaded_models[i].model) <= 2:
-            current_loaded_models.pop(i).model_unload(avoid_model_moving=True)
-
-    if free_all:
-        memory_required = 1e30
-        print(f"[Unload] Trying to free all memory for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
-    else:
-        print(f"[Unload] Trying to free {memory_required / (1024 * 1024):.2f} MB for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
-
-    offload_everything = ALWAYS_VRAM_OFFLOAD or vram_state == VRAMState.NO_VRAM
-    unloaded_model = False
-    for i in range(len(current_loaded_models) - 1, -1, -1):
-        if not offload_everything:
-            free_memory = get_free_memory(device)
-            print(f"Current free memory is {free_memory / (1024 * 1024):.2f} MB ... ", end="")
-            if free_memory > memory_required:
-                break
-        shift_model = current_loaded_models[i]
-        if shift_model.device == device:
-            if shift_model not in keep_loaded:
-                m = current_loaded_models.pop(i)
-                print(f"Unload model {m.model.model.__class__.__name__} ", end="")
-                m.model_unload()
-                del m
-                unloaded_model = True
-
-    if unloaded_model:
-        soft_empty_cache()
-    else:
-        if vram_state != VRAMState.HIGH_VRAM:
-            mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
-            if mem_free_torch > mem_free_total * 0.25:
-                soft_empty_cache()
-
-    print('Done.')
-    return
-
-
-def compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, inference_memory):
-    maximum_memory_available = current_free_mem - inference_memory
-
-    suggestion = max(
-        maximum_memory_available / 1.3,
-        maximum_memory_available - 1024 * 1024 * 1024 * 1.25
-    )
-
-    return int(max(0, suggestion))
-
-
-def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
-    global vram_state
-
-    execution_start_time = time.perf_counter()
-    memory_to_free = max(minimum_inference_memory(), memory_required) + hard_memory_preservation
-    memory_for_inference = minimum_inference_memory() + hard_memory_preservation
-
-    models_to_load = []
-    models_already_loaded = []
-    for x in models:
-        loaded_model = LoadedModel(x)
-
-        if loaded_model in current_loaded_models:
-            index = current_loaded_models.index(loaded_model)
-            current_loaded_models.insert(0, current_loaded_models.pop(index))
-            models_already_loaded.append(loaded_model)
-        else:
-            models_to_load.append(loaded_model)
-
-    if len(models_to_load) == 0:
-        devs = set(map(lambda a: a.device, models_already_loaded))
-        for d in devs:
-            if d != torch.device("cpu"):
-                free_memory(memory_to_free, d, models_already_loaded)
-
-        moving_time = time.perf_counter() - execution_start_time
-        if moving_time > 0.1:
-            print(f'Memory cleanup has taken {moving_time:.2f} seconds')
-
-        return
-
-    for loaded_model in models_to_load:
-        unload_model_clones(loaded_model.model)
-
-    total_memory_required = {}
-    for loaded_model in models_to_load:
-        loaded_model.compute_inclusive_exclusive_memory()
-        total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.exclusive_memory + loaded_model.inclusive_memory * 0.25
-
-    for device in total_memory_required:
-        if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.3 + memory_to_free, device, models_already_loaded)
-
-    for loaded_model in models_to_load:
-        model = loaded_model.model
-        torch_dev = model.load_device
-        if is_device_cpu(torch_dev):
-            vram_set_state = VRAMState.DISABLED
-        else:
-            vram_set_state = vram_state
-
-        model_gpu_memory_when_using_cpu_swap = -1
-
-        if lowvram_available and (vram_set_state == VRAMState.LOW_VRAM or vram_set_state == VRAMState.NORMAL_VRAM):
-            model_require = loaded_model.exclusive_memory
-            previously_loaded = loaded_model.inclusive_memory
-            current_free_mem = get_free_memory(torch_dev)
-            estimated_remaining_memory = current_free_mem - model_require - memory_for_inference
-
-            print(f"[Memory Management] Target: {loaded_model.model.model.__class__.__name__}, Free GPU: {current_free_mem / (1024 * 1024):.2f} MB, Model Require: {model_require / (1024 * 1024):.2f} MB, Previously Loaded: {previously_loaded / (1024 * 1024):.2f} MB, Inference Require: {memory_for_inference / (1024 * 1024):.2f} MB, Remaining: {estimated_remaining_memory / (1024 * 1024):.2f} MB, ", end="")
-
-            if estimated_remaining_memory < 0:
-                vram_set_state = VRAMState.LOW_VRAM
-                model_gpu_memory_when_using_cpu_swap = compute_model_gpu_memory_when_using_cpu_swap(current_free_mem, memory_for_inference)
-                if previously_loaded > 0:
-                    model_gpu_memory_when_using_cpu_swap = previously_loaded
-
-        if vram_set_state == VRAMState.NO_VRAM:
-            model_gpu_memory_when_using_cpu_swap = 0
-
-        loaded_model.model_load(model_gpu_memory_when_using_cpu_swap)
-        current_loaded_models.insert(0, loaded_model)
-
-    moving_time = time.perf_counter() - execution_start_time
-    print(f'Moving model(s) has taken {moving_time:.2f} seconds')
-
-    return
-
-
-def load_model_gpu(model):
-    return load_models_gpu([model])
-
-
-def cleanup_models():
-    to_delete = []
-    for i in range(len(current_loaded_models)):
-        if sys.getrefcount(current_loaded_models[i].model) <= 2:
-            to_delete = [i] + to_delete
-
-    for i in to_delete:
-        x = current_loaded_models.pop(i)
-        x.model_unload()
-        del x
-
-
-def dtype_size(dtype):
-    dtype_size = 4
-    if dtype == torch.float16 or dtype == torch.bfloat16:
-        dtype_size = 2
-    elif dtype == torch.float32:
-        dtype_size = 4
-    else:
-        try:
-            dtype_size = dtype.itemsize
-        except:  # Old pytorch doesn't have .itemsize
-            pass
-    return dtype_size
-
-
-def unet_offload_device():
-    if vram_state == VRAMState.HIGH_VRAM:
-        return get_torch_device()
-    else:
-        return torch.device("cpu")
-
-
-def unet_inital_load_device(parameters, dtype):
-    torch_dev = get_torch_device()
-    if vram_state == VRAMState.HIGH_VRAM:
-        return torch_dev
-
-    cpu_dev = torch.device("cpu")
-    if ALWAYS_VRAM_OFFLOAD:
-        return cpu_dev
-
-    model_size = dtype_size(dtype) * parameters
-
-    mem_dev = get_free_memory(torch_dev)
-    mem_cpu = get_free_memory(cpu_dev)
-    if mem_dev > mem_cpu and model_size < mem_dev:
-        return torch_dev
-    else:
-        return cpu_dev
-
-
-def unet_dtype(device=None, model_params=0, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]):
-    if args.unet_in_bf16:
-        return torch.bfloat16
-
-    if args.unet_in_fp16:
-        return torch.float16
-
-    if args.unet_in_fp8_e4m3fn:
-        return torch.float8_e4m3fn
-
-    if args.unet_in_fp8_e5m2:
-        return torch.float8_e5m2
-
-    for candidate in supported_dtypes:
-        if candidate == torch.float16:
-            if should_use_fp16(device, model_params=model_params, prioritize_performance=True, manual_cast=True):
-                return candidate
-        if candidate == torch.bfloat16:
-            if should_use_bf16(device, model_params=model_params, prioritize_performance=True, manual_cast=True):
-                return candidate
-
-    return torch.float32
-
-
-def get_computation_dtype(inference_device, parameters=0, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]):
-    for candidate in supported_dtypes:
-        if candidate == torch.float16:
-            if should_use_fp16(inference_device, model_params=parameters, prioritize_performance=True, manual_cast=False):
-                return candidate
-        if candidate == torch.bfloat16:
-            if should_use_bf16(inference_device, model_params=parameters, prioritize_performance=True, manual_cast=False):
-                return candidate
-
-    return torch.float32
-
-
-def text_encoder_offload_device():
-    if args.always_gpu:
-        return get_torch_device()
-    else:
-        return torch.device("cpu")
-
-
-def text_encoder_device():
-    if args.always_gpu:
-        return get_torch_device()
-    elif vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.NORMAL_VRAM:
-        if should_use_fp16(prioritize_performance=False):
-            return get_torch_device()
-        else:
-            return torch.device("cpu")
-    else:
-        return torch.device("cpu")
-
-
-def text_encoder_dtype(device=None):
-    if args.clip_in_fp8_e4m3fn:
-        return torch.float8_e4m3fn
-    elif args.clip_in_fp8_e5m2:
-        return torch.float8_e5m2
-    elif args.clip_in_fp16:
-        return torch.float16
-    elif args.clip_in_fp32:
-        return torch.float32
-
-    if is_device_cpu(device):
-        return torch.float16
-
-    return torch.float16
-
-
-def intermediate_device():
-    if args.always_gpu:
-        return get_torch_device()
-    else:
-        return torch.device("cpu")
-
-
-def vae_device():
-    if args.vae_in_cpu:
-        return torch.device("cpu")
-    return get_torch_device()
-
-
-def vae_offload_device():
-    if args.always_gpu:
-        return get_torch_device()
-    else:
-        return torch.device("cpu")
-
-
-def vae_dtype(device=None, allowed_dtypes=[]):
-    global VAE_DTYPES
-    if args.vae_in_fp16:
-        return torch.float16
-    elif args.vae_in_bf16:
-        return torch.bfloat16
-    elif args.vae_in_fp32:
-        return torch.float32
-
-    for d in allowed_dtypes:
-        if d == torch.float16 and should_use_fp16(device, prioritize_performance=False):
-            return d
-        if d in VAE_DTYPES:
-            return d
-
-    return VAE_DTYPES[0]
-
-
-print(f"VAE dtype preferences: {VAE_DTYPES} -> {vae_dtype()}")
-
-
-def get_autocast_device(dev):
-    if hasattr(dev, 'type'):
-        return dev.type
-    return "cuda"
-
-
-def supports_dtype(device, dtype):  # TODO
-    if dtype == torch.float32:
-        return True
-    if is_device_cpu(device):
-        return False
-    if dtype == torch.float16:
-        return True
-    if dtype == torch.bfloat16:
-        return True
-    return False
-
-
-def supports_cast(device, dtype):  # TODO
-    if dtype == torch.float32:
-        return True
-    if dtype == torch.float16:
-        return True
-    if directml_enabled:  # TODO: test this
-        return False
-    if dtype == torch.bfloat16:
-        return True
-    if is_device_mps(device):
-        return False
-    if dtype == torch.float8_e4m3fn:
-        return True
-    if dtype == torch.float8_e5m2:
-        return True
-    return False
-
-
-def pick_weight_dtype(dtype, fallback_dtype, device=None):
-    if dtype is None:
-        dtype = fallback_dtype
-    elif dtype_size(dtype) > dtype_size(fallback_dtype):
-        dtype = fallback_dtype
-
-    if not supports_cast(device, dtype):
-        dtype = fallback_dtype
-
-    return dtype
-
-
-def device_supports_non_blocking(device):
-    if is_device_mps(device):
-        return False  # pytorch bug? mps doesn't support non blocking
-    if is_intel_xpu():
-        return False
-    if args.pytorch_deterministic:  # TODO: figure out why deterministic breaks non blocking from gpu to cpu (previews)
-        return False
-    if directml_enabled:
-        return False
-    return True
-
-
-def device_should_use_non_blocking(device):
-    if not device_supports_non_blocking(device):
-        return False
-    return False
-    # return True #TODO: figure out why this causes memory issues on Nvidia and possibly others
-
-
-def force_channels_last():
-    if args.force_channels_last:
-        return True
-
-    # TODO
-    return False
-
-
-def cast_to_device(tensor, device, dtype, copy=False):
-    device_supports_cast = False
-    if tensor.dtype == torch.float32 or tensor.dtype == torch.float16:
-        device_supports_cast = True
-    elif tensor.dtype == torch.bfloat16:
-        if hasattr(device, 'type') and device.type.startswith("cuda"):
-            device_supports_cast = True
-        elif is_intel_xpu():
-            device_supports_cast = True
-
-    non_blocking = device_should_use_non_blocking(device)
-
-    if device_supports_cast:
-        if copy:
-            if tensor.device == device:
-                return tensor.to(dtype, copy=copy, non_blocking=non_blocking)
-            return tensor.to(device, copy=copy, non_blocking=non_blocking).to(dtype, non_blocking=non_blocking)
-        else:
-            return tensor.to(device, non_blocking=non_blocking).to(dtype, non_blocking=non_blocking)
-    else:
-        return tensor.to(device, dtype, copy=copy, non_blocking=non_blocking)
-
-def sage_attention_enabled():
-    return args.use_sage_attention
-
-def flash_attention_enabled():
-    return args.use_flash_attention
-
-def xformers_enabled():
-    global directml_enabled
-    global cpu_state
-    if cpu_state != CPUState.GPU:
-        return False
-    if is_intel_xpu():
-        return False
-    if directml_enabled:
-        return False
-    return XFORMERS_IS_AVAILABLE
-
-
-def xformers_enabled_vae():
-    enabled = xformers_enabled()
-    if not enabled:
-        return False
-
-    return XFORMERS_ENABLED_VAE
-
-
-def pytorch_attention_enabled():
-    global ENABLE_PYTORCH_ATTENTION
-    return ENABLE_PYTORCH_ATTENTION
-
-
-def pytorch_attention_flash_attention():
-    global ENABLE_PYTORCH_ATTENTION
-    if ENABLE_PYTORCH_ATTENTION:
-        # TODO: more reliable way of checking for flash attention?
-        if is_nvidia():  # pytorch flash attention only works on Nvidia
-            return True
-        if is_intel_xpu():
-            return True
-    return False
-
-
-def force_upcast_attention_dtype():
-    upcast = args.force_upcast_attention
-    try:
-        if platform.mac_ver()[0] in ['14.5']:  # black image bug on OSX Sonoma 14.5
-            upcast = True
-    except:
-        pass
-    if upcast:
-        return torch.float32
-    else:
-        return None
 
 
 def get_free_memory(dev=None, torch_free_too=False):
@@ -1240,6 +443,115 @@ def get_free_memory(dev=None, torch_free_too=False):
         return mem_free_total
 
 
+def free_memory(memory_required, device, keep_loaded=[], free_all=False):
+    # Unload abandoned models
+    for i in range(len(current_loaded_models) - 1, -1, -1):
+        if sys.getrefcount(current_loaded_models[i].model) <= 2:
+            current_loaded_models.pop(i).model_unload(avoid_model_moving=True)
+
+    if free_all:
+        memory_required = 1e30
+        print(f"[Unload] Trying to free all memory for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
+    else:
+        print(f"[Unload] Trying to free {memory_required / (1024 * 1024):.2f} MB for {device} with {len(keep_loaded)} models keep loaded ... ", end="")
+
+    unloaded_model = False
+    for i in range(len(current_loaded_models) - 1, -1, -1):
+        free_memory_current = get_free_memory(device)
+        print(f"Current free memory is {free_memory_current / (1024 * 1024):.2f} MB ... ", end="")
+        if free_memory_current > memory_required:
+            break
+
+        shift_model = current_loaded_models[i]
+        if shift_model.device == device:
+            if shift_model not in keep_loaded:
+                m = current_loaded_models.pop(i)
+                print(f"Unload model {m.model.model.__class__.__name__} ", end="")
+                m.model_unload()
+                del m
+                unloaded_model = True
+
+    if unloaded_model:
+        soft_empty_cache()
+
+    print('Done.')
+
+
+def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
+    execution_start_time = time.perf_counter()
+    memory_to_free = max(minimum_inference_memory(), memory_required) + hard_memory_preservation
+
+    models_to_load = []
+    models_already_loaded = []
+
+    for x in models:
+        loaded_model = LoadedModel(x)
+        if loaded_model in current_loaded_models:
+            index = current_loaded_models.index(loaded_model)
+            current_loaded_models.insert(0, current_loaded_models.pop(index))
+            models_already_loaded.append(loaded_model)
+        else:
+            models_to_load.append(loaded_model)
+
+    if len(models_to_load) == 0:
+        devs = set(map(lambda a: a.device, models_already_loaded))
+        for d in devs:
+            if d != torch.device("cpu"):
+                free_memory(memory_to_free, d, models_already_loaded)
+
+        moving_time = time.perf_counter() - execution_start_time
+        if moving_time > 0.1:
+            print(f'Memory cleanup has taken {moving_time:.2f} seconds')
+        return
+
+    for loaded_model in models_to_load:
+        torch_dev = loaded_model.model.load_device
+        current_free_mem = get_free_memory(torch_dev)
+
+        # Block swapping info will be handled by sd-scripts approach
+        print(f"[Memory Management] Target: {loaded_model.model.model.__class__.__name__}, "
+              f"Free GPU: {current_free_mem / (1024 * 1024):.2f} MB")
+
+        loaded_model.model_load()
+        current_loaded_models.insert(0, loaded_model)
+
+    moving_time = time.perf_counter() - execution_start_time
+    print(f'Moving model(s) has taken {moving_time:.2f} seconds')
+
+
+def load_model_gpu(model):
+    return load_models_gpu([model])
+
+
+def soft_empty_cache(force=False):
+    global cpu_state
+    if cpu_state == CPUState.MPS:
+        torch.mps.empty_cache()
+    elif is_intel_xpu():
+        torch.xpu.empty_cache()
+    elif torch.cuda.is_available():
+        if force or is_nvidia():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+
+def unload_all_models():
+    free_memory(1e30, get_torch_device(), free_all=True)
+
+
+# Keep remaining utility functions from original
+def is_device_cpu(device):
+    return hasattr(device, 'type') and device.type == 'cpu'
+
+
+def is_device_mps(device):
+    return hasattr(device, 'type') and device.type == 'mps'
+
+
+def is_device_cuda(device):
+    return hasattr(device, 'type') and device.type == 'cuda'
+
+
 def cpu_mode():
     global cpu_state
     return cpu_state == CPUState.CPU
@@ -1250,26 +562,147 @@ def mps_mode():
     return cpu_state == CPUState.MPS
 
 
-def is_device_type(device, type):
-    if hasattr(device, 'type'):
-        if (device.type == type):
-            return True
-    return False
+def unet_offload_device():
+    return torch.device("cpu")
 
 
-def is_device_cpu(device):
-    return is_device_type(device, 'cpu')
+def unet_inital_load_device(parameters, dtype):
+    torch_dev = get_torch_device()
+    cpu_dev = torch.device("cpu")
+
+    if ALWAYS_VRAM_OFFLOAD:
+        return cpu_dev
+
+    model_size = dtype.itemsize * parameters
+    mem_dev = get_free_memory(torch_dev)
+    mem_cpu = get_free_memory(cpu_dev)
+
+    if mem_dev > mem_cpu and model_size < mem_dev:
+        return torch_dev
+    else:
+        return cpu_dev
 
 
-def is_device_mps(device):
-    return is_device_type(device, 'mps')
+def text_encoder_device():
+    if args.always_gpu:
+        return get_torch_device()
+    else:
+        return torch.device("cpu")
 
 
-def is_device_cuda(device):
-    return is_device_type(device, 'cuda')
+def text_encoder_offload_device():
+    if args.always_gpu:
+        return get_torch_device()
+    else:
+        return torch.device("cpu")
+
+
+def vae_device():
+    if args.vae_in_cpu:
+        return torch.device("cpu")
+    return get_torch_device()
+
+
+def vae_offload_device():
+    if args.always_gpu:
+        return get_torch_device()
+    else:
+        return torch.device("cpu")
+
+
+def intermediate_device():
+    if args.always_gpu:
+        return get_torch_device()
+    else:
+        return torch.device("cpu")
+
+
+def dtype_size(dtype):
+    """Get the size in bytes of a dtype."""
+    dtype_size = 4
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        dtype_size = 2
+    elif dtype == torch.float32:
+        dtype_size = 4
+    else:
+        try:
+            dtype_size = dtype.itemsize
+        except:  # Old pytorch doesn't have .itemsize
+            pass
+    return dtype_size
+
+
+def unet_dtype(device=None, model_params=0, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]):
+    """Get the best dtype for UNet models."""
+    if args.unet_in_bf16:
+        return torch.bfloat16
+    if args.unet_in_fp16:
+        return torch.float16
+    if args.unet_in_fp8_e4m3fn:
+        return torch.float8_e4m3fn
+    if args.unet_in_fp8_e5m2:
+        return torch.float8_e5m2
+
+    for candidate in supported_dtypes:
+        if candidate == torch.float16:
+            if should_use_fp16(device, model_params=model_params, prioritize_performance=True, manual_cast=True):
+                return candidate
+        if candidate == torch.bfloat16:
+            if should_use_bf16(device, model_params=model_params, prioritize_performance=True, manual_cast=True):
+                return candidate
+
+    return torch.float32
+
+
+def get_computation_dtype(inference_device, parameters=0, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]):
+    """Get the best computation dtype."""
+    for candidate in supported_dtypes:
+        if candidate == torch.float16:
+            if should_use_fp16(inference_device, model_params=parameters, prioritize_performance=True, manual_cast=False):
+                return candidate
+        if candidate == torch.bfloat16:
+            if should_use_bf16(inference_device, model_params=parameters, prioritize_performance=True, manual_cast=False):
+                return candidate
+    return torch.float32
+
+
+def text_encoder_dtype(device=None):
+    """Get the best dtype for text encoders."""
+    if args.clip_in_fp8_e4m3fn:
+        return torch.float8_e4m3fn
+    elif args.clip_in_fp8_e5m2:
+        return torch.float8_e5m2
+    elif args.clip_in_fp16:
+        return torch.float16
+    elif args.clip_in_fp32:
+        return torch.float32
+
+    if is_device_cpu(device):
+        return torch.float16
+    return torch.float16
+
+
+def vae_dtype(device=None, allowed_dtypes=[]):
+    """Get the best dtype for VAE models."""
+    global VAE_DTYPES
+    if args.vae_in_fp16:
+        return torch.float16
+    elif args.vae_in_bf16:
+        return torch.bfloat16
+    elif args.vae_in_fp32:
+        return torch.float32
+
+    for d in allowed_dtypes:
+        if d == torch.float16 and should_use_fp16(device, prioritize_performance=False):
+            return d
+        if d in VAE_DTYPES:
+            return d
+
+    return VAE_DTYPES[0]
 
 
 def should_use_fp16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
+    """Determine if FP16 should be used."""
     global directml_enabled
 
     if device is not None:
@@ -1333,6 +766,7 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
 
 
 def should_use_bf16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
+    """Determine if BF16 should be used."""
     if device is not None:
         if is_device_cpu(device):  # TODO ? bf16 works on CPU but is extremely slow
             return False
@@ -1375,37 +809,227 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     return False
 
 
+def get_torch_device_name(device):
+    """Get a descriptive name for a torch device."""
+    if hasattr(device, 'type'):
+        if device.type == "cuda":
+            try:
+                allocator_backend = torch.cuda.get_allocator_backend()
+            except:
+                allocator_backend = ""
+            return "{} {} : {}".format(device, torch.cuda.get_device_name(device), allocator_backend)
+        else:
+            return "{}".format(device.type)
+    elif is_intel_xpu():
+        return "{} {}".format(device, torch.xpu.get_device_name(device))
+    else:
+        return "CUDA {}: {}".format(device, torch.cuda.get_device_name(device))
+
+
+def xformers_enabled():
+    """Check if xformers is enabled."""
+    global directml_enabled
+    global cpu_state
+    if cpu_state != CPUState.GPU:
+        return False
+    if is_intel_xpu():
+        return False
+    if directml_enabled:
+        return False
+    return XFORMERS_IS_AVAILABLE
+
+
+def xformers_enabled_vae():
+    """Check if xformers is enabled for VAE."""
+    enabled = xformers_enabled()
+    if not enabled:
+        return False
+    return XFORMERS_ENABLED_VAE
+
+
+def pytorch_attention_enabled():
+    """Check if PyTorch attention is enabled."""
+    global ENABLE_PYTORCH_ATTENTION
+    return ENABLE_PYTORCH_ATTENTION
+
+
+def pytorch_attention_flash_attention():
+    """Check if PyTorch flash attention is available."""
+    global ENABLE_PYTORCH_ATTENTION
+    if ENABLE_PYTORCH_ATTENTION:
+        # TODO: more reliable way of checking for flash attention?
+        if is_nvidia():  # pytorch flash attention only works on Nvidia
+            return True
+        if is_intel_xpu():
+            return True
+    return False
+
+
+def sage_attention_enabled():
+    """Check if sage attention is enabled."""
+    return args.use_sage_attention
+
+
+def flash_attention_enabled():
+    """Check if flash attention is enabled."""
+    return args.use_flash_attention
+
+
+def force_upcast_attention_dtype():
+    """Get forced upcast attention dtype if any."""
+    upcast = args.force_upcast_attention
+    try:
+        if platform.mac_ver()[0] in ['14.5']:  # black image bug on OSX Sonoma 14.5
+            upcast = True
+    except:
+        pass
+    if upcast:
+        return torch.float32
+    else:
+        return None
+
+
+def force_channels_last():
+    """Check if channels last format should be forced."""
+    if args.force_channels_last:
+        return True
+    return False
+
+
 def can_install_bnb():
+    """Check if bitsandbytes can be installed."""
     try:
         if not torch.cuda.is_available():
             return False
-
         cuda_version = tuple(int(x) for x in torch.version.cuda.split('.'))
-
         if cuda_version >= (11, 7):
             return True
-
         return False
     except:
         return False
 
 
+def device_supports_non_blocking(device):
+    """Check if device supports non-blocking transfers."""
+    if is_device_mps(device):
+        return False  # pytorch bug? mps doesn't support non blocking
+    if is_intel_xpu():
+        return False
+    if args.pytorch_deterministic:  # TODO: figure out why deterministic breaks non blocking from gpu to cpu (previews)
+        return False
+    if directml_enabled:
+        return False
+    return True
+
+
+def device_should_use_non_blocking(device):
+    """Check if device should use non-blocking transfers."""
+    if not device_supports_non_blocking(device):
+        return False
+    return False
+    # return True #TODO: figure out why this causes memory issues on Nvidia and possibly others
+
+
+def cast_to_device(tensor, device, dtype, copy=False):
+    """Cast tensor to device and dtype with proper handling."""
+    device_supports_cast = False
+    if tensor.dtype == torch.float32 or tensor.dtype == torch.float16:
+        device_supports_cast = True
+    elif tensor.dtype == torch.bfloat16:
+        if hasattr(device, 'type') and device.type.startswith("cuda"):
+            device_supports_cast = True
+        elif is_intel_xpu():
+            device_supports_cast = True
+
+    non_blocking = device_should_use_non_blocking(device)
+
+    if device_supports_cast:
+        if copy:
+            if tensor.device == device:
+                return tensor.to(dtype, copy=copy, non_blocking=non_blocking)
+            return tensor.to(device, copy=copy, non_blocking=non_blocking).to(dtype, non_blocking=non_blocking)
+        else:
+            return tensor.to(device, non_blocking=non_blocking).to(dtype, non_blocking=non_blocking)
+    else:
+        return tensor.to(device, dtype, copy=copy, non_blocking=non_blocking)
+
+
+def supports_dtype(device, dtype):
+    """Check if device supports dtype."""
+    if dtype == torch.float32:
+        return True
+    if is_device_cpu(device):
+        return False
+    if dtype == torch.float16:
+        return True
+    if dtype == torch.bfloat16:
+        return True
+    return False
+
+
+def supports_cast(device, dtype):
+    """Check if device supports casting to dtype."""
+    if dtype == torch.float32:
+        return True
+    if dtype == torch.float16:
+        return True
+    if directml_enabled:  # TODO: test this
+        return False
+    if dtype == torch.bfloat16:
+        return True
+    if is_device_mps(device):
+        return False
+    if dtype == torch.float8_e4m3fn:
+        return True
+    if dtype == torch.float8_e5m2:
+        return True
+    return False
+
+
+def pick_weight_dtype(dtype, fallback_dtype, device=None):
+    """Pick appropriate weight dtype."""
+    if dtype is None:
+        dtype = fallback_dtype
+    elif dtype_size(dtype) > dtype_size(fallback_dtype):
+        dtype = fallback_dtype
+
+    if not supports_cast(device, dtype):
+        dtype = fallback_dtype
+
+    return dtype
+
+
+def get_autocast_device(dev):
+    """Get autocast device type string."""
+    if hasattr(dev, 'type'):
+        return dev.type
+    return "cuda"
+
+
+print(f"VAE dtype preferences: {VAE_DTYPES} -> {vae_dtype()}")
+
+# SD-scripts compatible block swapping status
+try:
+    import sys
+    if 'modules.shared' in sys.modules:
+        from modules import shared
+        if hasattr(shared, 'opts') and shared.opts is not None:
+            current_blocks_to_swap = getattr(shared.opts, 'blocks_to_swap', 0)
+        else:
+            current_blocks_to_swap = 0
+    else:
+        current_blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+except (ImportError, AttributeError):
+    current_blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+
+print(f"SD-Scripts Block Swapping: {'Enabled' if current_blocks_to_swap > 0 else 'Disabled'} ({current_blocks_to_swap} blocks)")
+
+try:
+    torch_device_name = get_torch_device_name(get_torch_device())
+    print("Device: {}".format(torch_device_name))
+except:
+    torch_device_name = ''
+    print("Could not pick default device.")
+
+# Signal for cache clearing
 signal_empty_cache = False
-
-
-def soft_empty_cache(force=False):
-    global cpu_state, signal_empty_cache
-    if cpu_state == CPUState.MPS:
-        torch.mps.empty_cache()
-    elif is_intel_xpu():
-        torch.xpu.empty_cache()
-    elif torch.cuda.is_available():
-        if force or is_nvidia():  # This seems to make things worse on ROCm so I only do it for cuda
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    signal_empty_cache = False
-    return
-
-
-def unload_all_models():
-    free_memory(1e30, get_torch_device(), free_all=True)

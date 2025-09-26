@@ -74,3 +74,37 @@ class KModel(torch.nn.Module):
             pass
 
         return scaler * area * dtype_size * 16384
+
+    def enable_block_swap(self, num_blocks: int, device):
+        """Delegate block swapping to underlying diffusion model."""
+        if hasattr(self.diffusion_model, 'enable_block_swap'):
+            print(f"[KModel] Delegating enable_block_swap({num_blocks}) to {self.diffusion_model.__class__.__name__}")
+            return self.diffusion_model.enable_block_swap(num_blocks, device)
+        else:
+            raise AttributeError(f"Underlying model {self.diffusion_model.__class__.__name__} does not support block swapping")
+
+    def prepare_block_swap_before_forward(self):
+        """Delegate block swap preparation to underlying diffusion model."""
+        if hasattr(self.diffusion_model, 'prepare_block_swap_before_forward'):
+            return self.diffusion_model.prepare_block_swap_before_forward()
+
+    @property
+    def blocks_to_swap(self):
+        """Access blocks_to_swap from underlying diffusion model."""
+        if hasattr(self.diffusion_model, 'blocks_to_swap'):
+            return self.diffusion_model.blocks_to_swap
+        return None
+
+    @property
+    def double_blocks(self):
+        """Access double_blocks from underlying diffusion model."""
+        if hasattr(self.diffusion_model, 'double_blocks'):
+            return self.diffusion_model.double_blocks
+        return None
+
+    @property
+    def single_blocks(self):
+        """Access single_blocks from underlying diffusion model."""
+        if hasattr(self.diffusion_model, 'single_blocks'):
+            return self.diffusion_model.single_blocks
+        return None

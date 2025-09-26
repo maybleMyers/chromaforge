@@ -31,6 +31,7 @@ categories.register_category("sd", "Stable Diffusion")
 categories.register_category("ui", "User Interface")
 categories.register_category("system", "System")
 categories.register_category("postprocessing", "Postprocessing")
+categories.register_category("memory", "Memory Management")
 categories.register_category("training", "Training")
 
 options_templates.update(options_section(('saving-images', "Saving images/grids", "saving"), {
@@ -152,6 +153,10 @@ options_templates.update(options_section(('API', "API", "system"), {
     "api_enable_requests": OptionInfo(True, "Allow http:// and https:// URLs for input images in API", restrict_api=True),
     "api_forbid_local_requests": OptionInfo(True, "Forbid URLs to local resources", restrict_api=True),
     "api_useragent": OptionInfo("", "User agent for requests", restrict_api=True),
+}))
+
+options_templates.update(options_section(('memory', "Memory Management", "memory"), {
+    "blocks_to_swap": OptionInfo(0, "Blocks to swap to CPU", gr.Slider, {"minimum": 0, "maximum": 50, "step": 1}).info("Number of model blocks to swap to CPU to save VRAM. 0 disables block swapping. Higher values save more VRAM but may reduce speed."),
 }))
 
 options_templates.update(options_section(('training', "Training", "training"), {

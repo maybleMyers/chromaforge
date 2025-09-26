@@ -10,6 +10,7 @@ class NeverOOMForForge(scripts.Script):
     def __init__(self):
         self.previous_unet_enabled = False
         self.original_vram_state = memory_management.vram_state
+        self.original_blocks_to_swap = 0
 
     def title(self):
         return "Never OOM Integrated"
@@ -37,11 +38,32 @@ class NeverOOMForForge(scripts.Script):
         if self.previous_unet_enabled != unet_enabled:
             memory_management.unload_all_models()
             if unet_enabled:
+                # Store original states
                 self.original_vram_state = memory_management.vram_state
+                self.original_blocks_to_swap = memory_management.get_blocks_to_swap()
+
+                # Enable maximum block swapping (equivalent to NO_VRAM)
+                try:
+                    from modules import shared
+                    if hasattr(shared, 'opts'):
+                        shared.opts.set('blocks_to_swap', 30)  # Maximum swapping
+                except:
+                    pass
+
                 memory_management.vram_state = memory_management.VRAMState.NO_VRAM
+                print('Never OOM: Enabled maximum block swapping (30 blocks)')
             else:
+                # Restore original states
                 memory_management.vram_state = self.original_vram_state
-            print(f'VARM State Changed To {memory_management.vram_state.name}')
+                try:
+                    from modules import shared
+                    if hasattr(shared, 'opts'):
+                        shared.opts.set('blocks_to_swap', self.original_blocks_to_swap)
+                except:
+                    pass
+                print(f'Never OOM: Restored original block swapping ({self.original_blocks_to_swap} blocks)')
+
+            print(f'VRAM State Changed To {memory_management.vram_state.name}')
             self.previous_unet_enabled = unet_enabled
 
         return

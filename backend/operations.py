@@ -153,6 +153,11 @@ class ForgeOperations:
                     return torch.nn.functional.linear(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
+                # Ensure device consistency for block swapping
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
                 return torch.nn.functional.linear(x, weight, bias)
 
     class Conv2d(torch.nn.Conv2d):
@@ -173,6 +178,11 @@ class ForgeOperations:
                     return self._conv_forward(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
+                # Ensure device consistency for block swapping
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
                 return super()._conv_forward(x, weight, bias)
 
     class Conv3d(torch.nn.Conv3d):
@@ -193,7 +203,12 @@ class ForgeOperations:
                     return self._conv_forward(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
-                return super()._conv_forward(input, weight, bias)
+                # Ensure device consistency for block swapping
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
+                return super()._conv_forward(x, weight, bias)
 
     class Conv1d(torch.nn.Conv1d):
 
@@ -213,7 +228,12 @@ class ForgeOperations:
                     return self._conv_forward(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
-                return super()._conv_forward(input, weight, bias)
+                # Ensure device consistency for block swapping
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
+                return super()._conv_forward(x, weight, bias)
 
     class ConvTranspose2d(torch.nn.ConvTranspose2d):
 

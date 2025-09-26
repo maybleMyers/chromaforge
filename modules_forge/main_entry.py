@@ -54,7 +54,7 @@ def bind_to_opts(comp, k, save=False, callback=None):
 
 
 def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_blocks_to_swap, ui_forge_inference_memory, ui_forge_preset
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -108,11 +108,11 @@ def make_checkpoint_manager_ui():
 
     ui_forge_async_loading = gr.Radio(label="Swap Method", value=lambda: shared.opts.forge_async_loading, choices=['Queue', 'Async'])
     ui_forge_pin_shared_memory = gr.Radio(label="Swap Location", value=lambda: shared.opts.forge_pin_shared_memory, choices=['CPU', 'Shared'])
-    ui_forge_inference_memory = gr.Slider(label="GPU Weights (MB)", value=lambda: total_vram - shared.opts.forge_inference_memory, minimum=0, maximum=int(memory_management.total_vram), step=1)
+    ui_blocks_to_swap = gr.Slider(label="Blocks to Swap", value=lambda: shared.opts.blocks_to_swap, minimum=0, maximum=50, step=1, info="Number of model blocks to swap to CPU to save VRAM. Higher values save more VRAM but may reduce speed.")
 
-    mem_comps = [ui_forge_inference_memory, ui_forge_async_loading, ui_forge_pin_shared_memory]
+    mem_comps = [ui_blocks_to_swap, ui_forge_async_loading, ui_forge_pin_shared_memory]
 
-    ui_forge_inference_memory.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
+    ui_blocks_to_swap.change(ui_refresh_blocks_to_swap_settings, inputs=[ui_blocks_to_swap], queue=False, show_progress=False)
     ui_forge_async_loading.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
     ui_forge_pin_shared_memory.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
 
@@ -164,33 +164,41 @@ def refresh_models():
     return ckpt_list, module_list.keys()
 
 
-def ui_refresh_memory_management_settings(model_memory, async_loading, pin_shared_memory):
-    """ Passes precalculated 'model_memory' from "GPU Weights" UI slider (skip redundant calculation) """
+def ui_refresh_blocks_to_swap_settings(blocks_to_swap):
+    """Update blocks_to_swap setting."""
+    shared.opts.set('blocks_to_swap', blocks_to_swap)
+    # Update vram_state for compatibility
+    memory_management.set_vram_state_from_blocks(blocks_to_swap)
+    print(f"Block swapping updated: {blocks_to_swap} blocks")
+
+def ui_refresh_memory_management_settings(blocks_to_swap, async_loading, pin_shared_memory):
+    """Update memory management settings."""
     refresh_memory_management_settings(
         async_loading=async_loading,
         pin_shared_memory=pin_shared_memory,
-        model_memory=model_memory  # Use model_memory directly from UI slider value
+        blocks_to_swap=blocks_to_swap
     )
 
-def refresh_memory_management_settings(async_loading=None, inference_memory=None, pin_shared_memory=None, model_memory=None):
+def refresh_memory_management_settings(async_loading=None, pin_shared_memory=None, blocks_to_swap=None):
     # Fallback to defaults if values are not passed
     async_loading = async_loading if async_loading is not None else shared.opts.forge_async_loading
-    inference_memory = inference_memory if inference_memory is not None else shared.opts.forge_inference_memory
     pin_shared_memory = pin_shared_memory if pin_shared_memory is not None else shared.opts.forge_pin_shared_memory
+    blocks_to_swap = blocks_to_swap if blocks_to_swap is not None else shared.opts.blocks_to_swap
 
-    # If model_memory is provided, calculate inference memory accordingly, otherwise use inference_memory directly
-    if model_memory is None:
-        model_memory = total_vram - inference_memory
-    else:
-        inference_memory = total_vram - model_memory
-
+    # Update settings
     shared.opts.set('forge_async_loading', async_loading)
-    shared.opts.set('forge_inference_memory', inference_memory)
     shared.opts.set('forge_pin_shared_memory', pin_shared_memory)
+    shared.opts.set('blocks_to_swap', blocks_to_swap)
 
     stream.stream_activated = async_loading == 'Async'
-    memory_management.current_inference_memory = inference_memory * 1024 * 1024  # Convert MB to bytes
     memory_management.PIN_SHARED_MEMORY = pin_shared_memory == 'Shared'
+
+    # Update vram_state for compatibility
+    memory_management.set_vram_state_from_blocks(blocks_to_swap)
+
+    # Use default inference memory for now (can be made dynamic later)
+    inference_memory = 1024  # 1GB default
+    memory_management.current_inference_memory = inference_memory * 1024 * 1024
 
     log_dict = dict(
         stream=stream.should_use_stream(),
@@ -202,16 +210,16 @@ def refresh_memory_management_settings(async_loading=None, inference_memory=None
 
     if inference_memory < min(512, total_vram * 0.05):
         print('------------------')
-        print(f'[Low VRAM Warning] You just set Forge to use 100% GPU memory ({model_memory:.2f} MB) to load model weights.')
-        print('[Low VRAM Warning] This means you will have 0% GPU memory (0.00 MB) to do matrix computation. Computations may fallback to CPU or go Out of Memory.')
+        print(f'[Low VRAM Warning] Very low VRAM available for computations ({inference_memory:.2f} MB).')
+        print('[Low VRAM Warning] Computations may fallback to CPU or go Out of Memory.')
         print('[Low VRAM Warning] In many cases, image generation will be 10x slower.')
-        print("[Low VRAM Warning] To solve the problem, you can set the 'GPU Weights' (on the top of page) to a lower value.")
-        print("[Low VRAM Warning] If you cannot find 'GPU Weights', you can click the 'all' option in the 'UI' area on the left-top corner of the webpage.")
+        print("[Low VRAM Warning] To solve the problem, you can increase 'Blocks to Swap' (on the top of page) to free up more VRAM.")
+        print("[Low VRAM Warning] If you cannot find 'Blocks to Swap', you can click the 'all' option in the 'UI' area on the left-top corner of the webpage.")
         print('[Low VRAM Warning] Make sure that you know what you are testing.')
         print('------------------')
     else:
         compute_percentage = (inference_memory / total_vram) * 100.0
-        print(f'[GPU Setting] You will use {(100 - compute_percentage):.2f}% GPU memory ({model_memory:.2f} MB) to load weights, and use {compute_percentage:.2f}% GPU memory ({inference_memory:.2f} MB) to do matrix computation.')
+        print(f'[Block Swapping] Using {blocks_to_swap} blocks to swap, {compute_percentage:.2f}% GPU memory ({inference_memory:.2f} MB) for computation.')
 
     processing.need_global_unload = True
     return
@@ -301,13 +309,13 @@ def forge_main_entry():
     ui_txt2img_hr_cfg = get_a1111_ui_component('txt2img', 'Hires CFG Scale')
     ui_txt2img_hr_distilled_cfg = get_a1111_ui_component('txt2img', 'Hires Distilled CFG Scale')
 
-    output_targets = [
+    ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=[
         ui_vae,
         ui_clip_skip,
         ui_forge_unet_storage_dtype_options,
         ui_forge_async_loading,
         ui_forge_pin_shared_memory,
-        ui_forge_inference_memory,
+        ui_blocks_to_swap,
         ui_txt2img_width,
         ui_img2img_width,
         ui_txt2img_height,
@@ -322,11 +330,30 @@ def forge_main_entry():
         ui_img2img_scheduler,
         ui_txt2img_hr_cfg,
         ui_txt2img_hr_distilled_cfg,
-    ]
-
-    ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
+    ], queue=False, show_progress=False)
     ui_forge_preset.change(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
-    Context.root_block.load(on_preset_change, inputs=None, outputs=output_targets, queue=False, show_progress=False)
+    Context.root_block.load(on_preset_change, inputs=None, outputs=[
+        ui_vae,
+        ui_clip_skip,
+        ui_forge_unet_storage_dtype_options,
+        ui_forge_async_loading,
+        ui_forge_pin_shared_memory,
+        ui_blocks_to_swap,
+        ui_txt2img_width,
+        ui_img2img_width,
+        ui_txt2img_height,
+        ui_img2img_height,
+        ui_txt2img_cfg,
+        ui_img2img_cfg,
+        ui_txt2img_distilled_cfg,
+        ui_img2img_distilled_cfg,
+        ui_txt2img_sampler,
+        ui_img2img_sampler,
+        ui_txt2img_scheduler,
+        ui_img2img_scheduler,
+        ui_txt2img_hr_cfg,
+        ui_txt2img_hr_distilled_cfg,
+    ], queue=False, show_progress=False)
 
     refresh_model_loading_parameters()
     return
@@ -346,7 +373,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False, value='Automatic'),                                # ui_forge_unet_storage_dtype_options
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
-            gr.update(visible=False, value=total_vram - 1024),                          # ui_forge_inference_memory
+            gr.update(visible=False, value=0),                                          # ui_blocks_to_swap
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_width", 512)),                 # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_i2i_width", 512)),                 # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_height", 640)),                # ui_txt2img_height
@@ -366,16 +393,14 @@ def on_preset_change(preset=None):
     if shared.opts.forge_preset == 'xl':
         ckpt_list, _ = refresh_models()
         ui_checkpoint.choices = ckpt_list
-        model_mem = getattr(shared.opts, "xl_GPU_MB", total_vram - 1024)
-        if model_mem < 0 or model_mem > total_vram:
-            model_mem = total_vram - 1024
+        blocks_swap = getattr(shared.opts, "xl_blocks_to_swap", 0)
         return [
             gr.update(visible=True),                                                    # ui_vae
             gr.update(visible=False, value=1),                                          # ui_clip_skip
             gr.update(visible=True, value='Automatic'),                                 # ui_forge_unet_storage_dtype_options
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
-            gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
+            gr.update(visible=True, value=blocks_swap),                                 # ui_blocks_to_swap
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_width", 896)),                 # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_i2i_width", 1024)),                # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_height", 1152)),               # ui_txt2img_height
@@ -395,16 +420,14 @@ def on_preset_change(preset=None):
     if shared.opts.forge_preset == 'flux':
         ckpt_list, _ = refresh_models()
         ui_checkpoint.choices = ckpt_list
-        model_mem = getattr(shared.opts, "flux_GPU_MB", total_vram - 1024)
-        if model_mem < 0 or model_mem > total_vram:
-            model_mem = total_vram - 1024
+        blocks_swap = getattr(shared.opts, "flux_blocks_to_swap", 0)
         return [
             gr.update(visible=True),                                                    # ui_vae
             gr.update(visible=False, value=1),                                          # ui_clip_skip
             gr.update(visible=True, value='Automatic'),                                 # ui_forge_unet_storage_dtype_options
             gr.update(visible=True, value='Queue'),                                     # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),                                       # ui_forge_pin_shared_memory
-            gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
+            gr.update(visible=True, value=blocks_swap),                                 # ui_blocks_to_swap
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_width", 896)),               # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_i2i_width", 1024)),              # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_height", 1152)),             # ui_txt2img_height
@@ -430,7 +453,7 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value='Automatic'),  # ui_forge_unet_storage_dtype_options
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
-            gr.update(visible=True, value=total_vram - 1024),  # ui_forge_inference_memory
+            gr.update(visible=True, value=getattr(shared.opts, "chroma_blocks_to_swap", 0)),  # ui_blocks_to_swap
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_width", 1024)),  # ui_txt2img_width
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_width", 1024)),  # ui_img2img_width
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_height", 1024)),  # ui_txt2img_height
@@ -490,7 +513,7 @@ shared.options_templates.update(shared.options_section(('ui_xl', "UI defaults 'x
     "xl_i2i_width":  shared.OptionInfo(1024, "img2img width",      gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
     "xl_i2i_height": shared.OptionInfo(1024, "img2img height",     gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
     "xl_i2i_cfg":    shared.OptionInfo(5,    "img2img CFG",        gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
-    "xl_GPU_MB":     shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)", gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "xl_blocks_to_swap": shared.OptionInfo(0, "Blocks to Swap", gr.Slider, {"minimum": 0,  "maximum": 50,   "step": 1}),
 }))
 shared.options_templates.update(shared.options_section(('ui_flux', "UI defaults 'flux'", "ui"), {
     "flux_t2i_width":    shared.OptionInfo(896,  "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
@@ -503,7 +526,7 @@ shared.options_templates.update(shared.options_section(('ui_flux', "UI defaults 
     "flux_i2i_height":   shared.OptionInfo(1024, "img2img height",               gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
     "flux_i2i_cfg":      shared.OptionInfo(1,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "flux_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
-    "flux_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "flux_blocks_to_swap": shared.OptionInfo(0, "Blocks to Swap", gr.Slider, {"minimum": 0,  "maximum": 50,   "step": 1}),
 }))
 shared.options_templates.update(shared.options_section(('ui_chroma', "UI defaults 'chroma'", "ui"), {
     "chroma_t2i_width":    shared.OptionInfo(1024,  "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
@@ -520,5 +543,5 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
     "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
-    "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "chroma_blocks_to_swap": shared.OptionInfo(0, "Blocks to Swap", gr.Slider, {"minimum": 0,  "maximum": 50,   "step": 1}),
 }))

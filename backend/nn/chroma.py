@@ -177,7 +177,44 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         )
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
-        
+
+        # Block swapping support
+        self.blocks_to_swap = None
+        self.num_double_blocks = depth
+        self.num_single_blocks = depth_single_blocks
+        self.offloader_double = None
+        self.offloader_single = None
+
+    def enable_block_swap(self, num_blocks: int, device: torch.device):
+        """Enable block swapping based on sd-scripts implementation."""
+        from backend.custom_offloading_utils import ModelOffloader
+
+        self.blocks_to_swap = num_blocks
+        double_blocks_to_swap = num_blocks // 2
+        single_blocks_to_swap = (num_blocks - double_blocks_to_swap) * 2
+
+        assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
+            f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
+            f"Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks."
+        )
+
+        self.offloader_double = ModelOffloader(
+            self.double_blocks, double_blocks_to_swap, device  # , debug=True
+        )
+        self.offloader_single = ModelOffloader(
+            self.single_blocks, single_blocks_to_swap, device  # , debug=True
+        )
+        print(
+            f"CHROMA: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
+        )
+
+    def prepare_block_swap_before_forward(self):
+        """Prepare block devices before forward pass."""
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
+        self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
+
     @staticmethod
     def distribute_modulations(tensor, single_block_count: int = 38, double_blocks_count: int = 19):
         """
@@ -268,14 +305,30 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         pe = self.pe_embedder(ids)
         del ids
         for i, block in enumerate(self.double_blocks):
+            # Block swapping support - wait for block to be ready
+            if self.offloader_double is not None:
+                self.offloader_double.wait_for_block(i)
+
             img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
             txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
             double_mod = [img_mod, txt_mod]
             img, txt = block(img=img, txt=txt, mod=double_mod, pe=pe)
+
+            # Block swapping support - submit move blocks for next iteration
+            if self.offloader_double is not None:
+                self.offloader_double.submit_move_blocks(self.double_blocks, i)
         img = torch.cat((txt, img), 1)
         for i, block in enumerate(self.single_blocks):
+            # Block swapping support - wait for block to be ready
+            if self.offloader_single is not None:
+                self.offloader_single.wait_for_block(i)
+
             single_mod = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
             img = block(img, mod=single_mod, pe=pe)
+
+            # Block swapping support - submit move blocks for next iteration
+            if self.offloader_single is not None:
+                self.offloader_single.submit_move_blocks(self.single_blocks, i)
         del pe
         img = img[:, txt.shape[1]:, ...]
         final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
@@ -283,6 +336,9 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         return img
 
     def forward(self, x, timestep, context, **kwargs):
+        # Prepare block swapping before forward pass
+        self.prepare_block_swap_before_forward()
+
         bs, c, h, w = x.shape
         input_device = x.device
         input_dtype = x.dtype

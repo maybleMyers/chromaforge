@@ -28,12 +28,27 @@ class KModel(torch.nn.Module):
         if c_concat is not None:
             xc = torch.cat([xc] + [c_concat], dim=1)
 
-        context = c_crossattn
+        # Handle context which may now be a dict with crossattn and attention_mask
+        if isinstance(c_crossattn, dict):
+            context = c_crossattn['crossattn']
+            attention_mask = c_crossattn.get('attention_mask', None)
+        else:
+            # Backward compatibility: if context is just a tensor
+            context = c_crossattn
+            attention_mask = None
+
         dtype = self.computation_dtype
 
         xc = xc.to(dtype)
         t = self.predictor.timestep(t).float()
         context = context.to(dtype)
+
+        # Keep attention mask as boolean if present
+        if attention_mask is not None:
+            # Store attention mask in transformer options for potential future use
+            transformer_options = transformer_options.copy() if transformer_options else {}
+            transformer_options['attention_mask'] = attention_mask
+
         extra_conds = {}
         for o in kwargs:
             extra = kwargs[o]

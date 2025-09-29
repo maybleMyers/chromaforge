@@ -60,7 +60,11 @@ class ChromaDCT(ForgeDiffusionEngine):
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
-        return self.text_processing_engine_t5(prompt)
+        # Get embeddings with attention mask
+        embeddings, attention_mask = self.text_processing_engine_t5(prompt, return_attention_mask=True)
+        # Store attention mask in a dict along with embeddings
+        # Use 'crossattn' key to match the conditioning system's expectations
+        return {'crossattn': embeddings, 'attention_mask': attention_mask}
 
     @torch.inference_mode()
     def get_prompt_lengths_on_ui(self, prompt):

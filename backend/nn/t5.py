@@ -179,7 +179,16 @@ class T5Stack(torch.nn.Module):
         mask = None
 
         if attention_mask is not None:
-            mask = 1.0 - attention_mask.to(x.dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
+            # CRITICAL: Keep attention mask as boolean to avoid dtype bug
+            # The bug occurs when masks are converted to float16/bfloat16
+            # PyTorch's scaled_dot_product_attention expects boolean masks
+            # First ensure mask is boolean
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(torch.bool)
+
+            # Create attention mask in the format expected by attention functions
+            # This creates a mask where True values are attended to
+            mask = 1.0 - attention_mask.float().reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
             mask = mask.masked_fill(mask.to(torch.bool), float("-inf"))
 
         past_bias = None

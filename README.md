@@ -52,6 +52,8 @@ Discord: http://discord.gg/SQVcWVbqKx
 
 ## Changlog
 
+9/29/2025  
+    Implement diffusers style T5 embedding mask as seen here: https://github.com/huggingface/diffusers/pull/12263 seems to help alot with details.  
 9/26/2025  
     Improve memory management when offloading with async. async should be the fastest way to offload. Offloading with radiance improved, still slow though.   
 9/24/2025  

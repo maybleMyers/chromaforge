@@ -23,12 +23,6 @@ set the CFG scale to something like 3.5-7
 forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work  
 refer to screenshot for working settings.  
 
-To update to torch 2.7.0 with cuda 12.8 on windows and install sage attention, navigate to your root directory after initial installation ie c:/chromaforge/ and run these commands:  
-venv/scripts/activate  
-pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128  
-pip install -U "triton-windows<3.4"  
-pip install .\sageattention-2.1.1+cu128torch2.7.0-cp310-cp310-win_amd64.whl  
-
 there's a bunch of extra samplers/schedulers at these places:  
 https://github.com/DenOfEquity/webUI_ExtraSchedulers
 https://github.com/MisterChief95/sd-forge-extra-samplers
@@ -51,7 +45,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog
-
+10/15/2025  
+    Upgrade default torch version to 2.7.1 to support 50xx series gpu.  
 9/29/2025  
     Implement diffusers style T5 embedding mask as seen here: https://github.com/huggingface/diffusers/pull/12263 seems to help alot with details.  
 9/26/2025  

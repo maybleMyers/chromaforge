@@ -179,16 +179,7 @@ class T5Stack(torch.nn.Module):
         mask = None
 
         if attention_mask is not None:
-            # CRITICAL: Keep attention mask as boolean to avoid dtype bug
-            # The bug occurs when masks are converted to float16/bfloat16
-            # PyTorch's scaled_dot_product_attention expects boolean masks
-            # First ensure mask is boolean
-            if attention_mask.dtype != torch.bool:
-                attention_mask = attention_mask.to(torch.bool)
-
-            # Create attention mask in the format expected by attention functions
-            # This creates a mask where True values are attended to
-            mask = 1.0 - attention_mask.float().reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
+            mask = 1.0 - attention_mask.to(x.dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1])
             mask = mask.masked_fill(mask.to(torch.bool), float("-inf"))
 
         past_bias = None
@@ -210,10 +201,13 @@ class T5(torch.nn.Module):
         self.encoder = T5Stack(self.num_layers, model_dim, model_dim, config["d_ff"], config["dense_act_fn"], config["is_gated_act"], config["num_heads"], config["model_type"] != "umt5")
         self.shared = torch.nn.Embedding(config["vocab_size"], model_dim)
 
-    def forward(self, input_ids, *args, **kwargs):
-        x = self.shared(input_ids)
+    def forward(self, input_ids, attention_mask=None, embeds=None, *args, **kwargs):
+        if input_ids is None:
+            x = embeds
+        else:
+            x = self.shared(input_ids)
         x = torch.nan_to_num(x)
-        return self.encoder(x, *args, **kwargs)
+        return self.encoder(x, attention_mask=attention_mask, *args, **kwargs)
 
 
 class IntegratedT5(torch.nn.Module):

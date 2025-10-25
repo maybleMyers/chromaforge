@@ -1,0 +1,25 @@
+{
+  "_class_name": "AuraFlowPipeline",
+  "_diffusers_version": "0.31.0.dev0",
+  "_name_or_path": "fal/AuraFlow-v0.3",
+  "scheduler": [
+    "diffusers",
+    "FlowMatchEulerDiscreteScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "UMT5EncoderModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "LlamaTokenizer"
+  ],
+  "transformer": [
+    "diffusers",
+    "AuraFlowTransformer2DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKL"
+  ]
+}

@@ -123,9 +123,15 @@ class ForgeOperations:
             if self.parameters_manual_cast:
                 weight, bias, signal = weights_manual_cast(self, x)
                 with main_stream_worker(weight, bias, signal):
+                    # Handle case where weight is None (e.g., model initialization failed)
+                    if weight is None:
+                        raise RuntimeError(f"Linear layer {self.__class__.__name__} has None weight. Model initialization may have failed.")
                     return torch.nn.functional.linear(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
+                # Handle case where weight is None (e.g., model initialization failed)
+                if weight is None:
+                    raise RuntimeError(f"Linear layer {self.__class__.__name__} has None weight. Model initialization may have failed.")
                 return torch.nn.functional.linear(x, weight, bias)
 
     class Conv2d(torch.nn.Conv2d):

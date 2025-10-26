@@ -45,6 +45,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog
+10/25/2025  
+    Support auraflow in the p7 branch. To switch branches just navigate to your root directory then type "git switch p7" for example.  
 10/15/2025  
     Upgrade default torch version to 2.7.1 to support 50xx series gpu.  
 9/29/2025  

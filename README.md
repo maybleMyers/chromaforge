@@ -6,6 +6,18 @@ Use it in the all tab with very low cfg, I think 2-3 is a good starting point. T
 
 Just select the checkpoint and vae that you downloaded in the all tab and it should work.  
 
+If you are installing for the first time, you need to have python 3.10 preinstalled, then:  
+git clone https://github.com/maybleMyers/chromaforge  
+git switch p7  
+then double click webui=user.bat for windows and let it run until you get an error, then close it and run it again and it should be working.  
+
+Try eueler simple first to verify it is working.  
+
+
+
+
+
+
 ## Fork of forge to use Chroma!
 
 This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks Thanks to [@croquelois](https://github.com/croquelois) && [@lllyasviel](https://github.com/lllyasviel)!   

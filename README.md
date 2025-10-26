@@ -1,4 +1,10 @@
-![GUI Screenshot](images/screenshot.png)
+# P7 Branch
+
+To get this to work, download https://huggingface.co/maybleMyers/chromafiles/blob/main/pony-v7-base-mergedstockt5.safetensors and put it in the stable diffusion folder.  
+You should also download the vae from https://huggingface.co/purplesmartai/pony-v7-base/blob/main/vae/diffusion_pytorch_model.safetensors and put it in the vae folder.  
+Use it in the all tab with very low cfg, I think 2-3 is a good starting point. The model will break over 1536 res but seems to be working good below that.  
+
+Just select the checkpoint and vae that you downloaded in the all tab and it should work.  
 
 ## Fork of forge to use Chroma!
 
@@ -45,6 +51,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog
+10/25/2025  
+    Added support for auraflow to the p7  branch.  
 10/15/2025  
     Upgrade default torch version to 2.7.1 to support 50xx series gpu.  
 9/29/2025  

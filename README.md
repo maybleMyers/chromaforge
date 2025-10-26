@@ -9,7 +9,7 @@ Just select the checkpoint and vae that you downloaded in the all tab and it sho
 If you are installing for the first time, you need to have python 3.10 preinstalled, then:  
 git clone https://github.com/maybleMyers/chromaforge  
 git switch p7  
-then double click webui=user.bat for windows and let it run until you get an error, then close it and run it again and it should be working.  
+then double click webui-user.bat for windows and let it run until you get an error, then close it and run it again and it should be working.  
 
 Try eueler simple first to verify it is working.  
 

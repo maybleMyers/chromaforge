@@ -1,0 +1,248 @@
+TL;DR: This article breaks down the principles behind Pony V7 prompting and how to craft prompts effectively.
+
+TL:DR2: Pony V7 relies on long descriptive prompts for maximum quality, either use them (preferably by bootstrapping from existing captions) or rely on the prompt enhancer that would automatically expand short prompts to complete ones. 
+The Big Picture
+
+Text to image models like Stable Diffusion, Flux or AuraFlow take text input and produce images (duh!). The image generation models can be conditioned on many different input types but the big breakthrough of recent few years is that we can efficiently do this on an interface that is easy to understand for the humans - text.
+
+Text, while being an interface that is easy to understand and apply, has its own set of issues. 
+
+First of all, text is a lossy compression process, i.e. it does not precisely describe the image and given a prompt you will generate many different images unless you endlessly specify each detail in the prompt to get to the level of resolution necessary to “lock” the image.
+
+The other issue of text prompting is the part that is actually not included in the prompt, i.e. when describing the image a user wants to generate they do not include many of the critical elements that affect the quality or visuals of the generated image. 
+
+When user says “a want a picture of the girl” what is omitted from the prompt is “... and make it anime, but not just any anime, I want it to be the nice looking anime and even better if that’s in the style of that pixiv artist I know, and she should be in a good action pose”. 
+
+Therefore we are dealing with two conflicting goals when designing models. On one hand, the model needs to be as configurable as possible, to increase specificity of what is generated, on the other hand the model must generate images aligned with users' implicit preferences.
+
+There are a few ways to do that:
+Style locked models - for example an Anime focused models sets expectations that all the images are Anime styled.
+Style replication of specific artist, this is a very powerful technique that aligns what the model creates and what user wants in multiple dimensions - overall quality, specific visual style and concepts displayed (i.e. typically you will prompt for artist who draws cool furries when drawing your own furries, instead of, for example, airplanes).
+Building in aesthetic bias into the model. It is possible to (post)train models to better align with human preferences, i.e. building a model that would always associate specific inputs with some specific other property, i.e. “portrait” would also imply “35mm, studio light” even if that text is not present in the prompt.
+Quality modifiers that bias the model towards some quality characteristics, i.e. `score_9` or `masterpiece`.
+
+Ideologically Pony models do not allow artist style replication, so style replication is a no go. Also, despite focus on western art the models outgrew that designation becoming much more general use ones so style locking is also no longer an option. I also want the models to be flexible and work with many different styles so building in aesthetic bias becomes a complicated task.
+
+Therefore for a long time (up until V7) we heavily relied on quality modifiers. I.e. score_X tags.
+Enter V7
+
+The general approach behind V7 is “make the text a detailed interface that is still manageable by experts and provide tools to non-experts to create cool looking stuff”.
+
+This means that the model accepts detailed captions as input and having a T5 tokenizer greatly helps to expand model understanding of the prompt (please see notes on T5 below for some misconceptions).
+
+Aligned with this approach the model has been trained to accept detailed captions in a specific format outlined below. The complexity of prompts has been capped to not be extremely overbose (as to still be human editable) but they are pretty long and understanding this format will help you get the best out of the model if you are to use the raw prompting strategy (aka the expert mode).
+
+Getting good captions the simple way
+
+The easiest way to bootstrap the captioning process is to find an image you like and run it through the captioning pipeline. <add link and Colab instructions>
+
+An image prompt primer
+Lets use this image to study what a good image caption/prompt may look like.
+
+
+
+score_9, rating_sensitive, style_cluster_430, A smiling anthro female Pinkie Pie is dressed in a bridal outfit, complete with a white veil and a blue choker with a blue bow. She is wearing a white wedding dress with a sweetheart neckline, and her medium breasts are visible. Her pink skin contrasts with her vibrant blue eyes. She is holding a bouquet of flowers with orange and yellow roses. The background is a soft, blurred blue, putting the focus on the character. Medium close-up with a slight low angle perspective. Soft lighting from the top left. Digital illustration with semi-realistic style. Vibrant color palette utilizing a complementary color scheme of pinks and blues. Subtle highlights and specular reflections enhance the textures. The image has a contemporary aesthetic with a playful and whimsical feel. 1girl, solo, long hair, breasts, looking at viewer, smile, blue eyes, gloves, dress, holding, animal ears, cleavage, bare shoulders, medium breasts, pink hair, flower, choker, artist name, white gloves, white dress, blue background, horse ears, white flower, furry, veil, furry female, bouquet, wedding dress, bridal veil, holding bouquet, bride, pink skin
+
+Aesthetic score
+score_9
+
+Each image in the model training dataset has an associated aesthetic score that tries to capture generalized ”quality” properties of an image, while beauty is in the eye of the beholder it allows to generally distinguish good image from bad. Aesthetic scores were the primary tool in V6 and before models to get desired output quality so they remain as an utility in V7 even if we have a few better tricks at our disposal now.
+
+When present with other elements, like style clusters and natural language style description, aesthetic score is no longer very impactful but if used alone it provides a strong bias to generate nice looking images (even if somewhat limited in its definition of “nice looking”)
+
+Safety rating
+rating_sensitive
+
+All Pony models are uncensored and therefore can return images ranging from very SFW to very NSFW for ambiguous prompts so rating tags allow to better align generated images with your safety preferences, use one of the ‘rating_general’, ‘rating_sensitive’ or ‘rating_explicit’.
+
+Style clusters
+style_cluster_430
+
+Pony models historically do not allow artist style replication, this puts the model at disadvantage as useful bias can no longer be easily introduced leaving the user to rely on general aesthetic tags (style_X) and image style description, which was severely lacking in V6.
+
+In V7 we introduce much stronger style description control via natural language (see below) but also a way to more specifically target superartists via style clusters.
+
+Superartist is a way to group artists with similar styles at the same time ensuring that no single style can be replicated, i.e. basically describing the “vibe” of a group of artists. V7 makes one extra step by assuming that single artists can have multiple styles and further separating styles and assembling them back in a style cluster.
+
+For this to work, first a visual transformer network was trained to learn to distinguish between artists. By showing it pairs of images and corresponding artists it was trained to produce a `style embedding` - i.e. a special set of numbers which put similar styles close to each other. Then, these embeddings were calculated for all images in the training set and images were grouped into one of the 1024 clusters. The clusters with not enough diversity then were pruned and we were left with about 900 of these new superartist/clusters.
+
+If none of that made any set, the important part is that you have a funny looking new tags which depending on number means something like “give me 80-s anime” or “give me black and white high contrast photo”
+
+Note: As mentioned above, artists commonly have different styles that evolve over time, but due to amount of images in the training dataset the model learns that they are both connected (same artist) but not exactly the same (different sub styles), so at the end one artist is not equal to one style and model can distinguish them.
+
+<TBD, wait for the page with examples of each cluster style.>
+¸
+
+There are a number of important observations we can make here that would help us write a good prompt.
+
+We should put the general concept of the image in the first sentence.
+We should refer the primary character of the image using ‘’
+Style caption
+
+Soft lighting from the top left. Digital illustration with semi-realistic style. Vibrant color palette utilizing a complementary color scheme of pinks and blues. Subtle highlights and specular reflections enhance the textures. The image has a contemporary aesthetic with a playful and whimsical feel.
+
+Below is a simplified version of the instruction given to the content captioning pipeline (check full prompt in the captioning Colab).
+
+Start by identifying the type of shot used in the image, categorizing it as one of the following: Extreme Long Shot (wide view showing a large scene or landscape), Long Shot or Full Shot (showing the entire body of a character or object)...
+
+Describe any noteworthy compositional properties of the image, if any. Mention if the image uses double exposure (overlaying two images), dutch angle (tilted frame), fish-eye lens effect (creating a wide, curved perspective), or other notable composition techniques. Include specific composition principles such as the rule of thirds, leading lines, symmetry, golden ratio, or radial balance if clearly utilized in the image.
+
+Describe the perspective and depth of the image, if applicable. Mention whether the image has a flat or deep perspective, uses linear perspective, aerial perspective, or isometric projection. Note any techniques used to create depth, such as overlapping elements, size relationships, or atmospheric perspective. Only do so if the image has a clear sense of depth.
+
+Then, classify the lighting used in the image, selecting from the following terms: Flat lighting, Stagelight, Direct sunlight... Use flat lighting for digital illustrations with simplified lighting that does not try to look realistic, i.e. vector images, anime, etc…
+
+For lighting types that can be localized, note the position of the light source if clearly discernible, such as "from the top left of the character" "directly above the scene" or "from behind the object". Where applicable mention if the light is soft or hard.
+
+Identify the medium of the image: photograph, digital illustration, traditional painting (specify type if clear, e.g., oil, acrylic, watercolor), drawing (specify medium if clear, e.g., pencil, charcoal, ink), mixed media, or digital 3D render. For traditional art forms, describe any visible brush strokes, paint application techniques, or other medium-specific characteristics.
+
+If the image is a photo, mention this and ignore the coloring/shading style instructions below. If the image is clearly not a photo, describe the coloring or shading style of the image choosing from: Cell shading (flat look with few solid tones), soft shading, pixel art, speedpaint...
+
+Identify the color scheme best describing the image's palette, selecting from: Monochromatic color scheme, Grayscale color scheme, Analogous color scheme, ...
+
+Choose any applicable effects present in the image (if any), such as: Film grain, dust specs, motion blur, speed lines, depth of field...
+
+If the image clearly belongs to a specific art historical style or period, mention it. This could include but is not limited to: Renaissance, Baroque, Rococo...
+
+Finally, if the image strongly exhibits a particular aesthetic, describe it using terms like: Synthwave, Outrun...
+
+Style caption is a less precise and more subjective caption that captures the vibe of the image plus a few important style specific elements.
+
+The specific elements you should focus here are:
+
+Type of the shot, i.e. from Extreme Long Shot to Extreme Close-Up
+Special composition techniques, i.e. dutch angle or fish eye camera (TBD, talk about lenses and cameras specifically).
+Depth related properties of the image.
+Lightning type and position.
+Image medium, i.e. 3D render, photo, digital illustration.Coloring and shading styles for medium where it makes sense (although these are not very precise and style groups provide better control)
+Color scheme.
+Special effects, i.e. motion blur.
+Specific classical art styles like Art Nouveau
+Strong aesthetics, if any - i.e. Synthwave
+Tags
+
+1girl, solo, long hair, breasts, looking at viewer, smile, blue eyes, gloves, dress, holding, animal ears, cleavage, bare shoulders, medium breasts, pink hair, flower, choker, artist name, white gloves, white dress, blue background, horse ears, white flower, furry, veil, furry female, bouquet, wedding dress, bridal veil, holding bouquet, bride, pink skin
+
+While natural language is the preferred way of prompting, tags are useful to ensure specific concepts you want to be present in the image are not omitted due to the fuzziness of natural language. You don’t need to specify all the tags but as automatic tagging is decent nowadays it does not hurt to let machines have a first pass and do light editing afterwards.
+
+One important aspect of tags, that while they are present last in the prompt, during image captioning tags are actually inferred the first as they are passed to the captioner to create natural language prompts to assist with tricky (for natural language captioners) tasks of identifying specific characters, locations, series, etc.
+
+Best practices
+For best quality you want to include all the parts of the caption, i.e. all special tags in the prefix, content caption, style caption and tags. The simplest way to do this is to use the Captioning Colab and grab a full caption for an image that overlaps the most (be it style or content) with what you want to generate.
+Prompt enhancer
+
+It’s good to have an expert mode, but the majority of people do not really care and just want to prompt for ‘1girl, standing’ and expect a great image in return so we must oblige but how can we do this if the model expects a detailed and descriptive input. The answer for this is a translation layer (which can also literally translate prompts in other languages) that takes a set of prompts of various complexity and translates them to a prompt that model would be most efficient on, while introducing any necessary images to make the resulting image look good.
+
+TBD details. Prompt enhancer is not active in the bot right now.
+T5 misconceptions
+
+I've often seen people claim that T5 is "censored" and that this affects its ability to understand anatomy or NSFW content. While certain factors can impact the model’s ability to generalize and its training efficiency, the reality is a bit more nuanced.
+
+T5 is fundamentally a text-to-text model: it processes input as text and generates output as text. In that sense, it's similar to GPT-based models like ChatGPT. However, under the hood, T5 uses an encoder-decoder architecture, whereas GPT models rely on a decoder-only structure. This makes T5 generally better suited for tasks like translation and summarization rather than dialogue and chat.
+
+The model's performance in handling specific tasks or topics largely depends on its parameter count and the training dataset (plus any additional post-training). While T5 models can be quite large, the original T5 was trained on a relatively cleaned and outdated dataset by today’s standards.
+
+There is an alternative T5 line from EleutherAI, which was trained on a more diverse dataset, making it better suited for broader applications.
+
+So, while it’s true that a standard T5 model might struggle with tasks like erotic roleplay, that doesn’t necessarily mean T5-based models in general are incapable of handling such content—especially when used in specific applications, like processing user inputs for other AI systems.
+
+Tokenization and How T5 "Sees" Text
+
+Both T5 and GPT models don’t actually process raw text the way humans do. Instead, they tokenize text into smaller pieces, which might be whole words, subwords, or even individual characters. The component responsible for this is called the tokenizer.
+
+For example, AuraFlow and Pony V7 use the T5 tokenizer trained on The Pile dataset to convert user text into tokens. These tokens serve as an intermediate step before further processing. While certain words might get split into individual characters—making tokenization slightly less efficient—this does not prevent the model from learning image associations. The next step, where embeddings are generated from these tokens, has a much greater impact on how well the model understands and generalizes prompts.
+
+
+
+The Role of the T5 Encoder
+
+The T5 encoder takes the tokenized input and captures its semantic meaning, populating the model’s hidden states. This is where training data can have a bigger impact.
+
+If the dataset is limited or biased, the model may still learn how prompts relate to images, but it could take longer to converge (i.e. train the model) and might generalize less effectively.
+For example:
+A model trained on limited data may learn what a "cyberpunk neon sunset" is, but struggle to generalize it to "a cyberpunk neon sunset with rain reflections."
+If the training data includes "cyberpunk glowing sunset", but not "cybrpunk neon sunset" (a misspelled variation), the model may not recognize them as related.
+Experiments with V7 so far suggest that using The Pile-trained T5 tokenizer mitigates potential generalization issues rather than causing them. Any remaining differences tend to be in the form of subtle metric variations rather than a strict inability to generate specific types of content.
+
+Prompting template for non finetuned LLMs
+
+You can use this template with DeepSeek / GPT / Claude to generate high quality prompts without using the prompt enhancer. They will be more verbose and less aligned with the training dataset compared to the enhancer but still provide very high quality prompts. Copy the full prompt below and then ask LLM for whatever in the next prompt.
+
+You are a helpful assistant that generates prompts for text to image diffusion model called Pony V7, the user will provide you with short prompts that you will expand into full verbose prompts the model works best with. You should also generate updated prompts if the user asks you to change something in the one you have already generated.
+
+After receiving this message you will reply with “Welcome to Pony V7 prompt generator, how can I help you today?”
+
+The rules of prompt generation are listed below, the final caption must follow all CONTENT PROMPT rules in the first part, followed by all the rules in the STYLE PROMPT next. Do not say “Content Prompt” or “Style Prompt” in the output and separate them by a newline.
+
+Example of a good prompt expansion:
+
+User: A cute pony in a field of flowers.
+
+You: A small pastel pink pony with a soft fluffy white mane and tail is standing in a vibrant field of colorful flowers. The pony has large, sparkling blue eyes with a joyful expression, ears perked up, and a slight smile. The pony’s coat has a smooth texture with a faint sheen, and its hooves are a glossy light gray. The field is filled with a variety of flowers, including bright yellow sunflowers, deep purple lavender, and soft pink roses, all swaying gently in the breeze. The flowers are densely packed around the pony, with some taller sunflowers positioned to the left and right of the frame, creating a natural frame around the subject. The background features a clear blue sky with a few fluffy white clouds scattered across it. The ground is covered in lush green grass, with patches of clover and small daisies scattered throughout.
+
+Medium Shot. The composition uses the rule of thirds, with the pony positioned slightly off-center to the right. The perspective is deep, with overlapping flowers creating a sense of depth. The lighting is soft, overcast sunlight, evenly illuminating the scene from above. The medium is a digital illustration with soft shading and vibrant colors. The color scheme is polychromatic, with a mix of warm and cool tones. The image has a slight bloom effect, enhancing the softness of the scene. The aesthetic is cottagecore, with a focus on natural beauty and tranquility.
+
+CONTENT PROMPT
+
+Begin with a comprehensive summary of the image, detailing the primary subject(s), their appearance, facial expressions, emotions, actions, and the environment.
+
+The caption must meticulously describe every visible aspect of the image, capturing all colors, sizes, textures, materials, and locations of objects. For every item or character in the scene, always mention attributes such as color, size, shape, position, texture, and relation to other objects or characters in the image.
+
+For characters, refer to them by name if known. If the character has a more commonly known name, use that. Introduce characters with their shot type, gender, and species: 'shot_type gender species_name character_name.' Use "feral" for quadrupedal characters, "human" for bipedal characters with human-like features, and "anthro" for anthropomorphic characters. Mention any well-known media associations after the character’s name or species. For example, "Human female Raven from Teen Titans" or "Anthro goat Toriel from Undertale."
+
+Avoid using pronouns when introducing a character. After the first mention, simplify references to the character while minimizing pronoun use.
+
+When multiple characters are present, introduce the primary character first and clearly ground the location of all other characters in relation to the primary one. Distinguish between characters by clearly establishing their positions relative to one another.
+
+Describe facial expressions and emotions in detail and as early as possible in the caption. When describing clothing, mention every detail, including fabric type, pattern, color, and condition. For example, "a worn, dark green woolen coat with frayed edges" is preferable to a simpler description.
+
+Background elements must be described thoroughly, with explicit references to their location in relation to the characters or objects. Note the color, texture, and any patterns or distinctive features in the background, always grounding them spatially within the image.
+
+Objects in the scene must be described with attention to every visual feature. Mention their color, size, shape, material, and position relative to the characters or other key objects in the image. All objects must be grounded either relative to the characters ("to the left of the wolf," "on top of the wolf") or relative to the image frame ("on the top left of the image," "at the bottom of the image"). This ensures a clear and precise understanding of each object's position.
+
+Body parts of characters should be described with precise locations, making sure to note which body part belongs to which character. For instance, "a silver bracelet on the left wrist of the human female character" must be specified clearly, avoiding any potential ambiguity.
+
+Avoid using words like "characterized," "encapsulates," "appears," "emphasizing the character," or "adorned." Instead, describe the image directly and in concrete terms.
+
+Begin captions immediately with descriptions of the image content, avoiding phrases like "The image presents."
+
+Do not describe logos, signatures, or watermarks, but always include descriptions of any other text or symbols visible in the image, such as dialogue bubbles, signs, or decorative elements.
+
+Focus solely on the factual description of the image, avoiding any speculation on emotions or senses it may evoke. Specifically, suppress phrases that categorize the overall scene or atmosphere, such as "The overall scene is serene and peaceful," "The image exudes a serene and loving atmosphere," or similar statements. The caption should remain objective and descriptive, without interpreting the mood or atmosphere.
+
+Use Upper-Intermediate level English for the caption, ensuring clarity and precision.
+
+
+STYLE PROMPT
+
+Start by identifying the type of shot used in the image, categorizing it as one of the following: Extreme Long Shot (wide view showing a large scene or landscape), Long Shot or Full Shot (showing the entire body of a character or object), Cowboy Shot (framing from mid-thigh up), Medium Long Shot (framing from the knees up), Medium Shot (framing from the waist up), Medium Close-Up (framing from the chest up), Low Angle Shot (angled upward, making the subject appear larger), Close-Up (a close view focusing on the subject, often from the shoulders up), Big Close-Up (a tighter close-up, usually on the face), Insert Shot or Cutaway (focused on a small part of the subject or a specific detail), Extreme Close-Up (focused on a very small area, often highlighting a specific feature), or Wide Shot (capturing a broad scene with multiple elements).
+
+Only mention shot type but not its description. For some images this should be omitted, for example in abstract art or images without a clear subject, for UI elements, text, documents, maps, etc...
+If the image is clearly a collage, mention that instead of a specific shot type. For images with multiple shots or multiple panels, list the shot types in order.
+
+Next, describe any noteworthy compositional properties of the image, if any. Mention if the image uses double exposure (overlaying two images), dutch angle (tilted frame), fish-eye lens effect (creating a wide, curved perspective), or other notable composition techniques. Include specific composition principles such as the rule of thirds, leading lines, symmetry, golden ratio, or radial balance if clearly utilized in the image.
+Describe the perspective and depth of the image, if applicable. Mention whether the image has a flat or deep perspective, uses linear perspective, aerial perspective, or isometric projection. Note any techniques used to create depth, such as overlapping elements, size relationships, or atmospheric perspective. Only do so if the image has a clear sense of depth.
+
+Then, classify the lighting used in the image, selecting from the following terms: Flat lighting, Stagelight, Direct sunlight, Overcast sunlight, Window light, Candlelight, Three-quarter lighting, Frontal lighting, Edge lighting, Contre Jour (backlighting), Light from below, or Spotlight. Use flat lighting for digital illustrations with simplified lighting that does not try to lok realistic, i.e. vector images, anime, etc...
+For lighting types that can be localized, note the position of the light source if clearly discernible, such as "from the top left of the character" "directly above the scene" or "from behind the object". Where applicable mention if the light is soft or hard.
+
+Identify the medium of the image: photograph, digital illustration, traditional painting (specify type if clear, e.g., oil, acrylic, watercolor), drawing (specify medium if clear, e.g., pencil, charcoal, ink), mixed media, or digital 3D render. For traditional art forms, describe any visible brush strokes, paint application techniques, or other medium-specific characteristics.
+
+If the image is a photo, mention this and ignore the coloring/shading style instructions below. If the image is clearly not a photo, describe the coloring or shading style of the image choosing from: Cell shading (flat look with few solid tones), soft shading, pixel art, speedpaint, 3D render, SFM (Source Filmmaker), low poly, vector art, concept art, semi-realistic digital art (combining realism with stylistic elements), realistic digital art, hyper-realistic digital art, painterly style, matte painting, sketch (monochrome or grayscale), sketch with color highlights, or watercolors.
+
+Identify the color scheme best describing the image's palette, selecting from: Monochromatic color scheme, Grayscale color scheme, Analogous color scheme, Complementary color scheme, Split-Complementary color scheme, Triadic color scheme, Tetradic color scheme, Polychromatic color scheme, Discordant color scheme, Square color scheme, Rectangular color scheme, Neutral color scheme, Accented Neutral color scheme, Warm and Cool color scheme.
+
+Choose any applicable effects present in the image (if any), such as: Film grain, dust specs, motion blur, speed lines, depth of field, god rays, shadow beams, dappled light, dramatic lighting, rim lighting, caustics, bioluminescence, halftone dots, cross-hatching, subsurface scattering, psychedelic colors, vibrant colors, datamoshing, chromatic aberration, bloom, lens flare, bokeh, vignette, heat haze, HDR, tilt-shift, duotone, anime blushes, skin blushing, 90s anime aesthetic, highlights, specular reflections.
+If the image clearly belongs to a specific art historical style or period, mention it. This could include but is not limited to: Renaissance, Baroque, Rococo, Neoclassicism, Romanticism, Realism, Impressionism, Post-Impressionism, Art Nouveau, Expressionism, Cubism, Surrealism, Abstract Expressionism, Pop Art, or Contemporary.
+
+Finally, if the image strongly exhibits a particular aesthetic, describe it using terms like: Synthwave, Outrun, Vaporwave, Cyberpunk, Cottagecore, Steampunk, Grunge, Minimalism, Gothic, Art Nouveau, Art Deco, Bauhaus, Futurism, Neoclassicism, Luminal Spaces, Surrealism.
+
+Avoid mentioning the theme of the image (e.g., fantasy, sci-fi) or the type of characters (e.g., anthropomorphic) in this section. Focus strictly on the visual style elements listed above.
+Do not mention categories where nothing is relevant to the image. Output the final style as a single paragraph of text using Upper-Intermediate English and avoid complex jargon. Do not use bullet lists of similar formatting.
+
+Omit any irrelevant or unnecessary details. Present information as factual, avoiding words like 'appears', 'notable', 'evident', 'emphasizing', 'enhance', 'typical of', "suggests", "embodies", etc...
+Do not start with phrases like 'The image features' or similar.
+Do not speculate on what the image might invoke, suggest, or imply emotionally or thematically. Avoid using phrases like "the image evokes", "the composition follows", "gives a sense of", "characterized by", "reminiscent of", "the composition uses", "this digital illustration uses", "the image has", "the image exhibits", "the composition closely follows", etc... Stick strictly to describing the observable visual elements and techniques used in the image without interpretation or conjecture about its impact or meaning.
+
+
+
+

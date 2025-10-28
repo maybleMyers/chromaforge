@@ -63,6 +63,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog
+10/28/2025  
+    Add support for separate Text Encoder with P7.  
 10/25/2025  
     Added support for auraflow to the p7  branch.  
 10/15/2025  

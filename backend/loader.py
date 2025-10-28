@@ -445,14 +445,87 @@ def replace_state_dict(sd, asd, guess):
                         sd[new_k] = v
 
 
-    if 'encoder.block.0.layer.0.SelfAttention.k.weight' in asd:
-        keys_to_delete = [k for k in sd if k.startswith(f"{text_encoder_key_prefix}t5xxl.")]
+    has_t5_block = 'encoder.block.0.layer.0.SelfAttention.k.weight' in asd
+    has_text_encoder_prefix = any(k.startswith(text_encoder_key_prefix) for k in asd)
+    has_t5_inner_prefix = any(k.startswith("t5xxl.transformer.") for k in asd)
+
+    if has_t5_block or has_text_encoder_prefix or has_t5_inner_prefix:
+        keys_to_delete = [k for k in sd if k.startswith(text_encoder_key_prefix)]
         for k in keys_to_delete:
             del sd[k]
+
         for k, v in asd.items():
-            sd[f"{text_encoder_key_prefix}t5xxl.transformer.{k}"] = v
+            new_key = k
+
+            if new_key.startswith(text_encoder_key_prefix):
+                new_key = new_key[len(text_encoder_key_prefix):]
+            elif new_key.startswith("t5xxl.transformer."):
+                new_key = new_key[len("t5xxl.transformer."):]
+            elif new_key.startswith("transformer.") and text_encoder_key_prefix.endswith("transformer."):
+                new_key = new_key[len("transformer."):]
+
+            composed_key = f"{text_encoder_key_prefix}{new_key}" if not new_key.startswith(text_encoder_key_prefix) else new_key
+            sd[composed_key] = v
 
     return sd
+
+
+def is_t5_state_dict(state_dict: dict) -> bool:
+    if not isinstance(state_dict, dict) or len(state_dict) == 0:
+        return False
+
+    sample_keys = list(state_dict.keys())[:50]
+    identifiers = (
+        'encoder.block',
+        'transformer.encoder.block',
+        'pile_t5xl',
+        't5xxl',
+        'SelfAttention.q',
+        'SelfAttention.k',
+        'SelfAttention.v'
+    )
+
+    return any(any(marker in key for marker in identifiers) for key in sample_keys)
+
+
+def normalize_t5_key(key: str) -> str:
+    if not isinstance(key, str):
+        return key
+
+    prefixes_to_strip = [
+        'pile_t5xl.',
+        't5xxl.',
+        'text_encoders.',
+        'text_encoder.',
+        'cond_stage_model.',
+    ]
+
+    for prefix in prefixes_to_strip:
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+
+    if 'transformer.' in key:
+        key = key.split('transformer.', 1)[1]
+        key = f'transformer.{key}'
+    elif key.startswith('encoder.') or key.startswith('shared.') or key.startswith('lm_head.') or key.startswith('final_layer_norm.'):
+        key = f'transformer.{key}'
+
+    return key
+
+
+def build_text_encoder_override(state_dict: dict, guess) -> dict | None:
+    prefix_list = getattr(guess, 'text_encoder_key_prefix', None)
+    if not prefix_list:
+        return None
+
+    temp_store = {}
+    primary_prefix = prefix_list[0]
+
+    for k, v in state_dict.items():
+        normalized_key = normalize_t5_key(k)
+        temp_store[f"{primary_prefix}{normalized_key}"] = v
+
+    return try_filter_state_dict(temp_store, prefix_list)
 
 
 def preprocess_state_dict(sd):
@@ -469,10 +542,20 @@ def split_state_dict(sd, additional_state_dicts: list = None):
     sd = preprocess_state_dict(sd)
     guess = huggingface_guess.guess(sd)
 
+    external_components = {}
+
     if isinstance(additional_state_dicts, list):
         for asd in additional_state_dicts:
             asd = load_torch_file(asd)
-            sd = replace_state_dict(sd, asd, guess)
+            if is_t5_state_dict(asd):
+                override = build_text_encoder_override(asd, guess)
+                if override and len(override) > 0:
+                    external_components['text_encoder'] = override
+                    print(f"[AuraFlow] Loaded external text encoder override with {len(override)} tensors.")
+                else:
+                    print('[AuraFlow] External text encoder provided but no tensors matched expected prefixes.')
+            else:
+                sd = replace_state_dict(sd, asd, guess)
             del asd
 
     guess.clip_target = guess.clip_target(sd)
@@ -490,6 +573,22 @@ def split_state_dict(sd, additional_state_dicts: list = None):
 
     for k, v in guess.clip_target.items():
         state_dict[v] = try_filter_state_dict(sd, [k + '.'])
+
+    if 'text_encoder' not in state_dict and 'text_encoder' in external_components:
+        state_dict['text_encoder'] = external_components['text_encoder']
+
+    if 'text_encoder' not in state_dict and getattr(guess, 'text_encoder_key_prefix', None):
+        debug_sample = [k for k in sd.keys() if 'pile_t5xl' in k][:5]
+        if debug_sample:
+            print(f'[AuraFlow] Sample text encoder keys present: {debug_sample}')
+        else:
+            print('[AuraFlow] No pile_t5xl keys found in merged state dict.')
+        additional_text_encoder = try_filter_state_dict(sd, guess.text_encoder_key_prefix)
+        if len(additional_text_encoder) > 0:
+            state_dict['text_encoder'] = additional_text_encoder
+            print(f'[AuraFlow] Captured external text encoder with {len(additional_text_encoder)} tensors.')
+        else:
+            print('[AuraFlow] Failed to extract text encoder from prefixes:', guess.text_encoder_key_prefix)
 
     state_dict['ignore'] = sd
 

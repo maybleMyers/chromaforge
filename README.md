@@ -1,6 +1,8 @@
 # P7 Branch
 
-To get this to work, download https://huggingface.co/maybleMyers/chromafiles/blob/main/pony-v7-base-mergedstockt5.safetensors and put it in the stable diffusion folder.  
+To get this to work, download https://huggingface.co/purplesmartai/pony-v7-base/blob/main/safetensor/pony-v7-base.safetensors and put it in the stable diffusion folder.  
+Download the text encoder from https://huggingface.co/purplesmartai/pony-v7-base/blob/main/text_encoder/model.fp16.safetensors  
+and put it in the text encoder subfolder.  
 You should also download the vae from https://huggingface.co/purplesmartai/pony-v7-base/blob/main/vae/diffusion_pytorch_model.safetensors and put it in the vae folder.  
 Use it in the all tab with very low cfg, I think 2-3 is a good starting point. The model will break over 1536 res but seems to be working good below that.  
 
@@ -12,10 +14,6 @@ git switch p7
 then double click webui-user.bat for windows and let it run until you get an error, then close it and run it again and it should be working.  
 
 Try eueler simple first to verify it is working.  
-
-
-
-
 
 
 ## Fork of forge to use Chroma!

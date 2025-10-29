@@ -38,11 +38,15 @@ class AuraFlow(ForgeDiffusionEngine):
             config=estimated_config
         )
         
+        tokenizer_model_path = os.path.join(huggingface_components['tokenizer'].name_or_path, "tokenizer.model")
+        tokenizer = SPieceTokenizer.from_pretrained(tokenizer_model_path)
+
         self.text_processing_engine_t5 = T5TextProcessingEngine(
             text_encoder=clip.cond_stage_model.t5xxl,
-            tokenizer=SPieceTokenizer.from_pretrained(os.path.join(huggingface_components['tokenizer'].name_or_path, "tokenizer.model")),
+            tokenizer=tokenizer,
             emphasis_name=dynamic_args['emphasis_name'],
-            use_attention_mask=False
+            min_length=dynamic_args.get('t5_min_length', 256),
+            end_with_pad=True
         )
 
         self.forge_objects = ForgeObjects(unet=unet, clip=clip, vae=vae, clipvision=None)

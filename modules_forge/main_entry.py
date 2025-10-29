@@ -22,6 +22,7 @@ ui_forge_unet_storage_dtype_options: gr.Radio = None
 ui_forge_async_loading: gr.Radio = None
 ui_forge_pin_shared_memory: gr.Radio = None
 ui_forge_inference_memory: gr.Slider = None
+ui_forge_t5_padding: gr.Slider = None
 
 
 
@@ -55,7 +56,7 @@ def bind_to_opts(comp, k, save=False, callback=None):
 
 
 def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_forge_t5_padding
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -118,6 +119,17 @@ def make_checkpoint_manager_ui():
     ui_forge_pin_shared_memory.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
 
     Context.root_block.load(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
+
+    dynamic_args['t5_min_length'] = getattr(shared.opts, 'forge_t5_padding_tokens', 256)
+
+    def on_t5_padding_change(value):
+        shared.opts.set('forge_t5_padding_tokens', value)
+        dynamic_args['t5_min_length'] = value
+        shared.opts.save(shared.config_filename)
+
+    ui_forge_t5_padding = gr.Slider(label="T5 Padding Length", minimum=1, maximum=1024, step=1,
+                                    value=lambda: getattr(shared.opts, 'forge_t5_padding_tokens', 256))
+    ui_forge_t5_padding.change(on_t5_padding_change, inputs=[ui_forge_t5_padding], queue=False, show_progress=False)
 
     ui_clip_skip = gr.Slider(label="Clip skip", value=lambda: shared.opts.CLIP_stop_at_last_layers, **{"minimum": 1, "maximum": 12, "step": 1})
     bind_to_opts(ui_clip_skip, 'CLIP_stop_at_last_layers', save=True)
@@ -312,6 +324,7 @@ def forge_main_entry():
         ui_forge_async_loading,
         ui_forge_pin_shared_memory,
         ui_forge_inference_memory,
+        ui_forge_t5_padding,
         ui_txt2img_width,
         ui_img2img_width,
         ui_txt2img_height,
@@ -351,6 +364,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
             gr.update(visible=False, value=total_vram - 1024),                          # ui_forge_inference_memory
+            gr.update(visible=False, value=dynamic_args['t5_min_length']),              # ui_forge_t5_padding
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_width", 512)),                 # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_i2i_width", 512)),                 # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_height", 640)),                # ui_txt2img_height
@@ -380,6 +394,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
+            gr.update(visible=False, value=dynamic_args['t5_min_length']),              # ui_forge_t5_padding
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_width", 896)),                 # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_i2i_width", 1024)),                # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_height", 1152)),               # ui_txt2img_height
@@ -409,6 +424,7 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value='Queue'),                                     # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),                                       # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
+            gr.update(visible=False, value=dynamic_args['t5_min_length']),              # ui_forge_t5_padding
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_width", 896)),               # ui_txt2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_i2i_width", 1024)),              # ui_img2img_width
             gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_height", 1152)),             # ui_txt2img_height
@@ -435,6 +451,7 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
             gr.update(visible=True, value=total_vram - 1024),  # ui_forge_inference_memory
+            gr.update(visible=True, value=dynamic_args['t5_min_length']),  # ui_forge_t5_padding
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_width", 1024)),  # ui_txt2img_width
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_width", 1024)),  # ui_img2img_width
             gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_height", 1024)),  # ui_txt2img_height
@@ -461,6 +478,7 @@ def on_preset_change(preset=None):
         gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
         gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
         gr.update(visible=True, value=total_vram - 1024),  # ui_forge_inference_memory
+        gr.update(visible=True, value=dynamic_args['t5_min_length']),  # ui_forge_t5_padding
         gr.update(maximum=2048, value=ui_settings_from_file['txt2img/Width/value']),  # ui_txt2img_width
         gr.update(maximum=2048, value=ui_settings_from_file['img2img/Width/value']),  # ui_img2img_width
         gr.update(maximum=2048, value=ui_settings_from_file['txt2img/Height/value']),  # ui_txt2img_height

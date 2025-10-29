@@ -78,6 +78,15 @@ options_templates.update(options_section(('saving-images', "Saving images/grids"
     "notification_volume": OptionInfo(100, "Notification sound volume", gr.Slider, {"minimum": 0, "maximum": 100, "step": 1}).info("in %"),
 }))
 
+
+options_templates.update(options_section(('forge_all', "Forge (All)", "sd"), {
+    "forge_t5_padding_tokens": OptionInfo(256, "T5 padding length", gr.Slider, {
+        "minimum": 1,
+        "maximum": 1024,
+        "step": 1
+    }).info("Controls padding applied to T5 prompts for supported models."),
+}))
+
 options_templates.update(options_section(('saving-paths', "Paths for saving", "saving"), {
     "outdir_samples": OptionInfo("", "Output directory for images; if empty, defaults to three directories below", component_args=hide_dirs),
     "outdir_txt2img_samples": OptionInfo(util.truncate_path(os.path.join(default_output_dir, 'txt2img-images')), 'Output directory for txt2img images', component_args=hide_dirs),

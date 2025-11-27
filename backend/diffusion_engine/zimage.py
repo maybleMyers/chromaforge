@@ -33,40 +33,90 @@ class ZImage(ForgeDiffusionEngine):
 
         vae = VAE(model=components_dict['vae'])
 
+        # Ensure VAE latent channels match Transformer input channels
+        # This is necessary because the VAE config might be inferred incorrectly (e.g. 8 channels)
+        # while the Transformer expects 16 channels.
+        transformer_config = components_dict['transformer'].config
+        transformer_channels = None
+        
+        if isinstance(transformer_config, dict):
+            transformer_channels = transformer_config.get('in_channels')
+        elif hasattr(transformer_config, 'in_channels'):
+            transformer_channels = transformer_config.in_channels
+            
+        if transformer_channels is not None:
+            if vae.latent_channels != transformer_channels:
+                print(f"Correction: VAE latent_channels ({vae.latent_channels}) != Transformer in_channels ({transformer_channels}). Updating VAE to match Transformer.")
+                vae.latent_channels = transformer_channels
+                if hasattr(vae.first_stage_model.config, 'latent_channels'):
+                    vae.first_stage_model.config.latent_channels = transformer_channels
+
+        # Set Z-Image specific VAE scaling factors
+        # Default is 0.18215 / 0.0, but Z-Image needs 0.3611 / 0.1159
+        vae.first_stage_model.scaling_factor = 0.3611
+        vae.first_stage_model.shift_factor = 0.1159
+        if hasattr(vae.first_stage_model.config, 'scaling_factor'):
+            vae.first_stage_model.config.scaling_factor = 0.3611
+        if hasattr(vae.first_stage_model.config, 'shift_factor'):
+            vae.first_stage_model.config.shift_factor = 0.1159
+
         # Wrap the transformer to adapt parameter names
         class ZImageTransformerWrapper(torch.nn.Module):
             def __init__(self, transformer):
                 super().__init__()
                 self.transformer = transformer
 
-            def forward(self, x, timestep, context=None, **kwargs):
-                # Z-Image list format is for multi-resolution, not batching
-                # Keep batch dimension intact, just wrap in single-item list
+            def forward(self, x, timestep, context=None, transformer_options=None, **kwargs):
+                # Convert input to list format matching official diffusers implementation
+                # Official: latent [B,C,H,W] -> unsqueeze(2) -> [B,C,1,H,W] -> unbind(0) -> List of [C,1,H,W]
                 import torch
 
                 if not isinstance(x, list):
-                    x = [x]  # Wrap batched tensor in list for multi-res format
+                    # Input should be [batch, channels, height, width] (4D)
+                    # Need to add frame dimension and split into list
+                    if len(x.shape) == 4:  # [B, C, H, W]
+                        x = x.unsqueeze(2)  # [B, C, 1, H, W] - add frame dimension
+                        x = list(x.unbind(dim=0))  # List of [C, 1, H, W]
+                    else:
+                        raise ValueError(f"Unexpected input shape: {x.shape}. Expected 4D tensor [B, C, H, W]")
 
-                if context is not None:
-                    # Split context into list of 2D tensors per batch item
-                    if not isinstance(context, list):
-                        if len(context.shape) == 3:  # [batch, seq, features]
-                            context = [context[i] for i in range(context.shape[0])]
+                # Convert context to list format, filtering by attention mask if available
+                if context is not None and not isinstance(context, list):
+                    # Check if attention_mask is available in transformer_options
+                    attention_mask = None
+                    if transformer_options is not None and 'attention_mask' in transformer_options:
+                        attention_mask = transformer_options['attention_mask']
+
+                    if len(context.shape) == 3:  # [batch, seq_len, features]
+                        if attention_mask is not None:
+                            # Filter by attention mask to create variable-length embeddings (like official)
+                            context_list = []
+                            for i in range(context.shape[0]):
+                                # Only keep non-padded tokens
+                                context_list.append(context[i][attention_mask[i]])
+                            context = context_list
                         else:
-                            context = [context]
+                            # No attention mask, just split batch
+                            context = [context[i] for i in range(context.shape[0])]
+                    elif len(context.shape) == 2:  # [seq_len, features] - single item
+                        context = [context]
+                    else:
+                        raise ValueError(f"Unexpected context shape: {context.shape}")
 
-                # Debug: Check available embedders
-                print(f"DEBUG: all_x_embedder keys: {list(self.transformer.all_x_embedder.keys())}")
-                print(f"DEBUG: config type: {type(self.transformer.config)}")
-                if hasattr(self.transformer.config, 'all_patch_size'):
-                    print(f"DEBUG: all_patch_size: {self.transformer.config.all_patch_size}")
-                    print(f"DEBUG: in_channels: {self.transformer.config.in_channels}")
-                elif isinstance(self.transformer.config, dict):
-                    print(f"DEBUG: all_patch_size: {self.transformer.config.get('all_patch_size')}")
-                    print(f"DEBUG: in_channels: {self.transformer.config.get('in_channels')}")
+                # Call transformer with correct format
+                # patch_size=2 and f_patch_size=1 are the only supported values per config
+                # Transformer returns (list_of_tensors, {}), extract the list
+                result = self.transformer(x=x, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
+                output_list = result[0] if isinstance(result, tuple) else result
 
-                # Explicitly pass patch_size to ensure correct patchification
-                return self.transformer(x=x, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
+                # Convert list of [C, F, H, W] tensors back to batched [B, C, F, H, W] tensor
+                # Then squeeze frame dimension to get [B, C, H, W]
+                if isinstance(output_list, list):
+                    output = torch.stack(output_list, dim=0)  # [B, C, F, H, W]
+                    output = output.squeeze(2)  # [B, C, H, W] - remove frame dimension
+                    return -output
+                else:
+                    return -output_list
 
             def __getattr__(self, name):
                 # Pass through all other attributes to the underlying transformer
@@ -106,11 +156,55 @@ class ZImage(ForgeDiffusionEngine):
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
-        # Get embeddings with attention mask
-        embeddings, attention_mask = self.text_processing_engine_qwen(prompt, return_attention_mask=True)
-        # Store attention mask in a dict along with embeddings
-        # Use 'crossattn' key to match the conditioning system's expectations
-        return {'crossattn': embeddings, 'attention_mask': attention_mask}
+
+        # Process prompts through Qwen text encoder
+        # Format prompts with chat template like official implementation
+        tokenizer = self.text_processing_engine_qwen.tokenizer
+        text_encoder = self.text_processing_engine_qwen.text_encoder
+
+        formatted_prompts = []
+        for prompt_item in prompt:
+            messages = [{"role": "user", "content": prompt_item}]
+            formatted_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            formatted_prompts.append(formatted_prompt)
+
+        # Tokenize
+        text_inputs = tokenizer(
+            formatted_prompts,
+            padding="max_length",
+            max_length=512,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Move to device
+        device = text_encoder.device
+        text_input_ids = text_inputs.input_ids.to(device)
+        prompt_masks = text_inputs.attention_mask.to(device).bool()
+
+        # Encode (use hidden_states[-2] like official implementation)
+        outputs = text_encoder(
+            input_ids=text_input_ids,
+            attention_mask=prompt_masks,
+            output_hidden_states=True,
+        )
+        prompt_embeds = outputs.hidden_states[-2]
+
+        # Filter by attention mask to get variable-length embeddings (official approach)
+        # This removes padding tokens, creating a list of 2D tensors with different lengths
+        embeddings_list = []
+        for i in range(len(prompt_embeds)):
+            embeddings_list.append(prompt_embeds[i][prompt_masks[i]])
+
+        # However, for Forge backend compatibility, we need to return a batched tensor
+        # So we'll return the full padded embeddings with attention mask
+        # The wrapper will handle splitting into list format
+        return {'crossattn': prompt_embeds, 'attention_mask': prompt_masks}
 
     @torch.inference_mode()
     def get_prompt_lengths_on_ui(self, prompt):

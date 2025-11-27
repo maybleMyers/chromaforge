@@ -121,6 +121,26 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
+
+    # DEBUG: Print sigma schedule info
+    print(f"\n=== Euler Sampler Debug ===")
+    print(f"Number of steps: {len(sigmas) - 1}")
+    print(f"ALL Sigmas: {sigmas.tolist()}")
+    print(f"Sigmas range: [{sigmas.min().item():.6f}, {sigmas.max().item():.6f}]")
+    print(f"Initial x shape: {x.shape}, dtype: {x.dtype}")
+
+    # For comparison with official Z-Image pipeline (9 steps, shift=3.0):
+    # Official creates linear spacing BEFORE shift, then applies shift
+    # Official sigmas for 9 steps with shift=3.0:
+    # pre_shift = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0]
+    # shifted = 3.0 * pre_shift / (1 + 2.0 * pre_shift)
+    # shifted = [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6428, 0.5, 0.3, 0.0] + terminal 0
+    import numpy as np
+    pre_shift = np.linspace(1.0, 0.0, len(sigmas))  # Same number of points
+    official_sigmas = 3.0 * pre_shift / (1 + 2.0 * pre_shift)
+    print(f"Official would use: {official_sigmas.tolist()}")
+    print(f"===========================\n")
+
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
         eps = torch.randn_like(x) * s_noise
@@ -134,6 +154,13 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
         dt = sigmas[i + 1] - sigma_hat
         # Euler method
         x = x + d * dt
+
+    # DEBUG: Check final latents
+    print(f"\n=== Euler Final Output ===")
+    print(f"Final x stats: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
+    print(f"Final x has NaN: {torch.isnan(x).any().item()}, has Inf: {torch.isinf(x).any().item()}")
+    print(f"===========================\n")
+
     return x
 
 

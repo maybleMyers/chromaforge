@@ -24,6 +24,23 @@ class KModel(torch.nn.Module):
 
     def apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
         sigma = t
+
+        # DEBUG: Print sigma info on first call
+        if not hasattr(self, '_debug_sigma_printed'):
+            self._debug_sigma_printed = True
+            print(f"\n=== KModel Debug (first call) ===")
+            print(f"Sigma (t) value: {sigma}")
+            print(f"Predictor type: {type(self.predictor).__name__}")
+            print(f"Predictor sigmas range: [{self.predictor.sigma_min:.6f}, {self.predictor.sigma_max:.6f}]")
+            print(f"\n=== KModel c_crossattn Debug ===")
+            print(f"c_crossattn type: {type(c_crossattn)}")
+            if isinstance(c_crossattn, dict):
+                print(f"c_crossattn keys: {c_crossattn.keys()}")
+                if 'attention_mask' in c_crossattn:
+                    print(f"attention_mask shape: {c_crossattn['attention_mask'].shape}")
+            elif hasattr(c_crossattn, 'shape'):
+                print(f"c_crossattn shape: {c_crossattn.shape}")
+
         xc = self.predictor.calculate_input(sigma, x)
         if c_concat is not None:
             xc = torch.cat([xc] + [c_concat], dim=1)
@@ -58,7 +75,19 @@ class KModel(torch.nn.Module):
             extra_conds[o] = extra
 
         model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
-        return self.predictor.calculate_denoised(sigma, model_output, x)
+        denoised = self.predictor.calculate_denoised(sigma, model_output, x)
+
+        # DEBUG: Check denoised output on first call
+        if not hasattr(self, '_debug_denoised_printed'):
+            self._debug_denoised_printed = True
+            print(f"\n=== KModel Denoised Debug ===")
+            print(f"model_output stats: min={model_output.min().item():.4f}, max={model_output.max().item():.4f}")
+            print(f"model_output has NaN: {torch.isnan(model_output).any().item()}")
+            print(f"denoised stats: min={denoised.min().item():.4f}, max={denoised.max().item():.4f}")
+            print(f"denoised has NaN: {torch.isnan(denoised).any().item()}")
+            print(f"==============================\n")
+
+        return denoised
 
     def memory_required(self, input_shape):
         area = input_shape[0] * input_shape[2] * input_shape[3]

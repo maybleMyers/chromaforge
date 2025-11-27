@@ -362,7 +362,7 @@ def requirements_met(requirements_file):
 
 def prepare_environment():
     torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu128")
-    torch_command = os.environ.get('TORCH_COMMAND', f"pip install torch==2.7.1+cu128 torchvision --index-url https://download.pytorch.org/whl/cu128")
+    torch_command = os.environ.get('TORCH_COMMAND', f"pip install torch==2.8.0+cu128 torchvision --index-url https://download.pytorch.org/whl/cu128")
     if args.use_ipex:
         if platform.system() == "Windows":
             # The "Nuullll/intel-extension-for-pytorch" wheels were built from IPEX source for Intel Arc GPU: https://github.com/intel/intel-extension-for-pytorch/tree/xpu-main

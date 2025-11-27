@@ -43,6 +43,25 @@ class ConditionNoiseShape(Condition):
 
 
 class ConditionCrossAttn(Condition):
+    def __init__(self, cond, attention_mask=None):
+        # cond can be a tensor or a dict with 'crossattn' and optionally 'attention_mask'
+        if isinstance(cond, dict):
+            self.cond = cond['crossattn']
+            self.attention_mask = cond.get('attention_mask', None)
+        else:
+            self.cond = cond
+            self.attention_mask = attention_mask
+
+    def _copy_with(self, cond, attention_mask=None):
+        return self.__class__(cond, attention_mask)
+
+    def process_cond(self, batch_size, device, **kwargs):
+        processed_cond = repeat_to_batch_size(self.cond, batch_size).to(device)
+        processed_mask = None
+        if self.attention_mask is not None:
+            processed_mask = repeat_to_batch_size(self.attention_mask, batch_size).to(device)
+        return self._copy_with(processed_cond, processed_mask)
+
     def can_concat(self, other):
         s1 = self.cond.shape
         s2 = other.cond.shape
@@ -58,17 +77,36 @@ class ConditionCrossAttn(Condition):
 
     def concat(self, others):
         conds = [self.cond]
+        masks = [self.attention_mask]
         crossattn_max_len = self.cond.shape[1]
         for x in others:
             c = x.cond
             crossattn_max_len = lcm(crossattn_max_len, c.shape[1])
             conds.append(c)
+            masks.append(x.attention_mask)
 
         out = []
-        for c in conds:
+        out_masks = []
+        has_mask = any(m is not None for m in masks)
+
+        for i, c in enumerate(conds):
             if c.shape[1] < crossattn_max_len:
                 c = c.repeat(1, crossattn_max_len // c.shape[1], 1)
             out.append(c)
+
+            # Handle masks if any are present
+            if has_mask:
+                m = masks[i]
+                if m is not None:
+                    if m.shape[1] < crossattn_max_len:
+                        m = m.repeat(1, crossattn_max_len // m.shape[1])
+                    out_masks.append(m)
+
+        # Return dict with attention_mask if all conds had masks
+        if has_mask and len(out_masks) == len(conds):
+            concat_mask = torch.cat(out_masks)
+            return {'crossattn': torch.cat(out), 'attention_mask': concat_mask}
+
         return torch.cat(out)
 
 
@@ -102,13 +140,23 @@ def compile_conditions(cond):
         return [result, ]
 
     cross_attn = cond['crossattn']
+    attention_mask = cond.get('attention_mask', None)
 
-    result = dict(
-        cross_attn=cross_attn,
-        model_conds=dict(
-            c_crossattn=ConditionCrossAttn(cross_attn)
+    # Pass the full cond dict if it has attention_mask, so ConditionCrossAttn can preserve it
+    if attention_mask is not None:
+        result = dict(
+            cross_attn=cross_attn,
+            model_conds=dict(
+                c_crossattn=ConditionCrossAttn(cond)  # Pass full dict with attention_mask
+            )
         )
-    )
+    else:
+        result = dict(
+            cross_attn=cross_attn,
+            model_conds=dict(
+                c_crossattn=ConditionCrossAttn(cross_attn)
+            )
+        )
 
     if 'vector' in cond:
         result['pooled_output'] = cond['vector']

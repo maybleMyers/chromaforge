@@ -282,6 +282,42 @@ class PredictionDiscreteFlow(AbstractPrediction):
         return 1.0 - percent
 
 
+class PredictionZImage(AbstractPrediction):
+    """Prediction class for Z-Image models using static shift formula."""
+    def __init__(self, shift=3.0, timesteps=1000):
+        super().__init__(sigma_data=1.0, prediction_type='const')
+        self.shift = shift
+        # Generate sigmas using static shift formula: shift * t / (1 + (shift-1) * t)
+        t = torch.arange(1, timesteps + 1, 1) / timesteps  # [0.001, 0.002, ..., 1.0]
+        if shift == 1.0:
+            sigmas = t
+        else:
+            sigmas = shift * t / (1 + (shift - 1) * t)
+        self.register_buffer('sigmas', sigmas)
+
+    @property
+    def sigma_min(self):
+        return self.sigmas[0]
+
+    @property
+    def sigma_max(self):
+        return self.sigmas[-1]
+
+    def timestep(self, sigma):
+        # Return sigma unchanged - the wrapper handles the transformation
+        return sigma
+
+    def sigma(self, timestep):
+        return timestep
+
+    def percent_to_sigma(self, percent):
+        if percent <= 0.0:
+            return 1.0
+        if percent >= 1.0:
+            return 0.0
+        return 1.0 - percent
+
+
 class PredictionFlux(AbstractPrediction):
     def __init__(self, seq_len=4096, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15, pseudo_timestep_range=10000, mu=None):
         super().__init__(sigma_data=1.0, prediction_type='const')
@@ -297,7 +333,9 @@ class PredictionFlux(AbstractPrediction):
         else:
             self.mu = mu
         sigmas = torch.arange(1, self.pseudo_timestep_range + 1, 1) / self.pseudo_timestep_range
-        sigmas = FlowMatchEulerDiscreteScheduler.time_shift(None, self.mu, 1.0, sigmas)
+        # Create a temporary scheduler instance for time_shift
+        temp_scheduler = FlowMatchEulerDiscreteScheduler()
+        sigmas = temp_scheduler.time_shift(self.mu, 1.0, sigmas)
         self.register_buffer('sigmas', sigmas)
 
     @property

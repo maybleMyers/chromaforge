@@ -23,6 +23,11 @@ ui_forge_async_loading: gr.Radio = None
 ui_forge_pin_shared_memory: gr.Radio = None
 ui_forge_inference_memory: gr.Slider = None
 
+# Z-Image specific precision options
+ui_z_transformer_dtype: gr.Dropdown = None
+ui_z_vae_dtype: gr.Dropdown = None
+ui_z_text_encoder_dtype: gr.Dropdown = None
+
 
 
 forge_unet_storage_dtype_options = {
@@ -37,6 +42,9 @@ forge_unet_storage_dtype_options = {
     'float8-e5m2': (torch.float8_e5m2, False),
     'float8-e5m2 (fp16 LoRA)': (torch.float8_e5m2, True),
 }
+
+# Z-Image precision options
+z_precision_options = ['Automatic', 'bfloat16', 'float16', 'float32']
 
 module_list = {}
 
@@ -55,7 +63,7 @@ def bind_to_opts(comp, k, save=False, callback=None):
 
 
 def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -63,7 +71,7 @@ def make_checkpoint_manager_ui():
         if len(sd_models.checkpoints_list) > 0:
             shared.opts.set('sd_model_checkpoint', next(iter(sd_models.checkpoints_list.values())).name)
 
-    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'all'], elem_id="forge_ui_preset")
+    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'z', 'all'], elem_id="forge_ui_preset")
 
     ckpt_list, vae_list = refresh_models()
 
@@ -121,6 +129,16 @@ def make_checkpoint_manager_ui():
 
     ui_clip_skip = gr.Slider(label="Clip skip", value=lambda: shared.opts.CLIP_stop_at_last_layers, **{"minimum": 1, "maximum": 12, "step": 1})
     bind_to_opts(ui_clip_skip, 'CLIP_stop_at_last_layers', save=True)
+
+    # Z-Image precision options
+    ui_z_transformer_dtype = gr.Dropdown(label="Z-Image Transformer Precision", value=lambda: shared.opts.z_transformer_dtype, choices=z_precision_options)
+    bind_to_opts(ui_z_transformer_dtype, 'z_transformer_dtype', save=True, callback=refresh_model_loading_parameters)
+
+    ui_z_vae_dtype = gr.Dropdown(label="Z-Image VAE Precision", value=lambda: shared.opts.z_vae_dtype, choices=z_precision_options)
+    bind_to_opts(ui_z_vae_dtype, 'z_vae_dtype', save=True, callback=refresh_model_loading_parameters)
+
+    ui_z_text_encoder_dtype = gr.Dropdown(label="Z-Image Text Encoder Precision", value=lambda: shared.opts.z_text_encoder_dtype, choices=z_precision_options)
+    bind_to_opts(ui_z_text_encoder_dtype, 'z_text_encoder_dtype', save=True, callback=refresh_model_loading_parameters)
 
     ui_checkpoint.change(checkpoint_change, inputs=[ui_checkpoint], show_progress=False)
     ui_vae.change(modules_change, inputs=[ui_vae], queue=False, show_progress=False)
@@ -294,6 +312,7 @@ def forge_main_entry():
     ui_txt2img_distilled_cfg = get_a1111_ui_component('txt2img', 'Distilled CFG Scale')
     ui_txt2img_sampler = get_a1111_ui_component('txt2img', 'sampler_name')
     ui_txt2img_scheduler = get_a1111_ui_component('txt2img', 'scheduler')
+    ui_txt2img_steps = get_a1111_ui_component('txt2img', 'steps')
 
     ui_img2img_width = get_a1111_ui_component('img2img', 'Size-1')
     ui_img2img_height = get_a1111_ui_component('img2img', 'Size-2')
@@ -301,6 +320,7 @@ def forge_main_entry():
     ui_img2img_distilled_cfg = get_a1111_ui_component('img2img', 'Distilled CFG Scale')
     ui_img2img_sampler = get_a1111_ui_component('img2img', 'sampler_name')
     ui_img2img_scheduler = get_a1111_ui_component('img2img', 'scheduler')
+    ui_img2img_steps = get_a1111_ui_component('img2img', 'steps')
 
     ui_txt2img_hr_cfg = get_a1111_ui_component('txt2img', 'Hires CFG Scale')
     ui_txt2img_hr_distilled_cfg = get_a1111_ui_component('txt2img', 'Hires Distilled CFG Scale')
@@ -326,6 +346,11 @@ def forge_main_entry():
         ui_img2img_scheduler,
         ui_txt2img_hr_cfg,
         ui_txt2img_hr_distilled_cfg,
+        ui_txt2img_steps,
+        ui_img2img_steps,
+        ui_z_transformer_dtype,
+        ui_z_vae_dtype,
+        ui_z_text_encoder_dtype,
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
@@ -365,6 +390,11 @@ def on_preset_change(preset=None):
             gr.update(value=getattr(shared.opts, "sd_i2i_scheduler", 'Automatic')),     # ui_img2img_scheduler
             gr.update(visible=True, value=getattr(shared.opts, "sd_t2i_hr_cfg", 7.0)),  # ui_txt2img_hr_cfg
             gr.update(visible=False, value=3.5),                                        # ui_txt2img_hr_distilled_cfg
+            gr.update(value=20),                                                        # ui_txt2img_steps
+            gr.update(value=20),                                                        # ui_img2img_steps
+            gr.update(visible=False),                                                   # ui_z_transformer_dtype
+            gr.update(visible=False),                                                   # ui_z_vae_dtype
+            gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
         ]
 
     if shared.opts.forge_preset == 'xl':
@@ -394,6 +424,11 @@ def on_preset_change(preset=None):
             gr.update(value=getattr(shared.opts, "xl_i2i_scheduler", 'Automatic')),     # ui_img2img_scheduler
             gr.update(visible=True, value=getattr(shared.opts, "xl_t2i_hr_cfg", 5.0)),  # ui_txt2img_hr_cfg
             gr.update(visible=False, value=3.5),                                        # ui_txt2img_hr_distilled_cfg
+            gr.update(value=20),                                                        # ui_txt2img_steps
+            gr.update(value=20),                                                        # ui_img2img_steps
+            gr.update(visible=False),                                                   # ui_z_transformer_dtype
+            gr.update(visible=False),                                                   # ui_z_vae_dtype
+            gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
         ]
 
     if shared.opts.forge_preset == 'flux':
@@ -423,6 +458,11 @@ def on_preset_change(preset=None):
             gr.update(value=getattr(shared.opts, "flux_i2i_scheduler", 'Simple')),      # ui_img2img_scheduler
             gr.update(visible=True, value=getattr(shared.opts, "flux_t2i_hr_cfg", 1.0)),    # ui_txt2img_hr_cfg
             gr.update(visible=True, value=getattr(shared.opts, "flux_t2i_hr_d_cfg", 3.5)),  # ui_txt2img_hr_distilled_cfg
+            gr.update(value=20),                                                        # ui_txt2img_steps
+            gr.update(value=20),                                                        # ui_img2img_steps
+            gr.update(visible=False),                                                   # ui_z_transformer_dtype
+            gr.update(visible=False),                                                   # ui_z_vae_dtype
+            gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
         ]
 
     if shared.opts.forge_preset == 'chroma':
@@ -449,6 +489,45 @@ def on_preset_change(preset=None):
             gr.update(value=getattr(shared.opts, "chroma_i2i_scheduler", 'Simple')),  # ui_img2img_scheduler
             gr.update(visible=True, value=getattr(shared.opts, "chroma_t2i_hr_cfg", 1.0)), # ui_txt2img_hr_cfg
             gr.update(visible=True, value=getattr(shared.opts, "chroma_t2i_hr_d_cfg", 3.5)), # ui_txt2img_hr_distilled_cfg
+            gr.update(value=20),                                                        # ui_txt2img_steps
+            gr.update(value=20),                                                        # ui_img2img_steps
+            gr.update(visible=False),                                                   # ui_z_transformer_dtype
+            gr.update(visible=False),                                                   # ui_z_vae_dtype
+            gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
+        ]
+
+    if shared.opts.forge_preset == 'z':
+        ckpt_list, _ = refresh_models()
+        ui_checkpoint.choices = ckpt_list
+        model_mem = getattr(shared.opts, "z_GPU_MB", total_vram - 1024)
+        if model_mem < 0 or model_mem > total_vram:
+            model_mem = total_vram - 1024
+        return [
+            gr.update(visible=True),  # ui_vae
+            gr.update(visible=False, value=1),  # ui_clip_skip
+            gr.update(visible=True, value='Automatic'),  # ui_forge_unet_storage_dtype_options
+            gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
+            gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
+            gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
+            gr.update(maximum=3072, value=getattr(shared.opts, "z_t2i_width", 1024)),  # ui_txt2img_width
+            gr.update(maximum=3072, value=getattr(shared.opts, "z_i2i_width", 1024)),  # ui_img2img_width
+            gr.update(maximum=3072, value=getattr(shared.opts, "z_t2i_height", 1024)),  # ui_txt2img_height
+            gr.update(maximum=3072, value=getattr(shared.opts, "z_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(value=getattr(shared.opts, "z_t2i_cfg", 1)),  # ui_txt2img_cfg
+            gr.update(value=getattr(shared.opts, "z_i2i_cfg", 1)),  # ui_img2img_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_distilled_cfg
+            gr.update(visible=False, value=0),  # ui_img2img_distilled_cfg
+            gr.update(value=getattr(shared.opts, "z_t2i_sampler", 'Euler')),  # ui_txt2img_sampler
+            gr.update(value=getattr(shared.opts, "z_i2i_sampler", 'Euler')),  # ui_img2img_sampler
+            gr.update(value=getattr(shared.opts, "z_t2i_scheduler", 'Simple')),  # ui_txt2img_scheduler
+            gr.update(value=getattr(shared.opts, "z_i2i_scheduler", 'Simple')),  # ui_img2img_scheduler
+            gr.update(visible=True, value=getattr(shared.opts, "z_t2i_hr_cfg", 1)),  # ui_txt2img_hr_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_hr_distilled_cfg
+            gr.update(value=getattr(shared.opts, "z_t2i_steps", 9)),                    # ui_txt2img_steps
+            gr.update(value=getattr(shared.opts, "z_i2i_steps", 9)),                    # ui_img2img_steps
+            gr.update(visible=True, value=getattr(shared.opts, "z_transformer_dtype", 'Automatic')),  # ui_z_transformer_dtype
+            gr.update(visible=True, value=getattr(shared.opts, "z_vae_dtype", 'Automatic')),          # ui_z_vae_dtype
+            gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
         ]
 
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
@@ -475,6 +554,11 @@ def on_preset_change(preset=None):
         gr.update(value=ui_settings_from_file['customscript/sampler.py/img2img/Schedule type/value']),  # ui_img2img_scheduler
         gr.update(visible=True, value=ui_settings_from_file['txt2img/Hires CFG Scale/value']), # ui_txt2img_hr_cfg
         gr.update(visible=True, value=ui_settings_from_file['txt2img/Hires Distilled CFG Scale/value']), # ui_txt2img_hr_distilled_cfg
+        gr.update(value=ui_settings_from_file.get('customscript/sampler.py/txt2img/Sampling steps/value', 20)),  # ui_txt2img_steps
+        gr.update(value=ui_settings_from_file.get('customscript/sampler.py/img2img/Sampling steps/value', 20)),  # ui_img2img_steps
+        gr.update(visible=True, value=getattr(shared.opts, "z_transformer_dtype", 'Automatic')),  # ui_z_transformer_dtype
+        gr.update(visible=True, value=getattr(shared.opts, "z_vae_dtype", 'Automatic')),          # ui_z_vae_dtype
+        gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
     ]
 
 shared.options_templates.update(shared.options_section(('ui_sd', "UI defaults 'sd'", "ui"), {
@@ -525,4 +609,23 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
     "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+}))
+shared.options_templates.update(shared.options_section(('ui_z', "UI defaults 'z' (Z-Image)", "ui"), {
+    "z_t2i_width":    shared.OptionInfo(1024,  "txt2img width",      gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "z_t2i_height":   shared.OptionInfo(1024, "txt2img height",     gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "z_t2i_steps":    shared.OptionInfo(9, "txt2img steps",         gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
+    "z_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
+    "z_t2i_scheduler": shared.OptionInfo('Simple', "txt2img scheduler"),
+    "z_t2i_cfg":      shared.OptionInfo(1,    "txt2img CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_t2i_hr_cfg":   shared.OptionInfo(1,    "txt2img HiRes CFG",  gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_i2i_width":    shared.OptionInfo(1024, "img2img width",      gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "z_i2i_height":   shared.OptionInfo(1024, "img2img height",     gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "z_i2i_steps":    shared.OptionInfo(9, "img2img steps",         gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
+    "z_i2i_sampler":  shared.OptionInfo('Euler', "img2img sampler"),
+    "z_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
+    "z_i2i_cfg":      shared.OptionInfo(1,    "img2img CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)", gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "z_transformer_dtype": shared.OptionInfo('Automatic', "Transformer Precision", gr.Dropdown, {"choices": z_precision_options}),
+    "z_vae_dtype":         shared.OptionInfo('Automatic', "VAE Precision",         gr.Dropdown, {"choices": z_precision_options}),
+    "z_text_encoder_dtype": shared.OptionInfo('Automatic', "Text Encoder Precision", gr.Dropdown, {"choices": z_precision_options}),
 }))

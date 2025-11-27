@@ -24,9 +24,10 @@ from backend.diffusion_engine.sd35 import StableDiffusion3
 from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.chroma import Chroma
 from backend.diffusion_engine.chroma_dct import ChromaDCT
+from backend.diffusion_engine.zimage import ZImage
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, Flux]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, ZImage, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -53,7 +54,25 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             config = IntegratedAutoencoderKL.load_config(config_path)
 
-            with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype()):
+            # Check for Z-Image specific VAE precision
+            vae_dtype = memory_management.vae_dtype()
+            if getattr(guess, 'is_zimage', False):
+                try:
+                    from modules import shared
+                    z_vae_dtype = getattr(shared.opts, 'z_vae_dtype', 'Automatic')
+                    if z_vae_dtype != 'Automatic':
+                        dtype_map = {
+                            'bfloat16': torch.bfloat16,
+                            'float16': torch.float16,
+                            'float32': torch.float32,
+                        }
+                        if z_vae_dtype in dtype_map:
+                            vae_dtype = dtype_map[z_vae_dtype]
+                            print(f'Z-Image VAE: Using user-specified dtype: {vae_dtype}')
+                except Exception as e:
+                    print(f'Warning: Could not read Z-Image VAE precision setting: {e}')
+
+            with using_forge_operations(device=memory_management.cpu, dtype=vae_dtype):
                 model = IntegratedAutoencoderKL.from_config(config)
 
             if 'decoder.up_blocks.0.resnets.0.norm1.weight' in state_dict.keys(): #diffusers format
@@ -110,7 +129,40 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=['transformer.encoder.embed_tokens.weight', 'logit_scale'])
 
             return model
-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel']:
+        if cls_name == 'Qwen3Model':
+            assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have Qwen3 text encoder state dict!'
+
+            text_encoder_dtype = memory_management.text_encoder_dtype()
+
+            # Check for Z-Image specific text encoder precision
+            if getattr(guess, 'is_zimage', False):
+                try:
+                    from modules import shared
+                    z_text_encoder_dtype = getattr(shared.opts, 'z_text_encoder_dtype', 'Automatic')
+                    if z_text_encoder_dtype != 'Automatic':
+                        dtype_map = {
+                            'bfloat16': torch.bfloat16,
+                            'float16': torch.float16,
+                            'float32': torch.float32,
+                        }
+                        if z_text_encoder_dtype in dtype_map:
+                            text_encoder_dtype = dtype_map[z_text_encoder_dtype]
+                            print(f'Z-Image Text Encoder: Using user-specified dtype: {text_encoder_dtype}')
+                except Exception as e:
+                    print(f'Warning: Could not read Z-Image text encoder precision setting: {e}')
+
+            from transformers import Qwen3Config
+            config = Qwen3Config.from_pretrained(config_path)
+            cls = getattr(importlib.import_module('transformers'), cls_name)
+            with modeling_utils.no_init_weights():
+                model = cls(config)
+            model = model.to(dtype=text_encoder_dtype)
+            # Strip 'model.' prefix from state_dict keys if present
+            if any(k.startswith('model.') for k in state_dict.keys()):
+                state_dict = {k.replace('model.', '', 1): v for k, v in state_dict.items()}
+            load_state_dict(model, state_dict, log_name=cls_name)
+            return model
+        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
 
             model_loader = None
@@ -125,6 +177,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             elif cls_name == 'ChromaDCTTransformer2DModel':
                 from backend.nn.model_dct import IntegratedChromaDCTTransformer2DModel
                 model_loader = lambda c: IntegratedChromaDCTTransformer2DModel(**c)
+            elif cls_name == 'ZImageTransformer2DModel':
+                # Load ZImageTransformer2DModel directly from diffusers
+                from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+                model_loader = lambda c: ZImageTransformer2DModel(**c)
             elif cls_name == 'SD3Transformer2DModel':
                 from backend.nn.mmditx import MMDiTX
                 model_loader = lambda c: MMDiTX(**c)
@@ -147,8 +203,42 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     if state_dict_dtype in ['gguf']:
                         beautiful_print_gguf_state_dict_statics(state_dict)
 
+            # Z-Image specific precision settings (highest priority)
+            if cls_name == 'ZImageTransformer2DModel':
+                try:
+                    from modules import shared
+                    z_transformer_dtype = getattr(shared.opts, 'z_transformer_dtype', 'Automatic')
+                    if z_transformer_dtype != 'Automatic':
+                        dtype_map = {
+                            'bfloat16': torch.bfloat16,
+                            'float16': torch.float16,
+                            'float32': torch.float32,
+                        }
+                        if z_transformer_dtype in dtype_map:
+                            storage_dtype = dtype_map[z_transformer_dtype]
+                            print(f'Z-Image Transformer: Using user-specified dtype: {storage_dtype}')
+                except Exception as e:
+                    print(f'Warning: Could not read Z-Image precision setting: {e}')
+
             load_device = memory_management.get_torch_device()
             computation_dtype = memory_management.get_computation_dtype(load_device, parameters=state_dict_parameters, supported_dtypes=guess.supported_inference_dtypes)
+
+            # For Z-Image, if user specified a precision, also use it for computation
+            if cls_name == 'ZImageTransformer2DModel':
+                try:
+                    from modules import shared
+                    z_transformer_dtype = getattr(shared.opts, 'z_transformer_dtype', 'Automatic')
+                    if z_transformer_dtype != 'Automatic':
+                        dtype_map = {
+                            'bfloat16': torch.bfloat16,
+                            'float16': torch.float16,
+                            'float32': torch.float32,
+                        }
+                        if z_transformer_dtype in dtype_map:
+                            computation_dtype = dtype_map[z_transformer_dtype]
+                except Exception:
+                    pass
+
             offload_device = memory_management.unet_offload_device()
 
             if storage_dtype in ['nf4', 'fp4', 'gguf']:
@@ -519,7 +609,85 @@ if not chroma_is_in_huggingface_guess:
         }
         unet_remove_config = ['guidance_embed']
 @torch.inference_mode()
-def forge_loader(sd, additional_state_dicts=None):
+def forge_loader(sd, additional_state_dicts=None, preset=None):
+    # Handle Z-Image preset with manual loading
+    if preset == 'z':
+        print("DEBUG: Loading Z-Image model from preset")
+        # Load components manually from safetensors files
+        state_dicts = {}
+
+        # Load transformer (main checkpoint)
+        transformer_sd = load_torch_file(sd)
+        state_dicts['transformer'] = transformer_sd
+
+        # Load additional modules (VAE and text encoder)
+        if additional_state_dicts:
+            for module_path in additional_state_dicts:
+                module_sd = load_torch_file(module_path)
+                # Determine if it's VAE or text encoder based on keys
+                if 'decoder.conv_in.weight' in module_sd or 'decoder.up_blocks.0.resnets.0.conv1.weight' in module_sd:
+                    state_dicts['vae'] = module_sd
+                elif 'model.embed_tokens.weight' in module_sd or 'embed_tokens.weight' in module_sd:
+                    state_dicts['text_encoder'] = module_sd
+
+        # Create minimal config for Z-Image
+        local_path = os.path.join(dir_path, 'huggingface', 'Z-Image')
+        if os.path.exists(local_path):
+            config = DiffusionPipeline.load_config(local_path)
+        else:
+            # Fallback config if Z-Image folder doesn't exist
+            config = {
+                "_class_name": "ZImagePipeline",
+                "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+                "text_encoder": ["transformers", "Qwen3Model"],
+                "tokenizer": ["transformers", "Qwen2Tokenizer"],
+                "transformer": ["diffusers", "ZImageTransformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKL"]
+            }
+
+        # Create a minimal estimated_config for Z-Image
+        class ZImageConfig:
+            def __init__(self):
+                self.huggingface_repo = "Z-Image"
+                self.is_zimage = True  # Flag to identify Z-Image models
+                self.unet_config = {
+                    'in_channels': 16,
+                    'dim': 3840,
+                    'n_heads': 30,
+                    'n_kv_heads': 30,
+                    'n_layers': 30,
+                    'n_refiner_layers': 2,
+                    'axes_dims': [32, 48, 48],
+                    'axes_lens': [1536, 512, 512],
+                    'cap_feat_dim': 2560,
+                    'all_patch_size': [2],
+                    'all_f_patch_size': [1],
+                    'rope_theta': 256.0,
+                    't_scale': 1000.0,
+                    'norm_eps': 1e-05,
+                    'qk_norm': True
+                }
+                # Z-Image requires bfloat16 - the model has precision-sensitive layers
+                # (t_embedder, cap_embedder) that produce NaN with float16
+                self.supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
+
+            def inpaint_model(self):
+                return False
+
+        estimated_config = ZImageConfig()
+
+        huggingface_components = {}
+        for component_name, v in config.items():
+            if isinstance(v, list) and len(v) == 2:
+                lib_name, cls_name = v
+                component_sd = state_dicts.get(component_name, None)
+                component = load_huggingface_component(estimated_config, component_name, lib_name, cls_name, local_path, component_sd)
+                if component is not None:
+                    huggingface_components[component_name] = component
+
+        print("DEBUG: Loaded Z-Image components:", list(huggingface_components.keys()))
+        return ZImage(components_dict=huggingface_components, estimated_config=estimated_config)
+
     try:
         state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
     except:
@@ -649,6 +817,12 @@ def forge_loader(sd, additional_state_dicts=None):
     if estimated_config.huggingface_repo == "ChromaDCT":
         print("DEBUG: Loading ChromaDCT engine")
         return ChromaDCT(estimated_config=estimated_config, huggingface_components=huggingface_components)
+
+    # Load Z-Image when 'z' preset is selected
+    if preset == 'z':
+        print("DEBUG: Loading Z-Image engine (preset selected)")
+        return ZImage(components_dict=huggingface_components)
+
     for M in possible_models:
         if any(isinstance(estimated_config, x) for x in M.matched_guesses):
             return M(estimated_config=estimated_config, huggingface_components=huggingface_components)

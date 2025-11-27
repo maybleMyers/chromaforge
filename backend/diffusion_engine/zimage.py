@@ -128,6 +128,13 @@ class ZImage(ForgeDiffusionEngine):
                     print(f"Transformed timestep: {original_timestep} -> {timestep}")
                     print(f"(Official would use: (1000 - t)/1000 where t ≈ sigma*1000)")
 
+                # Ensure pad tokens are on the same device as input (fixes CPU/GPU mismatch when model is partially offloaded)
+                target_device = x[0].device
+                if hasattr(self.transformer, 'x_pad_token') and self.transformer.x_pad_token.device != target_device:
+                    self.transformer.x_pad_token.data = self.transformer.x_pad_token.data.to(target_device)
+                if hasattr(self.transformer, 'cap_pad_token') and self.transformer.cap_pad_token.device != target_device:
+                    self.transformer.cap_pad_token.data = self.transformer.cap_pad_token.data.to(target_device)
+
                 # Call transformer with correct format
                 # patch_size=2 and f_patch_size=1 are the only supported values per config
                 # Transformer returns (list_of_tensors, {}), extract the list

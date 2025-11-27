@@ -121,6 +121,15 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
+
+    # DEBUG: Print sigma schedule info
+    print(f"\n=== Euler Sampler Debug ===")
+    print(f"Number of steps: {len(sigmas) - 1}")
+    print(f"Sigmas: {sigmas[:5].tolist()}... (first 5)")
+    print(f"Sigmas range: [{sigmas.min().item():.6f}, {sigmas.max().item():.6f}]")
+    print(f"Initial x shape: {x.shape}, dtype: {x.dtype}")
+    print(f"===========================\n")
+
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
         eps = torch.randn_like(x) * s_noise

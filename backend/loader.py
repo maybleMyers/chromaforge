@@ -586,7 +586,9 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
                     'norm_eps': 1e-05,
                     'qk_norm': True
                 }
-                self.supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+                # Z-Image requires bfloat16 - the model has precision-sensitive layers
+                # (t_embedder, cap_embedder) that produce NaN with float16
+                self.supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
 
             def inpaint_model(self):
                 return False

@@ -6,7 +6,7 @@ from backend.patcher.vae import VAE
 from backend.patcher.unet import UnetPatcher
 from backend.text_processing.qwen_engine import QwenTextProcessingEngine
 from backend.args import dynamic_args
-from backend.modules.k_prediction import PredictionFlux
+from backend.modules.k_prediction import PredictionZImage
 from backend import memory_management
 
 class ZImage(ForgeDiffusionEngine):
@@ -71,6 +71,17 @@ class ZImage(ForgeDiffusionEngine):
                 # Official: latent [B,C,H,W] -> unsqueeze(2) -> [B,C,1,H,W] -> unbind(0) -> List of [C,1,H,W]
                 import torch
 
+                # DEBUG: Print info on first call only
+                if not hasattr(self, '_debug_printed'):
+                    self._debug_printed = True
+                    print(f"\n=== Z-Image Wrapper Debug (first call) ===")
+                    print(f"Input x shape: {x.shape}, dtype: {x.dtype}")
+                    print(f"Input x stats: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
+                    print(f"Input x has NaN: {torch.isnan(x).any().item()}")
+                    print(f"Timestep (raw sigma): {timestep}")
+                    if context is not None:
+                        print(f"Context shape: {context.shape}, dtype: {context.dtype}")
+
                 if not isinstance(x, list):
                     # Input should be [batch, channels, height, width] (4D)
                     # Need to add frame dimension and split into list
@@ -103,6 +114,20 @@ class ZImage(ForgeDiffusionEngine):
                     else:
                         raise ValueError(f"Unexpected context shape: {context.shape}")
 
+                # Invert timestep: Forge uses sigma in [1->0] (noisy->clean)
+                # but Z-Image expects t in [0->1] (noisy->clean)
+                # The transformer then multiplies by t_scale=1000 internally
+                original_timestep = timestep
+                timestep = 1.0 - timestep
+                # Clamp to avoid exactly 0.0 which can cause numerical issues
+                timestep = torch.clamp(timestep, min=1e-6, max=1.0)
+
+                # DEBUG: Print transformed timestep on first call
+                if hasattr(self, '_debug_printed') and not hasattr(self, '_debug_timestep_printed'):
+                    self._debug_timestep_printed = True
+                    print(f"Transformed timestep: {original_timestep} -> {timestep}")
+                    print(f"(Official would use: (1000 - t)/1000 where t ≈ sigma*1000)")
+
                 # Call transformer with correct format
                 # patch_size=2 and f_patch_size=1 are the only supported values per config
                 # Transformer returns (list_of_tensors, {}), extract the list
@@ -114,6 +139,17 @@ class ZImage(ForgeDiffusionEngine):
                 if isinstance(output_list, list):
                     output = torch.stack(output_list, dim=0)  # [B, C, F, H, W]
                     output = output.squeeze(2)  # [B, C, H, W] - remove frame dimension
+
+                    # DEBUG: Check transformer output
+                    if hasattr(self, '_debug_printed') and not hasattr(self, '_debug_output_printed'):
+                        self._debug_output_printed = True
+                        print(f"\n=== Transformer Output Debug ===")
+                        print(f"Output shape: {output.shape}, dtype: {output.dtype}")
+                        print(f"Output stats: min={output.min().item():.4f}, max={output.max().item():.4f}, mean={output.mean().item():.4f}")
+                        print(f"Output has NaN: {torch.isnan(output).any().item()}")
+                        print(f"Output has Inf: {torch.isinf(output).any().item()}")
+                        print(f"=================================\n")
+
                     return -output
                 else:
                     return -output_list
@@ -127,9 +163,11 @@ class ZImage(ForgeDiffusionEngine):
 
         wrapped_transformer = ZImageTransformerWrapper(components_dict['transformer'])
 
-        # Flow matching with mu=1.0 (same as Chroma)
-        k_predictor = PredictionFlux(
-            mu=1.0
+        # Z-Image uses static shift=3.0 (from scheduler config)
+        # This matches the formula: sigmas = shift * t / (1 + (shift-1) * t)
+        k_predictor = PredictionZImage(
+            shift=3.0,
+            timesteps=1000
         )
 
         unet = UnetPatcher.from_model(

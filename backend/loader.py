@@ -130,7 +130,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             return model
         if cls_name == 'Qwen3Model':
-            # Load Qwen model directly from transformers
+            assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have Qwen3 text encoder state dict!'
+
             text_encoder_dtype = memory_management.text_encoder_dtype()
 
             # Check for Z-Image specific text encoder precision
@@ -150,8 +151,16 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 except Exception as e:
                     print(f'Warning: Could not read Z-Image text encoder precision setting: {e}')
 
+            from transformers import Qwen3Config
+            config = Qwen3Config.from_pretrained(config_path)
             cls = getattr(importlib.import_module('transformers'), cls_name)
-            model = cls.from_pretrained(config_path, torch_dtype=text_encoder_dtype)
+            with modeling_utils.no_init_weights():
+                model = cls(config)
+            model = model.to(dtype=text_encoder_dtype)
+            # Strip 'model.' prefix from state_dict keys if present
+            if any(k.startswith('model.') for k in state_dict.keys()):
+                state_dict = {k.replace('model.', '', 1): v for k, v in state_dict.items()}
+            load_state_dict(model, state_dict, log_name=cls_name)
             return model
         if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'

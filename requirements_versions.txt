@@ -40,6 +40,6 @@ gradio_imageslider==0.0.20
 loadimg==0.1.2
 tqdm==4.66.1
 peft
-pydantic==2.8.2
+pydantic
 huggingface-hub
 joblib

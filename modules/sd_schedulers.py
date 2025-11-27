@@ -235,6 +235,32 @@ def sigmoid_offset_sigmas(n, sigma_min, sigma_max, inner_model, device):
     sigs.append(0.0)
     return torch.FloatTensor(sigs).to(device)
 
+
+def zimage_scheduler(n, sigma_min, sigma_max, inner_model, device):
+    """
+    Z-Image specific scheduler that uses the official FlowMatchEulerDiscreteScheduler
+    to generate sigmas that exactly match the official Z-Image pipeline.
+    """
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    # Create scheduler with Z-Image config (shift=3.0, no dynamic shifting)
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=1000,
+        shift=3.0,
+        use_dynamic_shifting=False,
+    )
+
+    # Generate timesteps/sigmas for n steps
+    scheduler.set_timesteps(n, device=device)
+
+    # Get the sigmas (already includes terminal 0)
+    sigmas = scheduler.sigmas
+
+    print(f"Z-Image scheduler ({n} steps) from FlowMatchEulerDiscreteScheduler:")
+    print(f"  Sigmas: {sigmas.tolist()}")
+
+    return sigmas.to(device)
+
 schedulers = [
     Scheduler('automatic', 'Automatic', None),
     Scheduler('uniform', 'Uniform', uniform, need_inner_model=True),
@@ -253,6 +279,7 @@ schedulers = [
     Scheduler('align_your_steps_11', 'Align Your Steps 11', ays_11_sigmas),
     Scheduler('align_your_steps_32', 'Align Your Steps 32', ays_32_sigmas),
     Scheduler('sigmoid_offset', 'Sigmoid Offset', sigmoid_offset_sigmas, need_inner_model=True),
+    Scheduler('zimage', 'Z-Image', zimage_scheduler, need_inner_model=True),
 ]
 
 schedulers_map = {**{x.name: x for x in schedulers}, **{x.label: x for x in schedulers}}

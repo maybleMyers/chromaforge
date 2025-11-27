@@ -125,9 +125,20 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     # DEBUG: Print sigma schedule info
     print(f"\n=== Euler Sampler Debug ===")
     print(f"Number of steps: {len(sigmas) - 1}")
-    print(f"Sigmas: {sigmas[:5].tolist()}... (first 5)")
+    print(f"ALL Sigmas: {sigmas.tolist()}")
     print(f"Sigmas range: [{sigmas.min().item():.6f}, {sigmas.max().item():.6f}]")
     print(f"Initial x shape: {x.shape}, dtype: {x.dtype}")
+
+    # For comparison with official Z-Image pipeline (9 steps, shift=3.0):
+    # Official creates linear spacing BEFORE shift, then applies shift
+    # Official sigmas for 9 steps with shift=3.0:
+    # pre_shift = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0]
+    # shifted = 3.0 * pre_shift / (1 + 2.0 * pre_shift)
+    # shifted = [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6428, 0.5, 0.3, 0.0] + terminal 0
+    import numpy as np
+    pre_shift = np.linspace(1.0, 0.0, len(sigmas))  # Same number of points
+    official_sigmas = 3.0 * pre_shift / (1 + 2.0 * pre_shift)
+    print(f"Official would use: {official_sigmas.tolist()}")
     print(f"===========================\n")
 
     for i in trange(len(sigmas) - 1, disable=disable):
@@ -143,6 +154,13 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
         dt = sigmas[i + 1] - sigma_hat
         # Euler method
         x = x + d * dt
+
+    # DEBUG: Check final latents
+    print(f"\n=== Euler Final Output ===")
+    print(f"Final x stats: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
+    print(f"Final x has NaN: {torch.isnan(x).any().item()}, has Inf: {torch.isinf(x).any().item()}")
+    print(f"===========================\n")
+
     return x
 
 

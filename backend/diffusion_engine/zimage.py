@@ -98,21 +98,43 @@ class ZImage(ForgeDiffusionEngine):
                     if transformer_options is not None and 'attention_mask' in transformer_options:
                         attention_mask = transformer_options['attention_mask']
 
+                    # DEBUG: Check attention mask
+                    if not hasattr(self, '_debug_context_printed'):
+                        self._debug_context_printed = True
+                        print(f"\n=== Context/Attention Mask Debug ===")
+                        print(f"Context shape before filtering: {context.shape}")
+                        print(f"Attention mask present: {attention_mask is not None}")
+                        if attention_mask is not None:
+                            print(f"Attention mask shape: {attention_mask.shape}")
+                            print(f"Attention mask sum (non-padded tokens): {attention_mask.sum(dim=1).tolist()}")
+
                     if len(context.shape) == 3:  # [batch, seq_len, features]
                         if attention_mask is not None:
                             # Filter by attention mask to create variable-length embeddings (like official)
                             context_list = []
                             for i in range(context.shape[0]):
                                 # Only keep non-padded tokens
-                                context_list.append(context[i][attention_mask[i]])
+                                filtered = context[i][attention_mask[i]]
+                                context_list.append(filtered)
+                                if not hasattr(self, '_debug_filtered_printed'):
+                                    self._debug_filtered_printed = True
+                                    print(f"Filtered context[{i}] shape: {filtered.shape} (from {context[i].shape})")
                             context = context_list
                         else:
                             # No attention mask, just split batch
                             context = [context[i] for i in range(context.shape[0])]
+                            if not hasattr(self, '_debug_nofilter_printed'):
+                                self._debug_nofilter_printed = True
+                                print(f"WARNING: No attention mask - using full padded context!")
                     elif len(context.shape) == 2:  # [seq_len, features] - single item
                         context = [context]
                     else:
                         raise ValueError(f"Unexpected context shape: {context.shape}")
+
+                    if not hasattr(self, '_debug_final_context_printed'):
+                        self._debug_final_context_printed = True
+                        print(f"Final context: list of {len(context)} tensors, shapes: {[c.shape for c in context]}")
+                        print(f"====================================\n")
 
                 # Invert timestep: Forge uses sigma in [1->0] (noisy->clean)
                 # but Z-Image expects t in [0->1] (noisy->clean)
@@ -264,6 +286,20 @@ class ZImage(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def decode_first_stage(self, x):
+        print(f"\n=== VAE Decode Debug ===")
+        print(f"Input latents: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
+
         sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
+        print(f"After process_out: min={sample.min().item():.4f}, max={sample.max().item():.4f}")
+
+        decoded = self.forge_objects.vae.decode(sample)
+        print(f"VAE decode output: min={decoded.min().item():.4f}, max={decoded.max().item():.4f}")
+        print(f"VAE decode output shape: {decoded.shape}")
+
+        # Note: If VAE outputs [-1, 1], we should NOT do * 2.0 - 1.0
+        # If VAE outputs [0, 1], we need * 2.0 - 1.0 to convert to [-1, 1]
+        sample = decoded.movedim(-1, 1) * 2.0 - 1.0
+        print(f"After * 2.0 - 1.0: min={sample.min().item():.4f}, max={sample.max().item():.4f}")
+        print(f"=========================\n")
+
         return sample.to(x)

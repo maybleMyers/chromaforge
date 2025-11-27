@@ -32,6 +32,14 @@ class KModel(torch.nn.Module):
             print(f"Sigma (t) value: {sigma}")
             print(f"Predictor type: {type(self.predictor).__name__}")
             print(f"Predictor sigmas range: [{self.predictor.sigma_min:.6f}, {self.predictor.sigma_max:.6f}]")
+            print(f"\n=== KModel c_crossattn Debug ===")
+            print(f"c_crossattn type: {type(c_crossattn)}")
+            if isinstance(c_crossattn, dict):
+                print(f"c_crossattn keys: {c_crossattn.keys()}")
+                if 'attention_mask' in c_crossattn:
+                    print(f"attention_mask shape: {c_crossattn['attention_mask'].shape}")
+            elif hasattr(c_crossattn, 'shape'):
+                print(f"c_crossattn shape: {c_crossattn.shape}")
 
         xc = self.predictor.calculate_input(sigma, x)
         if c_concat is not None:

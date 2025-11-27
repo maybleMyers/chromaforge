@@ -63,7 +63,7 @@ def make_checkpoint_manager_ui():
         if len(sd_models.checkpoints_list) > 0:
             shared.opts.set('sd_model_checkpoint', next(iter(sd_models.checkpoints_list.values())).name)
 
-    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'all'], elem_id="forge_ui_preset")
+    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'z', 'all'], elem_id="forge_ui_preset")
 
     ckpt_list, vae_list = refresh_models()
 
@@ -451,6 +451,35 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value=getattr(shared.opts, "chroma_t2i_hr_d_cfg", 3.5)), # ui_txt2img_hr_distilled_cfg
         ]
 
+    if shared.opts.forge_preset == 'z':
+        ckpt_list, _ = refresh_models()
+        ui_checkpoint.choices = ckpt_list
+        model_mem = getattr(shared.opts, "z_GPU_MB", total_vram - 1024)
+        if model_mem < 0 or model_mem > total_vram:
+            model_mem = total_vram - 1024
+        return [
+            gr.update(visible=True),  # ui_vae
+            gr.update(visible=False, value=1),  # ui_clip_skip
+            gr.update(visible=True, value='Automatic'),  # ui_forge_unet_storage_dtype_options
+            gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
+            gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
+            gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
+            gr.update(maximum=2048, value=getattr(shared.opts, "z_t2i_width", 1024)),  # ui_txt2img_width
+            gr.update(maximum=2048, value=getattr(shared.opts, "z_i2i_width", 1024)),  # ui_img2img_width
+            gr.update(maximum=2048, value=getattr(shared.opts, "z_t2i_height", 1024)),  # ui_txt2img_height
+            gr.update(maximum=2048, value=getattr(shared.opts, "z_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(value=getattr(shared.opts, "z_t2i_cfg", 0)),  # ui_txt2img_cfg
+            gr.update(value=getattr(shared.opts, "z_i2i_cfg", 0)),  # ui_img2img_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_distilled_cfg
+            gr.update(visible=False, value=0),  # ui_img2img_distilled_cfg
+            gr.update(value=getattr(shared.opts, "z_t2i_sampler", 'Euler')),  # ui_txt2img_sampler
+            gr.update(value=getattr(shared.opts, "z_i2i_sampler", 'Euler')),  # ui_img2img_sampler
+            gr.update(value=getattr(shared.opts, "z_t2i_scheduler", 'Simple')),  # ui_txt2img_scheduler
+            gr.update(value=getattr(shared.opts, "z_i2i_scheduler", 'Simple')),  # ui_img2img_scheduler
+            gr.update(visible=True, value=getattr(shared.opts, "z_t2i_hr_cfg", 0)),  # ui_txt2img_hr_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_hr_distilled_cfg
+        ]
+
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
     ui_settings_from_file = loadsave.ui_settings.copy()
 
@@ -525,4 +554,18 @@ shared.options_templates.update(shared.options_section(('ui_chroma', "UI default
     "chroma_i2i_cfg":      shared.OptionInfo(7,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "chroma_i2i_d_cfg":    shared.OptionInfo(3.5,  "img2img Distilled CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
     "chroma_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+}))
+shared.options_templates.update(shared.options_section(('ui_z', "UI defaults 'z' (Z-Image)", "ui"), {
+    "z_t2i_width":    shared.OptionInfo(1024,  "txt2img width",      gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
+    "z_t2i_height":   shared.OptionInfo(1024, "txt2img height",     gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
+    "z_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
+    "z_t2i_scheduler": shared.OptionInfo('Simple', "txt2img scheduler"),
+    "z_t2i_cfg":      shared.OptionInfo(0,    "txt2img CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_t2i_hr_cfg":   shared.OptionInfo(0,    "txt2img HiRes CFG",  gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_i2i_width":    shared.OptionInfo(1024, "img2img width",      gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
+    "z_i2i_height":   shared.OptionInfo(1024, "img2img height",     gr.Slider, {"minimum": 64, "maximum": 2048, "step": 8}),
+    "z_i2i_sampler":  shared.OptionInfo('Euler', "img2img sampler"),
+    "z_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
+    "z_i2i_cfg":      shared.OptionInfo(0,    "img2img CFG",        gr.Slider, {"minimum": 0,  "maximum": 30,   "step": 0.1}),
+    "z_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)", gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
 }))

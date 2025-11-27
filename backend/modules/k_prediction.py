@@ -297,7 +297,9 @@ class PredictionFlux(AbstractPrediction):
         else:
             self.mu = mu
         sigmas = torch.arange(1, self.pseudo_timestep_range + 1, 1) / self.pseudo_timestep_range
-        sigmas = FlowMatchEulerDiscreteScheduler.time_shift(None, self.mu, 1.0, sigmas)
+        # Create a temporary scheduler instance for time_shift
+        temp_scheduler = FlowMatchEulerDiscreteScheduler()
+        sigmas = temp_scheduler.time_shift(self.mu, 1.0, sigmas)
         self.register_buffer('sigmas', sigmas)
 
     @property

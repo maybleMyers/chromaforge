@@ -27,6 +27,10 @@ there's a bunch of extra samplers/schedulers at these places:
 https://github.com/DenOfEquity/webUI_ExtraSchedulers
 https://github.com/MisterChief95/sd-forge-extra-samplers
 
+## To use the Z-Image model
+
+Download the files from here https://huggingface.co/maybleMyers/z-image. put the text encoder in the text encoder folder, vae in vae folder and transformer in the stable diffusion folder. Select z in the top by the ui. It might work with other safetensors I have not tested them.  
+
 ## RamForge
 
 This supports use of the RamTorch memory management system. Add --use-ramtorch-chroma to your command line arguments. It will drastically lower vram usage to let you increase batch size or resolution greatly above what you could previously use. For instance you can run a batch of 8 1024x1024 images with a 12gb GPU. It does increas normal RAM usage by alot, 64GB recommended.  
@@ -45,6 +49,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord: http://discord.gg/SQVcWVbqKx  
 
 ## Changlog
+11/27/2025  
+    Add support for z-image model.   
 10/25/2025  
     Support auraflow in the p7 branch. To switch branches just navigate to your root directory then type "git switch p7" for example.  
 10/15/2025  

@@ -336,8 +336,20 @@ def requirements_met(requirements_file):
 
     with open(requirements_file, "r", encoding="utf8") as file:
         for line in file:
-            if line.strip() == "":
+            line = line.strip()
+            if line == "":
                 continue
+
+            # Handle git+https URLs (e.g., git+https://github.com/huggingface/diffusers)
+            # Extract package name from URL and check if already installed
+            if line.startswith("git+"):
+                # Extract package name from URL (last part of path, without .git)
+                url_path = line.split("/")[-1]
+                package_name = url_path.replace(".git", "")
+                if is_installed(package_name):
+                    continue
+                else:
+                    return False
 
             m = re.match(re_requirement, line)
             if m is None:
@@ -446,6 +458,19 @@ def prepare_environment():
     if not is_installed("open_clip"):
         run_pip(f"install {openclip_package}", "open_clip")
         startup_timer.record("install open_clip")
+
+    # Check if diffusers is installed with version >= 0.36.0.dev0
+    diffusers_installed = False
+    try:
+        import packaging.version
+        diffusers_version = importlib.metadata.version("diffusers")
+        if packaging.version.parse(diffusers_version) >= packaging.version.parse("0.36.0.dev0"):
+            diffusers_installed = True
+    except Exception:
+        pass
+    if not diffusers_installed:
+        run_pip("install git+https://github.com/huggingface/diffusers", "diffusers")
+        startup_timer.record("install diffusers")
 
     if (not is_installed("xformers") or args.reinstall_xformers) and args.xformers:
         run_pip(f"install -U -I --no-deps {xformers_package}", "xformers")

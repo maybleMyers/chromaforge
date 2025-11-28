@@ -46,7 +46,7 @@ The memory management is currently derped. It will run fast with a 24GB card whe
 
 Training: https://github.com/lodestone-rock/flow/  https://github.com/kohya-ss/sd-scripts/tree/sd3  
 Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-fi.com/lodestonerock  
-Discord: http://discord.gg/SQVcWVbqKx  
+Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
 11/27/2025  

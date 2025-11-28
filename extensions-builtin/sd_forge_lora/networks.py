@@ -10,17 +10,37 @@ from backend.args import dynamic_args
 from modules import shared, sd_models, errors, scripts
 from backend.utils import load_torch_file
 from backend.patcher.lora import model_lora_keys_clip, model_lora_keys_unet, load_lora
+from backend.lora.zimage_lora import load_zimage_lora_patches
 
 
 def load_lora_for_models(model, clip, lora, strength_model, strength_clip, filename='default', online_mode=False):
     model_flag = type(model.model).__name__ if model is not None else 'default'
 
-    unet_keys = model_lora_keys_unet(model.model) if model is not None else {}
-    clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
+    # Check if this is a Z-Image model (detect by wrapper class or model config)
+    is_zimage = False
+    if model is not None:
+        model_config = getattr(model.model, 'config', None)
+        if model_config is not None and getattr(model_config, 'is_zimage', False):
+            is_zimage = True
+            print(f'[LORA] Z-Image model detected via config.is_zimage')
+        # Also check by class name pattern
+        if 'ZImage' in model_flag:
+            is_zimage = True
+            print(f'[LORA] Z-Image model detected via class name: {model_flag}')
 
-    lora_unmatch = lora
-    lora_unet, lora_unmatch = load_lora(lora_unmatch, unet_keys)
-    lora_clip, lora_unmatch = load_lora(lora_unmatch, clip_keys)
+    # Use dedicated Z-Image LoRA loader if applicable
+    if is_zimage and model is not None:
+        print(f'[LORA] Using Z-Image LoRA loader for {filename}')
+        lora_unet, lora_unmatch = load_zimage_lora_patches(lora, model.model)
+        clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
+        lora_clip, lora_unmatch = load_lora(lora_unmatch, clip_keys)
+    else:
+        unet_keys = model_lora_keys_unet(model.model) if model is not None else {}
+        clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
+
+        lora_unmatch = lora
+        lora_unet, lora_unmatch = load_lora(lora_unmatch, unet_keys)
+        lora_clip, lora_unmatch = load_lora(lora_unmatch, clip_keys)
 
     #if len(lora_unmatch) > 12:
         #print(f'[LORA] LoRA version mismatch for {model_flag}: {filename}')

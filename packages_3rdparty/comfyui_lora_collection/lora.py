@@ -339,7 +339,13 @@ def model_lora_keys_unet(model, key_map={}):
     #             key_lora = k[len("diffusion_model."):-len(".weight")]
     #             key_map["base_model.model.{}".format(key_lora)] = k #official hunyuan lora format
 
-    if 'flux' in model.config.huggingface_repo.lower() or 'chroma' in model.config.huggingface_repo.lower(): #Diffusers lora Flux and Chroma
+    # Safe access to huggingface_repo (may be None for some models like Z-Image)
+    repo = ''
+    config = getattr(model, 'config', None)
+    if config is not None:
+        repo = (getattr(config, 'huggingface_repo', '') or '').lower()
+
+    if 'flux' in repo or 'chroma' in repo:  # Diffusers lora Flux and Chroma
         diffusers_keys = utils.flux_to_diffusers(model.diffusion_model.config, output_prefix="diffusion_model.")
         for k in diffusers_keys:
             if k.endswith(".weight"):
@@ -347,5 +353,27 @@ def model_lora_keys_unet(model, key_map={}):
                 key_map["transformer.{}".format(k[:-len(".weight")])] = to  # simpletrainer and probably regular diffusers flux lora format
                 key_map["lycoris_{}".format(k[:-len(".weight")].replace(".", "_"))] = to  # simpletrainer lycoris
                 key_map["lora_transformer_{}".format(k[:-len(".weight")].replace(".", "_"))] = to  # onetrainer
+
+    # Z-Image LoRA support
+    is_zimage = (config is not None and getattr(config, 'is_zimage', False)) or repo == 'z-image'
+    if not is_zimage:
+        # Fallback: detect by checking for Z-Image layer structure
+        if any('layers.0.feed_forward.w1' in k for k in sdk):
+            is_zimage = True
+
+    if is_zimage:
+        for k in sdk:
+            if k.endswith(".weight"):
+                # Handle both cases: with or without diffusion_model. prefix
+                if k.startswith("diffusion_model."):
+                    model_key = k
+                    lora_key = k[:-len(".weight")]
+                else:
+                    # Add diffusion_model. prefix for model key (Forge wrapping)
+                    model_key = "diffusion_model." + k
+                    lora_key = "diffusion_model." + k[:-len(".weight")]
+                # Handle the to_out.0 -> out naming difference in LoRA files
+                lora_key = lora_key.replace(".attention.to_out.0", ".attention.out")
+                key_map[lora_key] = model_key
 
     return sdk, key_map

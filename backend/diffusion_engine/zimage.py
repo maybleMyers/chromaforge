@@ -199,11 +199,16 @@ class ZImage(ForgeDiffusionEngine):
             timesteps=1000
         )
 
+        # Create config object for Z-Image identification (used by LoRA loader)
+        class ZImageModelConfig:
+            is_zimage = True
+            huggingface_repo = 'Z-Image'
+
         unet = UnetPatcher.from_model(
             model=wrapped_transformer,
             diffusers_scheduler=components_dict['scheduler'],
             k_predictor=k_predictor,
-            config=None
+            config=ZImageModelConfig()
         )
 
         self.text_processing_engine_qwen = QwenTextProcessingEngine(

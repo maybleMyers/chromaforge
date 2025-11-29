@@ -49,6 +49,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+11/29/2025  
+    Support loras in z-image.  
 11/27/2025  
     Add support for z-image model.   
 10/25/2025  

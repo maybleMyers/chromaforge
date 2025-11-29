@@ -142,11 +142,21 @@ def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
 
     Returns (base_key, type) where type is 'up', 'down', or 'alpha'
     Returns None if not a valid LoRA key.
+
+    Supports two LoRA formats:
+    - Kohya/WebUI format: .lora_up.weight, .lora_down.weight
+    - PEFT/HuggingFace format: .lora_B.weight (up), .lora_A.weight (down)
     """
+    # Kohya/WebUI format
     if full_key.endswith('.lora_up.weight'):
         return full_key[:-len('.lora_up.weight')], 'up'
     elif full_key.endswith('.lora_down.weight'):
         return full_key[:-len('.lora_down.weight')], 'down'
+    # PEFT/HuggingFace format (lora_B = up, lora_A = down)
+    elif full_key.endswith('.lora_B.weight'):
+        return full_key[:-len('.lora_B.weight')], 'up'
+    elif full_key.endswith('.lora_A.weight'):
+        return full_key[:-len('.lora_A.weight')], 'down'
     elif full_key.endswith('.alpha'):
         return full_key[:-len('.alpha')], 'alpha'
     return None

@@ -9,6 +9,41 @@ from backend.args import dynamic_args
 from backend.modules.k_prediction import PredictionZImage
 from backend import memory_management
 
+
+class ZImageLatentFormat:
+    """Latent format for Z-Image models (16-channel latents using FLUX VAE)"""
+    # Computed via least squares regression from latent/RGB pairs
+    # Maps 16-channel latents to RGB for cheap preview approximation
+    latent_rgb_factors = [
+        [-0.037223, -0.005345,  0.027556],
+        [ 0.016390,  0.037071,  0.064793],
+        [ 0.019696, -0.027534, -0.014296],
+        [-0.006327,  0.014695,  0.036488],
+        [ 0.068934,  0.055449,  0.033998],
+        [ 0.013588,  0.014694,  0.000826],
+        [ 0.074462,  0.109467,  0.114805],
+        [-0.024411, -0.022535, -0.025943],
+        [-0.023577,  0.013515,  0.077390],
+        [ 0.062267,  0.037371, -0.032887],
+        [-0.052327, -0.016201, -0.019524],
+        [ 0.068548,  0.035523,  0.014399],
+        [ 0.014019,  0.010056,  0.018069],
+        [-0.063674, -0.015887, -0.049793],
+        [-0.005128, -0.034811, -0.009309],
+        [-0.064089, -0.038018, -0.024993],
+    ]
+
+    def __init__(self):
+        self.scale_factor = 0.3611  # Z-Image VAE scale factor
+        self.shift_factor = 0.1159  # Z-Image VAE shift factor
+
+    def process_in(self, latent):
+        return (latent - self.shift_factor) * self.scale_factor
+
+    def process_out(self, latent):
+        return (latent / self.scale_factor) + self.shift_factor
+
+
 class ZImage(ForgeDiffusionEngine):
     def __init__(self, components_dict, estimated_config=None):
         # Create minimal config if not provided
@@ -20,6 +55,10 @@ class ZImage(ForgeDiffusionEngine):
 
         super().__init__(estimated_config, components_dict)
         self.is_inpaint = False
+
+        # Add latent_format to model_config for cheap preview approximation
+        if not hasattr(self.model_config, 'latent_format'):
+            self.model_config.latent_format = ZImageLatentFormat()
 
         # Wrap Qwen encoder in CLIP interface
         clip = CLIP(
@@ -291,20 +330,8 @@ class ZImage(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def decode_first_stage(self, x):
-        print(f"\n=== VAE Decode Debug ===")
-        print(f"Input latents: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
-
         sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        print(f"After process_out: min={sample.min().item():.4f}, max={sample.max().item():.4f}")
-
         decoded = self.forge_objects.vae.decode(sample)
-        print(f"VAE decode output: min={decoded.min().item():.4f}, max={decoded.max().item():.4f}")
-        print(f"VAE decode output shape: {decoded.shape}")
-
-        # Note: If VAE outputs [-1, 1], we should NOT do * 2.0 - 1.0
-        # If VAE outputs [0, 1], we need * 2.0 - 1.0 to convert to [-1, 1]
-        sample = decoded.movedim(-1, 1) * 2.0 - 1.0
-        print(f"After * 2.0 - 1.0: min={sample.min().item():.4f}, max={sample.max().item():.4f}")
-        print(f"=========================\n")
-
-        return sample.to(x)
+        # VAE outputs [0, 1], convert to [-1, 1]
+        result = decoded.movedim(-1, 1) * 2.0 - 1.0
+        return result.to(x)

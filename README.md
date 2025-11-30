@@ -31,14 +31,6 @@ https://github.com/MisterChief95/sd-forge-extra-samplers
 
 Download the files from here https://huggingface.co/maybleMyers/z-image. put the text encoder in the text encoder folder, vae in vae folder and transformer in the stable diffusion folder. Select z in the top by the ui. It might work with other safetensors I have not tested them.  
 
-## RamForge
-
-This supports use of the RamTorch memory management system. Add --use-ramtorch-chroma to your command line arguments. It will drastically lower vram usage to let you increase batch size or resolution greatly above what you could previously use. For instance you can run a batch of 8 1024x1024 images with a 12gb GPU. It does increas normal RAM usage by alot, 64GB recommended.  
-
-This was designed for training, it seems like not using it is faster.  
-
-https://github.com/lodestone-rock/RamTorch
-
 ## Radiance Model
 
 Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
@@ -63,8 +55,6 @@ Discord for help etc. https://discord.gg/wDaEfNGuCX
     Improve memory management when offloading with async. async should be the fastest way to offload. Offloading with radiance improved, still slow though.   
 9/24/2025  
     One trainer lora should load correctly now.  
-9/19/2025  
-    Added support for RamTorch memory management system using normal chroma models. Use it by moidfying your webui-user.bat's set COMMANDLINE_ARGS= --use-ramtorch-chroma https://github.com/lodestone-rock/RamTorch  
 9/2/2025  
     Add res 2s, res 6s and res 16s samplers to main. Thanks to ClownsharkBatwing https://github.com/ClownsharkBatwing/RES4LYF  
 8/29/2025  

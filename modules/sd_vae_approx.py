@@ -71,4 +71,18 @@ def model():
 
 
 def cheap_approximation(sample):
-    return torch.einsum("...lxy,lr -> ...rxy", sample, torch.tensor(shared.sd_model.model_config.latent_format.latent_rgb_factors).to(sample.device))
+    model = shared.sd_model
+
+    # Check for latent_rgb_factors in model_config
+    has_model_config = hasattr(model, 'model_config') and model.model_config is not None
+    has_latent_format = has_model_config and hasattr(model.model_config, 'latent_format')
+    has_factors = has_latent_format and hasattr(model.model_config.latent_format, 'latent_rgb_factors')
+
+    if not has_factors:
+        # Fallback for models without latent_rgb_factors - use first 3 channels
+        if sample.shape[1] >= 3:
+            return sample[:, :3, :, :].clamp(-1, 1)
+        else:
+            return sample.repeat(1, 3, 1, 1)[:, :3, :, :].clamp(-1, 1)
+
+    return torch.einsum("...lxy,lr -> ...rxy", sample, torch.tensor(model.model_config.latent_format.latent_rgb_factors).to(sample.device))

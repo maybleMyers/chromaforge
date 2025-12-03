@@ -501,7 +501,14 @@ def forge_model_reload():
     dynamic_args['forge_unet_storage_dtype'] = model_data.forge_loading_parameters.get('unet_storage_dtype', None)
     dynamic_args['embedding_dir'] = cmd_opts.embeddings_dir
     dynamic_args['emphasis_name'] = opts.emphasis
-    sd_model = forge_loader(state_dict, additional_state_dicts=additional_state_dicts, preset=shared.opts.forge_preset)
+    try:
+        sd_model = forge_loader(state_dict, additional_state_dicts=additional_state_dicts, preset=shared.opts.forge_preset)
+    except memory_management.OOM_EXCEPTION as e:
+        memory_management.emergency_memory_cleanup()
+        raise RuntimeError(
+            "Out of memory during model loading. Memory has been cleared. "
+            "Please try again with a lower GPU Weights setting or use a smaller model."
+        ) from e
     timer.record("forge model load")
 
     sd_model.extra_generation_params = {}

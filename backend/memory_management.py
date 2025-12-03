@@ -1435,3 +1435,72 @@ def soft_empty_cache(force=False):
 
 def unload_all_models():
     free_memory(1e30, get_torch_device(), free_all=True)
+
+
+def emergency_memory_cleanup():
+    """
+    Emergency memory cleanup function for OOM recovery.
+    This aggressively clears all GPU memory and unloads all models
+    to allow the application to continue without requiring a restart.
+    """
+    import gc
+
+    print("\n" + "="*60)
+    print("[OOM Recovery] Emergency memory cleanup initiated...")
+    print("="*60)
+
+    # Step 1: Unload all models from GPU
+    print("[OOM Recovery] Step 1: Unloading all models...")
+    try:
+        unload_all_models()
+    except Exception as e:
+        print(f"[OOM Recovery] Warning during model unload: {e}")
+
+    # Step 2: Clear the current_loaded_models list
+    print("[OOM Recovery] Step 2: Clearing model tracking list...")
+    global current_loaded_models
+    try:
+        for model in current_loaded_models:
+            try:
+                model.model_unload(avoid_model_moving=True)
+            except:
+                pass
+        current_loaded_models.clear()
+    except Exception as e:
+        print(f"[OOM Recovery] Warning during model list cleanup: {e}")
+
+    # Step 3: Force Python garbage collection
+    print("[OOM Recovery] Step 3: Running garbage collection...")
+    gc.collect()
+    gc.collect()  # Run twice for thorough cleanup
+
+    # Step 4: Clear PyTorch CUDA cache
+    print("[OOM Recovery] Step 4: Clearing GPU cache...")
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+        elif is_intel_xpu():
+            torch.xpu.empty_cache()
+        elif mps_mode():
+            torch.mps.empty_cache()
+    except Exception as e:
+        print(f"[OOM Recovery] Warning during cache clearing: {e}")
+
+    # Step 5: Reset signal flags
+    global signal_empty_cache
+    signal_empty_cache = False
+
+    # Step 6: Final garbage collection
+    gc.collect()
+
+    # Report memory status
+    try:
+        device = get_torch_device()
+        free_mem = get_free_memory(device)
+        print(f"[OOM Recovery] Cleanup complete. Free memory: {free_mem / (1024*1024):.2f} MB")
+    except:
+        print("[OOM Recovery] Cleanup complete.")
+
+    print("="*60 + "\n")

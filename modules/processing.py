@@ -972,7 +972,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if p.scripts is not None:
                 p.scripts.process_batch(p, batch_number=n, prompts=p.prompts, seeds=p.seeds, subseeds=p.subseeds)
 
-            p.setup_conds()
+            try:
+                p.setup_conds()
+            except memory_management.OOM_EXCEPTION as e:
+                memory_management.emergency_memory_cleanup()
+                raise RuntimeError(
+                    "Out of memory during text encoding. Memory has been cleared. "
+                    "Please try again with a shorter prompt or reduce GPU Weights slider."
+                ) from e
 
             p.extra_generation_params.update(p.sd_model.extra_generation_params)
 
@@ -1000,7 +1007,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sigmas_backup = p.sd_model.forge_objects.unet.model.predictor.sigmas
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
-            samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
+            try:
+                samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
+            except memory_management.OOM_EXCEPTION as e:
+                memory_management.emergency_memory_cleanup()
+                raise RuntimeError(
+                    "Out of memory during sampling. Memory has been cleared. "
+                    "Please try again with a smaller resolution, fewer steps, or reduce GPU Weights slider."
+                ) from e
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)
@@ -1020,7 +1034,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
                 if opts.sd_vae_decode_method != 'Full':
                     p.extra_generation_params['VAE Decoder'] = opts.sd_vae_decode_method
-                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
+                try:
+                    x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
+                except memory_management.OOM_EXCEPTION as e:
+                    memory_management.emergency_memory_cleanup()
+                    raise RuntimeError(
+                        "Out of memory during VAE decode. Memory has been cleared. "
+                        "Please try again with a smaller resolution or use tiled VAE decoding."
+                    ) from e
 
             x_samples_ddim = torch.stack(x_samples_ddim).float()
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)

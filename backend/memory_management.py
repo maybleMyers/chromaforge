@@ -1542,18 +1542,23 @@ def emergency_memory_cleanup():
                 except:
                     pass
 
-        # Nuclear option: iterate through ALL tensors tracked by PyTorch
-        # and delete any that are on CUDA
-        moved_count = 0
+        # Nuclear option: iterate through ALL CUDA tensors and free their storage
+        # This forcibly releases GPU memory even if references still exist
+        freed_count = 0
+        total_freed_bytes = 0
         for obj in gc.get_objects():
             try:
                 if isinstance(obj, torch.Tensor) and obj.device.type == 'cuda':
-                    # Can't directly move, but we can help GC by removing refs
-                    moved_count += 1
+                    # Get tensor size before freeing
+                    tensor_bytes = obj.element_size() * obj.nelement()
+                    # Free the storage - this releases GPU memory immediately
+                    obj.storage().resize_(0)
+                    freed_count += 1
+                    total_freed_bytes += tensor_bytes
             except:
                 pass
-        if moved_count > 0:
-            print(f"[OOM Recovery] Found {moved_count} CUDA tensors (will be freed after gc)")
+        if freed_count > 0:
+            print(f"[OOM Recovery] Freed storage of {freed_count} CUDA tensors ({total_freed_bytes / (1024*1024*1024):.2f} GB)")
     except Exception as e:
         print(f"[OOM Recovery] Warning during tensor scan: {e}")
 

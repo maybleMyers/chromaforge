@@ -1,12 +1,7 @@
-// code related to showing and updating progressbar shown as the image is being made
+// Progress bar with queue tracking and reconnection support
 
-function rememberGallerySelection() {
-
-}
-
-function getGallerySelectedIndex() {
-
-}
+function rememberGallerySelection() {}
+function getGallerySelectedIndex() {}
 
 function request(url, data, handler, errorHandler) {
     var xhr = new XMLHttpRequest();
@@ -69,14 +64,18 @@ function randomId() {
     return "task(" + Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7) + ")";
 }
 
-// starts sending progress requests to "/internal/progress" uri, creating progressbar above progressbarContainer element and
-// preview inside gallery element. Cleans up all created stuff when the task is over and calls atEnd.
-// calls onProgress every time there is a progress update
-function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgress, inactivityTimeout = 6000) {
+// Progress request with reconnection support
+// inactivityTimeout: time in ms before giving up on a task that was never queued/active
+// Setting to 0 disables the timeout (for restore operations)
+function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgress, inactivityTimeout = 60000) {
     var dateStart = new Date();
     var wasEverActive = false;
+    var wasEverQueued = false;
     var parentProgressbar = progressbarContainer.parentNode;
     var wakeLock = null;
+    var isDestroyed = false;
+    var reconnectAttempts = 0;
+    var maxReconnectAttempts = 10;
 
     var requestWakeLock = async function() {
         if (!opts.prevent_screen_sleep_during_generation || wakeLock !== null) return;
@@ -110,20 +109,51 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
     var livePreview = null;
 
     var removeProgressBar = function() {
+        isDestroyed = true;
         releaseWakeLock();
         if (!divProgress) return;
 
         setTitle("");
-        parentProgressbar.removeChild(divProgress);
-        if (gallery && livePreview) gallery.removeChild(livePreview);
+        try {
+            parentProgressbar.removeChild(divProgress);
+        } catch (e) {}
+        if (gallery && livePreview) {
+            try {
+                gallery.removeChild(livePreview);
+            } catch (e) {}
+        }
         atEnd();
 
         divProgress = null;
     };
 
+    var handleError = function() {
+        reconnectAttempts++;
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            console.error('Max reconnect attempts reached, giving up');
+            removeProgressBar();
+            return;
+        }
+        // Exponential backoff: 1s, 2s, 3s, 4s, 5s (capped)
+        var delay = Math.min(reconnectAttempts, 5) * 1000;
+        console.log('Connection error, reconnecting in', delay, 'ms (attempt', reconnectAttempts + ')');
+        setTimeout(function() {
+            if (!isDestroyed) {
+                funProgress(id_task);
+            }
+        }, delay);
+    };
+
     var funProgress = function(id_task) {
+        if (isDestroyed) return;
+
         requestWakeLock();
         request("./internal/progress", {id_task: id_task, live_preview: false}, function(res) {
+            if (isDestroyed) return;
+
+            // Reset reconnect counter on success
+            reconnectAttempts = 0;
+
             if (res.completed) {
                 removeProgressBar();
                 return;
@@ -152,14 +182,24 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
 
             var elapsedFromStart = (new Date() - dateStart) / 1000;
 
-            if (res.active) wasEverActive = true;
+            // Track if we've ever been in the queue or active
+            if (res.active) {
+                wasEverActive = true;
+                wasEverQueued = true;
+            }
+            if (res.queued) {
+                wasEverQueued = true;
+            }
 
+            // Task finished (was active, now isn't)
             if (!res.active && wasEverActive) {
                 removeProgressBar();
                 return;
             }
 
-            if (elapsedFromStart > inactivityTimeout && !res.queued && !res.active) {
+            // Timeout check - only if we've never been queued/active and timeout is enabled
+            if (inactivityTimeout > 0 && elapsedFromStart * 1000 > inactivityTimeout && !res.queued && !res.active && !wasEverQueued) {
+                console.log('Inactivity timeout reached for task', id_task);
                 removeProgressBar();
                 return;
             }
@@ -169,22 +209,23 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
             }
 
             setTimeout(() => {
-                funProgress(id_task); // CORRECTED: Only pass id_task
+                funProgress(id_task);
             }, opts.live_preview_refresh_period || 500);
-        }, function() {
-            removeProgressBar();
-        });
+        }, handleError);
     };
 
     var funLivePreview = function(id_task, id_live_preview) {
-        request("./internal/progress", {id_task: id_task, id_live_preview: id_live_preview}, function(res) {
-            if (!divProgress) {
+        if (isDestroyed) return;
+
+        request("./internal/progress", {id_task: id_task, id_live_preview: id_live_preview, live_preview: true}, function(res) {
+            if (!divProgress || isDestroyed) {
                 return;
             }
 
             if (res.live_preview && gallery) {
                 var img = new Image();
                 img.onload = function() {
+                    if (isDestroyed) return;
                     if (!livePreview) {
                         livePreview = document.createElement('div');
                         livePreview.className = 'livePreview';
@@ -200,17 +241,21 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
             }
 
             setTimeout(() => {
-                funLivePreview(id_task, res.id_live_preview);
+                funLivePreview(id_task, res.id_live_preview || id_live_preview);
             }, opts.live_preview_refresh_period || 500);
         }, function() {
-            removeProgressBar();
+            // Don't give up on live preview errors, just retry
+            if (!isDestroyed) {
+                setTimeout(() => {
+                    funLivePreview(id_task, id_live_preview);
+                }, 2000);
+            }
         });
     };
 
-    funProgress(id_task, 0);
+    funProgress(id_task);
 
     if (gallery) {
         funLivePreview(id_task, 0);
     }
-
 }

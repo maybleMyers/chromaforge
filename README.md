@@ -42,7 +42,7 @@ Discord for help etc. https://discord.gg/wDaEfNGuCX
 
 ## Changlog
 12/2/2025  
-    Support the controlnet model. On the controlnet branch for now. switch to the controlnet branch to use it and put https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union/blob/main/Z-Image-Turbo-Fun-Controlnet-Union.safetensors in the controlnet folder in the models dir.  
+    Support the controlnet model. Put https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union/blob/main/Z-Image-Turbo-Fun-Controlnet-Union.safetensors in the controlnet folder in the models dir. And use in the controlnet extension.  Settings are touchy, needs some experimentation to get right.    
 11/29/2025  
     Support loras in z-image.  
 11/27/2025  

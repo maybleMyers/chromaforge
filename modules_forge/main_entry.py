@@ -251,7 +251,10 @@ def refresh_model_loading_parameters():
     model_data.forge_loading_parameters = dict(
         checkpoint_info=checkpoint_info,
         additional_modules=shared.opts.forge_additional_modules,
-        unet_storage_dtype=unet_storage_dtype
+        unet_storage_dtype=unet_storage_dtype,
+        z_transformer_dtype=getattr(shared.opts, 'z_transformer_dtype', 'Automatic'),
+        z_vae_dtype=getattr(shared.opts, 'z_vae_dtype', 'Automatic'),
+        z_text_encoder_dtype=getattr(shared.opts, 'z_text_encoder_dtype', 'Automatic'),
     )
 
     print(f'Model selected: {model_data.forge_loading_parameters}')

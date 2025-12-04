@@ -9,6 +9,17 @@ from backend.args import dynamic_args
 from backend.modules.k_prediction import PredictionZImage
 from backend import memory_management
 
+# Import control components (lazy loaded when needed)
+_zimage_control_module = None
+
+def get_zimage_control_module():
+    """Lazy load zimage_control module to avoid circular imports"""
+    global _zimage_control_module
+    if _zimage_control_module is None:
+        from backend.nn import zimage_control
+        _zimage_control_module = zimage_control
+    return _zimage_control_module
+
 
 class ZImageLatentFormat:
     """Latent format for Z-Image models (16-channel latents using FLUX VAE)"""
@@ -106,20 +117,22 @@ class ZImage(ForgeDiffusionEngine):
                 self.transformer = transformer
 
             def forward(self, x, timestep, context=None, transformer_options=None, **kwargs):
-                # Convert input to list format matching official diffusers implementation
-                # Official: latent [B,C,H,W] -> unsqueeze(2) -> [B,C,1,H,W] -> unbind(0) -> List of [C,1,H,W]
-                import torch
+                # Check if Z-Image ControlNet is active
+                control_active = (
+                    transformer_options is not None and
+                    transformer_options.get('z_image_controlnet_active', False)
+                )
 
-                # DEBUG: Print info on first call only
-                if not hasattr(self, '_debug_printed'):
-                    self._debug_printed = True
-                    print(f"\n=== Z-Image Wrapper Debug (first call) ===")
-                    print(f"Input x shape: {x.shape}, dtype: {x.dtype}")
-                    print(f"Input x stats: min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
-                    print(f"Input x has NaN: {torch.isnan(x).any().item()}")
-                    print(f"Timestep (raw sigma): {timestep}")
-                    if context is not None:
-                        print(f"Context shape: {context.shape}, dtype: {context.dtype}")
+                if control_active:
+                    # Use control-enabled forward path
+                    return self._forward_with_control(x, timestep, context, transformer_options, **kwargs)
+                else:
+                    # Use standard forward path (unchanged behavior)
+                    return self._forward_normal(x, timestep, context, transformer_options, **kwargs)
+
+            def _forward_normal(self, x, timestep, context=None, transformer_options=None, **kwargs):
+                """Standard forward path - unchanged from original implementation"""
+                import torch
 
                 if not isinstance(x, list):
                     # Input should be [batch, channels, height, width] (4D)
@@ -132,95 +145,246 @@ class ZImage(ForgeDiffusionEngine):
 
                 # Convert context to list format, filtering by attention mask if available
                 if context is not None and not isinstance(context, list):
-                    # Check if attention_mask is available in transformer_options
                     attention_mask = None
                     if transformer_options is not None and 'attention_mask' in transformer_options:
                         attention_mask = transformer_options['attention_mask']
-
-                    # DEBUG: Check attention mask
-                    if not hasattr(self, '_debug_context_printed'):
-                        self._debug_context_printed = True
-                        print(f"\n=== Context/Attention Mask Debug ===")
-                        print(f"Context shape before filtering: {context.shape}")
-                        print(f"Attention mask present: {attention_mask is not None}")
-                        if attention_mask is not None:
-                            print(f"Attention mask shape: {attention_mask.shape}")
-                            print(f"Attention mask sum (non-padded tokens): {attention_mask.sum(dim=1).tolist()}")
 
                     if len(context.shape) == 3:  # [batch, seq_len, features]
                         if attention_mask is not None:
                             # Filter by attention mask to create variable-length embeddings (like official)
                             context_list = []
                             for i in range(context.shape[0]):
-                                # Only keep non-padded tokens
                                 filtered = context[i][attention_mask[i]]
                                 context_list.append(filtered)
-                                if not hasattr(self, '_debug_filtered_printed'):
-                                    self._debug_filtered_printed = True
-                                    print(f"Filtered context[{i}] shape: {filtered.shape} (from {context[i].shape})")
                             context = context_list
                         else:
-                            # No attention mask, just split batch
                             context = [context[i] for i in range(context.shape[0])]
-                            if not hasattr(self, '_debug_nofilter_printed'):
-                                self._debug_nofilter_printed = True
-                                print(f"WARNING: No attention mask - using full padded context!")
                     elif len(context.shape) == 2:  # [seq_len, features] - single item
                         context = [context]
                     else:
                         raise ValueError(f"Unexpected context shape: {context.shape}")
 
-                    if not hasattr(self, '_debug_final_context_printed'):
-                        self._debug_final_context_printed = True
-                        print(f"Final context: list of {len(context)} tensors, shapes: {[c.shape for c in context]}")
-                        print(f"====================================\n")
-
                 # Invert timestep: Forge uses sigma in [1->0] (noisy->clean)
                 # but Z-Image expects t in [0->1] (noisy->clean)
-                # The transformer then multiplies by t_scale=1000 internally
-                original_timestep = timestep
                 timestep = 1.0 - timestep
-                # Clamp to avoid exactly 0.0 which can cause numerical issues
                 timestep = torch.clamp(timestep, min=1e-6, max=1.0)
 
-                # DEBUG: Print transformed timestep on first call
-                if hasattr(self, '_debug_printed') and not hasattr(self, '_debug_timestep_printed'):
-                    self._debug_timestep_printed = True
-                    print(f"Transformed timestep: {original_timestep} -> {timestep}")
-                    print(f"(Official would use: (1000 - t)/1000 where t ≈ sigma*1000)")
-
-                # Ensure pad tokens are on the same device as input (fixes CPU/GPU mismatch when model is partially offloaded)
+                # Ensure pad tokens are on the same device as input
                 target_device = x[0].device
                 if hasattr(self.transformer, 'x_pad_token') and self.transformer.x_pad_token.device != target_device:
                     self.transformer.x_pad_token.data = self.transformer.x_pad_token.data.to(target_device)
                 if hasattr(self.transformer, 'cap_pad_token') and self.transformer.cap_pad_token.device != target_device:
                     self.transformer.cap_pad_token.data = self.transformer.cap_pad_token.data.to(target_device)
 
-                # Call transformer with correct format
-                # patch_size=2 and f_patch_size=1 are the only supported values per config
-                # Transformer returns (list_of_tensors, {}), extract the list
+                # Call transformer
                 result = self.transformer(x=x, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
                 output_list = result[0] if isinstance(result, tuple) else result
 
-                # Convert list of [C, F, H, W] tensors back to batched [B, C, F, H, W] tensor
-                # Then squeeze frame dimension to get [B, C, H, W]
+                # Convert list of [C, F, H, W] tensors back to batched tensor
                 if isinstance(output_list, list):
-                    output = torch.stack(output_list, dim=0)  # [B, C, F, H, W]
-                    output = output.squeeze(2)  # [B, C, H, W] - remove frame dimension
-
-                    # DEBUG: Check transformer output
-                    if hasattr(self, '_debug_printed') and not hasattr(self, '_debug_output_printed'):
-                        self._debug_output_printed = True
-                        print(f"\n=== Transformer Output Debug ===")
-                        print(f"Output shape: {output.shape}, dtype: {output.dtype}")
-                        print(f"Output stats: min={output.min().item():.4f}, max={output.max().item():.4f}, mean={output.mean().item():.4f}")
-                        print(f"Output has NaN: {torch.isnan(output).any().item()}")
-                        print(f"Output has Inf: {torch.isinf(output).any().item()}")
-                        print(f"=================================\n")
-
+                    output = torch.stack(output_list, dim=0).squeeze(2)
                     return -output
                 else:
                     return -output_list
+
+            def _forward_with_control(self, x, timestep, context=None, transformer_options=None, **kwargs):
+                """Forward path with ControlNet - matches VideoX-Fun behavior"""
+                import torch
+                from torch.nn.utils.rnn import pad_sequence
+
+                # Get control parameters from transformer_options
+                control_context = transformer_options.get('control_context')  # [B, C, F, H, W]
+                control_context_scale = transformer_options.get('control_context_scale', 1.0)
+
+                # Convert x to list format
+                if not isinstance(x, list):
+                    if len(x.shape) == 4:  # [B, C, H, W]
+                        x_5d = x.unsqueeze(2)  # [B, C, 1, H, W]
+                        x_list = list(x_5d.unbind(dim=0))  # List of [C, 1, H, W]
+                    else:
+                        raise ValueError(f"Unexpected input shape: {x.shape}")
+                else:
+                    x_list = x
+
+                # Convert context to list format
+                if context is not None and not isinstance(context, list):
+                    attention_mask = None
+                    if transformer_options is not None and 'attention_mask' in transformer_options:
+                        attention_mask = transformer_options['attention_mask']
+
+                    if len(context.shape) == 3:  # [batch, seq_len, features]
+                        if attention_mask is not None:
+                            context_list = []
+                            for i in range(context.shape[0]):
+                                filtered = context[i][attention_mask[i]]
+                                context_list.append(filtered)
+                            context = context_list
+                        else:
+                            context = [context[i] for i in range(context.shape[0])]
+                    elif len(context.shape) == 2:
+                        context = [context]
+                else:
+                    context = context if isinstance(context, list) else [context]
+
+                # Invert timestep
+                timestep = 1.0 - timestep
+                timestep = torch.clamp(timestep, min=1e-6, max=1.0)
+
+                # Ensure pad tokens are on the same device
+                target_device = x_list[0].device
+                if hasattr(self.transformer, 'x_pad_token') and self.transformer.x_pad_token.device != target_device:
+                    self.transformer.x_pad_token.data = self.transformer.x_pad_token.data.to(target_device)
+                if hasattr(self.transformer, 'cap_pad_token') and self.transformer.cap_pad_token.device != target_device:
+                    self.transformer.cap_pad_token.data = self.transformer.cap_pad_token.data.to(target_device)
+
+                # Also move control components if they exist
+                if hasattr(self.transformer, 'control_x_pad_token') and self.transformer.control_x_pad_token.device != target_device:
+                    self.transformer.control_x_pad_token.data = self.transformer.control_x_pad_token.data.to(target_device)
+
+                # Prepare control context as list
+                if control_context is not None:
+                    control_context = control_context.to(target_device)
+                    if control_context.dim() == 5:  # [B, C, F, H, W]
+                        control_context_list = list(control_context.unbind(0))  # List of [C, F, H, W]
+                    elif control_context.dim() == 4:  # [B, C, H, W]
+                        # Add frame dimension
+                        control_context = control_context.unsqueeze(2)  # [B, C, 1, H, W]
+                        control_context_list = list(control_context.unbind(0))
+                    else:
+                        control_context_list = [control_context]
+                else:
+                    control_context_list = None
+
+                # Check if transformer has control layers loaded
+                if not (hasattr(self.transformer, '_control_layers_loaded') and self.transformer._control_layers_loaded):
+                    print("WARNING: ControlNet active but control layers not loaded, falling back to normal forward")
+                    result = self.transformer(x=x_list, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
+                    output_list = result[0] if isinstance(result, tuple) else result
+                    if isinstance(output_list, list):
+                        output = torch.stack(output_list, dim=0).squeeze(2)
+                        return -output
+                    return -output_list
+
+                # === Control-enabled forward path ===
+                # This mirrors VideoX-Fun's ZImageControlTransformer2DModel.forward
+
+                patch_size = 2
+                f_patch_size = 1
+                bsz = len(x_list)
+                device = x_list[0].device
+
+                # Get timestep embedding
+                t_scaled = timestep * self.transformer.t_scale
+                t_emb = self.transformer.t_embedder(t_scaled)
+
+                # Patchify and embed
+                (
+                    x_patches,
+                    cap_feats,
+                    x_size,
+                    x_pos_ids,
+                    cap_pos_ids,
+                    x_inner_pad_mask,
+                    cap_inner_pad_mask,
+                ) = self.transformer.patchify_and_embed(x_list, context, patch_size, f_patch_size)
+
+                # Process x through embedder and refiner
+                SEQ_MULTI_OF = 32
+                x_item_seqlens = [len(_) for _ in x_patches]
+                x_max_item_seqlen = max(x_item_seqlens)
+
+                x_cat = torch.cat(x_patches, dim=0)
+                x_cat = self.transformer.all_x_embedder[f"{patch_size}-{f_patch_size}"](x_cat)
+
+                adaln_input = t_emb.type_as(x_cat)
+                x_cat[torch.cat(x_inner_pad_mask)] = self.transformer.x_pad_token
+                x_split = list(x_cat.split(x_item_seqlens, dim=0))
+                x_freqs_cis = list(self.transformer.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(x_item_seqlens, dim=0))
+
+                x_padded = pad_sequence(x_split, batch_first=True, padding_value=0.0)
+                x_freqs_cis_padded = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
+                x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+                for i, seq_len in enumerate(x_item_seqlens):
+                    x_attn_mask[i, :seq_len] = 1
+
+                # Noise refiner
+                for layer in self.transformer.noise_refiner:
+                    x_padded = layer(x_padded, x_attn_mask, x_freqs_cis_padded, adaln_input)
+
+                # Process caption features
+                cap_item_seqlens = [len(_) for _ in cap_feats]
+                cap_max_item_seqlen = max(cap_item_seqlens)
+
+                cap_cat = torch.cat(cap_feats, dim=0)
+                cap_cat = self.transformer.cap_embedder(cap_cat)
+                cap_cat[torch.cat(cap_inner_pad_mask)] = self.transformer.cap_pad_token
+                cap_split = list(cap_cat.split(cap_item_seqlens, dim=0))
+                cap_freqs_cis = list(self.transformer.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split(cap_item_seqlens, dim=0))
+
+                cap_padded = pad_sequence(cap_split, batch_first=True, padding_value=0.0)
+                cap_freqs_cis_padded = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
+                cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+                for i, seq_len in enumerate(cap_item_seqlens):
+                    cap_attn_mask[i, :seq_len] = 1
+
+                # Context refiner
+                for layer in self.transformer.context_refiner:
+                    cap_padded = layer(cap_padded, cap_attn_mask, cap_freqs_cis_padded)
+
+                # Unify x and caption
+                unified = []
+                unified_freqs_cis = []
+                for i in range(bsz):
+                    x_len = x_item_seqlens[i]
+                    cap_len = cap_item_seqlens[i]
+                    unified.append(torch.cat([x_padded[i][:x_len], cap_padded[i][:cap_len]]))
+                    unified_freqs_cis.append(torch.cat([x_freqs_cis_padded[i][:x_len], cap_freqs_cis_padded[i][:cap_len]]))
+
+                unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+                unified_max_item_seqlen = max(unified_item_seqlens)
+
+                unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+                unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
+                unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+                for i, seq_len in enumerate(unified_item_seqlens):
+                    unified_attn_mask[i, :seq_len] = 1
+
+                # Generate control hints
+                hints = None
+                if control_context_list is not None and hasattr(self.transformer, 'forward_control'):
+                    # Build kwargs exactly like VideoX-Fun
+                    kwargs_for_control = dict(
+                        attn_mask=unified_attn_mask,
+                        freqs_cis=unified_freqs_cis,
+                        adaln_input=adaln_input,
+                    )
+                    # Pass cap_padded (TENSOR, not list) - matches VideoX-Fun exactly
+                    hints = self.transformer.forward_control(
+                        unified, cap_padded, control_context_list, kwargs_for_control,
+                        t=t_emb, patch_size=patch_size, f_patch_size=f_patch_size
+                    )
+
+                # Forward through main layers with hints
+                for layer in self.transformer.layers:
+                    unified = layer(
+                        unified,
+                        attn_mask=unified_attn_mask,
+                        freqs_cis=unified_freqs_cis,
+                        adaln_input=adaln_input,
+                        hints=hints,
+                        context_scale=control_context_scale
+                    )
+
+                # Final layer
+                unified = self.transformer.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+                unified = list(unified.unbind(dim=0))
+                output_list = self.transformer.unpatchify(unified, x_size, patch_size, f_patch_size)
+
+                # Convert output to tensor
+                output = torch.stack(output_list, dim=0)  # [B, C, F, H, W]
+                output = output.squeeze(2)  # [B, C, H, W]
+
+                return -output
 
             def __getattr__(self, name):
                 # Pass through all other attributes to the underlying transformer

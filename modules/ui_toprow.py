@@ -32,6 +32,7 @@ class Toprow:
     negative_token_button = None
 
     ui_styles = None
+    expand_prompt_button = None
 
     submit_box = None
 
@@ -142,3 +143,12 @@ class Toprow:
     def create_styles_ui(self):
         self.ui_styles = ui_prompt_styles.UiPromptStyles(self.id_part, self.prompt, self.negative_prompt)
         self.ui_styles.setup_apply_button(self.apply_styles)
+
+        # Add expand prompt button below styles (Z-Image only feature)
+        with gr.Row(elem_id=f"{self.id_part}_expand_prompt_row"):
+            self.expand_prompt_button = gr.Button(
+                value="\U0001F4A1 Expand Prompt",  # 💡 lightbulb icon
+                elem_id=f"{self.id_part}_expand_prompt",
+                variant="secondary",
+                scale=1,
+            )

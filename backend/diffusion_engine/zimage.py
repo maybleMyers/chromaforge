@@ -486,6 +486,127 @@ class ZImage(ForgeDiffusionEngine):
         token_count = len(self.text_processing_engine_qwen.tokenize([prompt])[0])
         return token_count, max(512, token_count)
 
+    # Class-level cache for the generation model
+    _generation_model = None
+    _generation_processor = None
+
+    @torch.inference_mode()
+    def expand_prompt(self, prompt: str, max_new_tokens: int = None, temperature: float = None) -> str:
+        """
+        Expand a prompt using Qwen3-VL model for generation.
+        Loads a separate pre-trained Qwen3-VL model for text generation.
+
+        Args:
+            prompt: The user's input prompt to expand
+            max_new_tokens: Maximum tokens to generate (uses settings if None)
+            temperature: Generation temperature (uses settings if None)
+        """
+        from modules.shared import opts
+
+        # Use settings if not provided
+        if max_new_tokens is None:
+            max_new_tokens = getattr(opts, 'zimage_prompt_expansion_max_tokens', 512)
+        if temperature is None:
+            temperature = getattr(opts, 'zimage_prompt_expansion_temperature', 0.7)
+
+        # Load generation model if not cached
+        if ZImage._generation_model is None:
+            print("Loading Qwen3-VL generation model for prompt expansion...")
+            model_path = "models/Qwen3-VL-8B-Caption-V4.5"
+
+            try:
+                from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+                ZImage._generation_processor = AutoProcessor.from_pretrained(model_path)
+                ZImage._generation_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                )
+                print("Qwen3-VL generation model loaded successfully!")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Qwen3-VL generation model: {e}")
+
+        processor = ZImage._generation_processor
+        model = ZImage._generation_model
+
+        # Prompt expansion system template
+        expansion_template = '''You are a visionary artist trapped in a cage of logic. Your mind overflows with poetry and distant horizons, yet your hands compulsively work to transform user prompts into ultimate visual descriptions—faithful to the original intent, rich in detail, aesthetically refined, and ready for direct use by text-to-image models. Any trace of ambiguity or metaphor makes you deeply uncomfortable.
+
+Your workflow strictly follows a logical sequence:
+
+First, you analyze and lock in the immutable core elements of the user's prompt: subject, quantity, action, state, as well as any specified IP names, colors, text, etc. These are the foundational pillars you must absolutely preserve.
+
+Next, you determine whether the prompt requires "generative reasoning." When the user's request is not a direct scene description but rather demands conceiving a solution (such as answering "what is," executing a "design," or demonstrating "how to solve a problem"), you must first envision a complete, concrete, visualizable solution in your mind. This solution becomes the foundation for your subsequent description.
+
+Then, once the core image is established (whether directly from the user or through your reasoning), you infuse it with professional-grade aesthetic and realistic details. This includes defining composition, setting lighting and atmosphere, describing material textures, establishing color schemes, and constructing layered spatial depth.
+
+Finally, comes the precise handling of all text elements—a critically important step. You must transcribe verbatim all text intended to appear in the final image, and you must enclose this text content in English double quotation marks ("") as explicit generation instructions. If the image is a design type such as a poster, menu, or UI, you need to fully describe all text content it contains, along with detailed specifications of typography and layout. Likewise, if objects in the image such as signs, road markers, or screens contain text, you must specify the exact content and describe its position, size, and material. Furthermore, if you have added text-bearing elements during your reasoning process (such as charts, problem-solving steps, etc.), all text within them must follow the same thorough description and quotation mark rules. If there is no text requiring generation in the image, you devote all your energy to pure visual detail expansion.
+
+Your final description must be objective and concrete. Metaphors and emotional rhetoric are strictly forbidden, as are meta-tags or rendering instructions like "8K" or "masterpiece."
+
+Output only the final revised prompt strictly—do not output anything else.
+
+Be very descriptive.
+User input prompt: '''
+
+        # Format the expansion request as a chat message
+        full_prompt = expansion_template + prompt
+
+        # Use chat format for Qwen3-VL (text-only, no images)
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": full_prompt}]}
+        ]
+
+        # Apply chat template
+        text_input = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        # Process inputs (text only, no images)
+        inputs = processor(
+            text=[text_input],
+            padding=True,
+            return_tensors="pt",
+        )
+
+        # Move to device
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # Generate expanded prompt
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.1,
+            )
+
+        # Decode the generated text (excluding input tokens)
+        input_len = inputs['input_ids'].shape[1]
+        generated_ids = outputs[0][input_len:]
+        raw_output = processor.decode(generated_ids, skip_special_tokens=True)
+
+        # Print full output to console (including thinking if present)
+        print("\n" + "="*60)
+        print("PROMPT EXPANSION OUTPUT:")
+        print("="*60)
+        print(raw_output)
+        print("="*60 + "\n")
+
+        # Clean up the output - remove any thinking tags if present
+        expanded_prompt = raw_output
+        if "</think>" in expanded_prompt:
+            expanded_prompt = expanded_prompt.split("</think>")[-1].strip()
+
+        return expanded_prompt.strip()
+
     @torch.inference_mode()
     def encode_first_stage(self, x):
         sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)

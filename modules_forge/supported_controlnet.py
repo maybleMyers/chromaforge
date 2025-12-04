@@ -328,15 +328,13 @@ class ZImageControlNetPatcher(ControlModelPatcher):
 
     def _ensure_control_layers_loaded(self, sd_model, unet):
         """Load control weights into transformer if not already loaded"""
-        if self._control_loaded:
-            return
-
         try:
             # Get the wrapped transformer
             wrapped_model = unet.model.diffusion_model
             transformer = wrapped_model.transformer if hasattr(wrapped_model, 'transformer') else wrapped_model
 
-            # Check if already loaded
+            # Always check if the CURRENT transformer has control layers loaded
+            # (model may have been reloaded, creating a new transformer without control layers)
             if hasattr(transformer, '_control_layers_loaded') and transformer._control_layers_loaded:
                 self._control_loaded = True
                 return

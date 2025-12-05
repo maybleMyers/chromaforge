@@ -153,7 +153,7 @@ def interrogate_deepbooru(image):
     return gr.update() if prompt is None else prompt
 
 
-def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=None, is_negative=False):
+def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=None, is_negative=False, positive_prompt=None):
     """
     Expand the prompt using LLM capabilities.
 
@@ -163,17 +163,27 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         llm_model: The LLM model folder name to use (from models/LLM)
         system_prompt: Custom system prompt to use for expansion
         is_negative: Whether this is a negative prompt expansion
+        positive_prompt: The positive prompt (used as context for negative expansion)
     """
     import os
+    import time
 
     prompt_type = "negative" if is_negative else "positive"
+    start_time = time.time()
 
     try:
-        print(f"\n{'='*60}", flush=True)
-        print(f"PROMPT EXPANSION STARTED ({prompt_type.upper()})", flush=True)
-        print(f"{'='*60}", flush=True)
-        print(f"LLM Model: {llm_model}", flush=True)
-        print(f"Original prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}", flush=True)
+        print("\n" + "#"*70, flush=True)
+        print(f"#  {prompt_type.upper()} PROMPT EXPANSION REQUEST", flush=True)
+        print("#"*70, flush=True)
+        print(f"  Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        print(f"  LLM Model: {llm_model}", flush=True)
+        print(f"  Has image context: {image is not None}", flush=True)
+        print(f"  Has custom system prompt: {system_prompt is not None and len(system_prompt) > 0}", flush=True)
+        if is_negative and positive_prompt:
+            print(f"  Using positive prompt as context: Yes ({len(positive_prompt)} chars)", flush=True)
+        print(f"  Original prompt ({len(prompt)} chars):", flush=True)
+        print(f"    \"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\"", flush=True)
+        print("#"*70, flush=True)
 
         if not prompt or prompt.strip() == "":
             gr.Warning(f"Please enter a {prompt_type} prompt to expand.")
@@ -188,9 +198,8 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
 
         if not os.path.exists(model_path):
             gr.Warning(f"LLM model not found at: {model_path}")
+            print(f"ERROR: Model path does not exist: {model_path}", flush=True)
             return prompt
-
-        print(f"Using model path: {model_path}", flush=True)
 
         # Extract PIL image if provided (from ForgeCanvas or gr.Image)
         pil_image = None
@@ -204,7 +213,6 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
 
         if pil_image is not None:
             gr.Info(f"Expanding {prompt_type} prompt with image context... This may take a moment.")
-            print("Image context provided for expansion.", flush=True)
         else:
             gr.Info(f"Expanding {prompt_type} prompt... This may take a moment.")
 
@@ -213,14 +221,20 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
             prompt=prompt.strip(),
             model_path=model_path,
             system_prompt=system_prompt,
-            image=pil_image
+            image=pil_image,
+            is_negative=is_negative,
+            positive_prompt=positive_prompt.strip() if positive_prompt else None
         )
 
+        total_time = time.time() - start_time
+
         if expanded and expanded != prompt:
-            gr.Info(f"{prompt_type.capitalize()} prompt expanded successfully!")
-            print(f"\n{'='*60}", flush=True)
-            print(f"EXPANSION COMPLETE ({prompt_type.upper()})", flush=True)
-            print(f"{'='*60}\n", flush=True)
+            gr.Info(f"{prompt_type.capitalize()} prompt expanded successfully! ({total_time:.1f}s)")
+            print("\n" + "#"*70, flush=True)
+            print(f"#  {prompt_type.upper()} PROMPT EXPANSION SUCCESS", flush=True)
+            print("#"*70, flush=True)
+            print(f"  Total request time: {total_time:.2f}s", flush=True)
+            print("#"*70 + "\n", flush=True)
             return expanded
         else:
             gr.Warning("Prompt expansion returned empty result, keeping original.")
@@ -228,6 +242,13 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
 
     except Exception as e:
         import traceback
+        total_time = time.time() - start_time
+        print("\n" + "!"*70, flush=True)
+        print(f"!  {prompt_type.upper()} PROMPT EXPANSION FAILED", flush=True)
+        print("!"*70, flush=True)
+        print(f"  Error: {str(e)}", flush=True)
+        print(f"  Time elapsed: {total_time:.2f}s", flush=True)
+        print("!"*70, flush=True)
         traceback.print_exc()
         gr.Warning(f"Error during prompt expansion: {str(e)}")
         return prompt
@@ -241,7 +262,7 @@ _expansion_model_cache = {
 }
 
 
-def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = None, image=None):
+def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = None, image=None, is_negative: bool = False, positive_prompt: str = None):
     """
     Standalone prompt expansion using Qwen3-VL model.
 
@@ -250,21 +271,52 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         model_path: Path to the LLM model
         system_prompt: System prompt to use (with {prompt} placeholder)
         image: Optional PIL Image for context
+        is_negative: Whether this is a negative prompt expansion
+        positive_prompt: The positive prompt (used as context for negative expansion)
 
     Returns:
         Expanded prompt string
     """
     import torch
     import gc
+    import time
     from modules.shared import opts
 
     global _expansion_model_cache
+
+    # Track total time
+    total_start_time = time.time()
+
+    def log_step(message, start_time=None):
+        """Helper to log with timestamp and optional elapsed time."""
+        timestamp = time.strftime("%H:%M:%S")
+        if start_time is not None:
+            elapsed = time.time() - start_time
+            print(f"[{timestamp}] {message} ({elapsed:.2f}s)", flush=True)
+        else:
+            print(f"[{timestamp}] {message}", flush=True)
+
+    def get_gpu_memory():
+        """Get GPU memory usage if available."""
+        try:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        except:
+            pass
+        return None
+
+    prompt_type = "NEGATIVE" if is_negative else "POSITIVE"
+    print("\n" + "="*70, flush=True)
+    log_step(f"{prompt_type} PROMPT EXPANSION PIPELINE STARTED")
+    print("="*70, flush=True)
 
     # Get settings
     max_new_tokens = getattr(opts, 'zimage_prompt_expansion_max_tokens', 512)
     temperature = getattr(opts, 'zimage_prompt_expansion_temperature', 0.7)
 
-    print(f"Max tokens: {max_new_tokens}, Temperature: {temperature}", flush=True)
+    log_step(f"Settings: max_tokens={max_new_tokens}, temperature={temperature}")
 
     # Load model if not cached or different model requested
     if (_expansion_model_cache['model'] is None or
@@ -272,50 +324,78 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
 
         # Clear old model if exists
         if _expansion_model_cache['model'] is not None:
-            print("Unloading previous LLM model...", flush=True)
+            log_step("Unloading previous LLM model...")
+            unload_start = time.time()
             del _expansion_model_cache['model']
             del _expansion_model_cache['processor']
             _expansion_model_cache['model'] = None
             _expansion_model_cache['processor'] = None
             gc.collect()
             torch.cuda.empty_cache()
+            log_step("Previous model unloaded", unload_start)
 
-        print(f"Loading LLM model from: {model_path}", flush=True)
+        log_step(f"Loading LLM model: {model_path}")
+        load_start = time.time()
 
         try:
             from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
+            log_step("  Loading processor...")
+            processor_start = time.time()
             _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+            log_step("  Processor loaded", processor_start)
+
+            log_step("  Loading model weights (this may take a moment)...")
+            model_start = time.time()
             _expansion_model_cache['model'] = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
             )
             _expansion_model_cache['model_path'] = model_path
-            print("LLM model loaded successfully!", flush=True)
+            log_step("  Model weights loaded", model_start)
+
+            gpu_mem = get_gpu_memory()
+            if gpu_mem:
+                log_step(f"  {gpu_mem}")
+
+            log_step("LLM model ready", load_start)
         except Exception as e:
             raise RuntimeError(f"Failed to load LLM model: {e}")
+    else:
+        log_step("Using cached LLM model")
 
     processor = _expansion_model_cache['processor']
     model = _expansion_model_cache['model']
 
     # Build the full prompt with system instruction
-    if system_prompt:
-        # If system prompt contains {prompt} placeholder, use it
-        if '{prompt}' in system_prompt:
-            full_prompt = system_prompt.replace('{prompt}', prompt)
-        else:
-            # Otherwise append the user prompt
-            full_prompt = system_prompt + prompt
-    else:
-        # Use default - just the prompt itself
-        full_prompt = prompt
+    log_step("Preparing prompt...")
+    prep_start = time.time()
 
-    print(f"Full prompt length: {len(full_prompt)} chars", flush=True)
+    # For negative prompt expansion, inject positive prompt context if available
+    effective_prompt = prompt
+    if is_negative and positive_prompt:
+        log_step(f"  Injecting positive prompt context for negative expansion")
+        # Prepend context about what the image will contain
+        effective_prompt = f"The image being generated is: \"{positive_prompt}\"\n\nNow expand this negative prompt to exclude unwanted elements: {prompt}"
+
+    if system_prompt:
+        if '{prompt}' in system_prompt:
+            full_prompt = system_prompt.replace('{prompt}', effective_prompt)
+        else:
+            full_prompt = system_prompt + effective_prompt
+    else:
+        full_prompt = effective_prompt
+
+    log_step(f"  System prompt: {len(system_prompt) if system_prompt else 0} chars")
+    log_step(f"  User prompt: {len(prompt)} chars")
+    if is_negative and positive_prompt:
+        log_step(f"  Positive prompt context: {len(positive_prompt)} chars")
+    log_step(f"  Combined prompt: {len(full_prompt)} chars")
 
     # Build message content based on whether image is provided
     if image is not None:
-        print("Including image in prompt expansion...", flush=True)
+        log_step("  Including image context")
         content = [
             {"type": "image", "image": image},
             {"type": "text", "text": full_prompt}
@@ -326,13 +406,18 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
     messages = [{"role": "user", "content": content}]
 
     # Apply chat template
+    log_step("Applying chat template...")
+    template_start = time.time()
     text_input = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
+    log_step("Chat template applied", template_start)
 
-    # Process inputs
+    # Process/tokenize inputs
+    log_step("Tokenizing inputs...")
+    tokenize_start = time.time()
     if image is not None:
         inputs = processor(
             text=[text_input],
@@ -351,10 +436,15 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    print("Generating expanded prompt...", flush=True)
+    input_token_count = inputs['input_ids'].shape[1]
+    log_step(f"Tokenization complete: {input_token_count} input tokens", tokenize_start)
 
     # Generate expanded prompt
-    import torch
+    print("-"*70, flush=True)
+    log_step(f"GENERATING (max {max_new_tokens} tokens)...")
+    print("-"*70, flush=True)
+    generate_start = time.time()
+
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -366,30 +456,54 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             repetition_penalty=1.1,
         )
 
+    generate_time = time.time() - generate_start
+
     # Decode the generated text
+    log_step("Decoding output...")
+    decode_start = time.time()
     input_len = inputs['input_ids'].shape[1]
     generated_ids = outputs[0][input_len:]
+    output_token_count = len(generated_ids)
     raw_output = processor.decode(generated_ids, skip_special_tokens=True)
+    log_step(f"Decoding complete", decode_start)
 
-    # Print output to console
-    print(f"\n{'-'*60}", flush=True)
-    print("RAW EXPANSION OUTPUT:", flush=True)
-    print(f"{'-'*60}", flush=True)
+    # Calculate generation stats
+    tokens_per_second = output_token_count / generate_time if generate_time > 0 else 0
+
+    print("-"*70, flush=True)
+    log_step("GENERATION COMPLETE")
+    print("-"*70, flush=True)
+    log_step(f"  Output tokens: {output_token_count}")
+    log_step(f"  Generation time: {generate_time:.2f}s")
+    log_step(f"  Speed: {tokens_per_second:.2f} tokens/sec")
+
+    # Print raw output to console
+    print("\n" + "="*70, flush=True)
+    print("RAW LLM OUTPUT:", flush=True)
+    print("="*70, flush=True)
     print(raw_output, flush=True)
-    print(f"{'-'*60}", flush=True)
+    print("="*70, flush=True)
 
     # Clean up output - remove thinking tags if present
     expanded_prompt = raw_output
     if "</think>" in expanded_prompt:
+        log_step("Removing <think> tags from output...")
         expanded_prompt = expanded_prompt.split("</think>")[-1].strip()
 
-    print(f"\nCLEANED OUTPUT:", flush=True)
-    print(f"{'-'*60}", flush=True)
+    print("\n" + "="*70, flush=True)
+    print("FINAL EXPANDED PROMPT:", flush=True)
+    print("="*70, flush=True)
     print(expanded_prompt, flush=True)
-    print(f"{'-'*60}\n", flush=True)
+    print("="*70 + "\n", flush=True)
 
     # Unload model to free VRAM
-    print("Unloading LLM model to free VRAM...", flush=True)
+    log_step("Unloading LLM model to free VRAM...")
+    unload_start = time.time()
+
+    gpu_before = get_gpu_memory()
+    if gpu_before:
+        log_step(f"  Before unload: {gpu_before}")
+
     if _expansion_model_cache['model'] is not None:
         del _expansion_model_cache['model']
         _expansion_model_cache['model'] = None
@@ -400,7 +514,22 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
 
     gc.collect()
     torch.cuda.empty_cache()
-    print("LLM model unloaded.", flush=True)
+
+    gpu_after = get_gpu_memory()
+    if gpu_after:
+        log_step(f"  After unload: {gpu_after}")
+
+    log_step("LLM model unloaded", unload_start)
+
+    # Final summary
+    total_time = time.time() - total_start_time
+    print("\n" + "="*70, flush=True)
+    log_step("PROMPT EXPANSION PIPELINE COMPLETE")
+    print("="*70, flush=True)
+    log_step(f"  Total time: {total_time:.2f}s")
+    log_step(f"  Input: {len(prompt)} chars -> Output: {len(expanded_prompt)} chars")
+    log_step(f"  Expansion ratio: {len(expanded_prompt)/len(prompt):.1f}x")
+    print("="*70 + "\n", flush=True)
 
     return expanded_prompt.strip()
 
@@ -801,13 +930,14 @@ def create_ui():
                     gr.State(None),  # No image for txt2img positive
                     toprow.llm_model_dropdown,
                     toprow.positive_system_prompt,
-                    gr.State(False)  # is_negative=False
+                    gr.State(False),  # is_negative=False
+                    gr.State(None)  # positive_prompt (not needed for positive expansion)
                 ],
                 outputs=[toprow.prompt],
                 show_progress=True,
             )
 
-            # Expand Negative Prompt button
+            # Expand Negative Prompt button - uses positive prompt as context
             toprow.expand_negative_button.click(
                 fn=expand_prompt_with_llm,
                 inputs=[
@@ -815,7 +945,8 @@ def create_ui():
                     gr.State(None),  # No image for txt2img negative
                     toprow.llm_model_dropdown,
                     toprow.negative_system_prompt,
-                    gr.State(True)  # is_negative=True
+                    gr.State(True),  # is_negative=True
+                    toprow.prompt  # Pass positive prompt as context
                 ],
                 outputs=[toprow.negative_prompt],
                 show_progress=True,
@@ -1185,13 +1316,14 @@ def create_ui():
                     init_img.background,  # Image context from img2img
                     toprow.llm_model_dropdown,
                     toprow.positive_system_prompt,
-                    gr.State(False)  # is_negative=False
+                    gr.State(False),  # is_negative=False
+                    gr.State(None)  # positive_prompt (not needed for positive expansion)
                 ],
                 outputs=[toprow.prompt],
                 show_progress=True,
             )
 
-            # Expand Negative Prompt button - uses image from img2img
+            # Expand Negative Prompt button - uses image from img2img and positive prompt as context
             toprow.expand_negative_button.click(
                 fn=expand_prompt_with_llm,
                 inputs=[
@@ -1199,7 +1331,8 @@ def create_ui():
                     init_img.background,  # Image context from img2img
                     toprow.llm_model_dropdown,
                     toprow.negative_system_prompt,
-                    gr.State(True)  # is_negative=True
+                    gr.State(True),  # is_negative=True
+                    toprow.prompt  # Pass positive prompt as context
                 ],
                 outputs=[toprow.negative_prompt],
                 show_progress=True,

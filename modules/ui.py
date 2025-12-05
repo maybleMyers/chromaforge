@@ -334,7 +334,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         return None
 
     def detect_model_type(model_path):
-        """Detect whether model is standard VL or VL+MoE from config."""
+        """Detect whether model is VL, VL+MoE, or text-only from config."""
         config_path = os.path.join(model_path, "config.json")
         if os.path.exists(config_path):
             try:
@@ -345,11 +345,21 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
 
                 # Check for VL+MoE models (e.g., Qwen3VLMoeForConditionalGeneration)
                 if any("Moe" in arch or "MoE" in arch for arch in architectures):
-                    return "vl_moe"
-                if "moe" in model_type.lower():
-                    return "vl_moe"
+                    if "vl" in model_type.lower() or any("VL" in arch for arch in architectures):
+                        return "vl_moe"
 
-                # Default to standard VL
+                # Check for VL models (must have "vl" in model_type or architecture)
+                if "vl" in model_type.lower() or any("VL" in arch for arch in architectures):
+                    return "vl"
+
+                # Check for text-only causal LM models (Qwen3, Llama, etc.)
+                # These don't have VL in their architecture and are ForCausalLM
+                if any("CausalLM" in arch or "ForCausalLM" in arch for arch in architectures):
+                    return "text"
+                if model_type.lower() in ["qwen3", "qwen2", "llama", "mistral", "gemma", "phi"]:
+                    return "text"
+
+                # Default to VL for img2img support
                 return "vl"
             except Exception as e:
                 log_step(f"  Warning: Could not read config.json: {e}")
@@ -391,13 +401,6 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         log_step(f"  Detected model type: {detected_type}")
 
         try:
-            from transformers import AutoProcessor
-
-            log_step("  Loading processor...")
-            processor_start = time.time()
-            _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
-            log_step("  Processor loaded", processor_start)
-
             log_step("  Loading model weights (this may take a moment)...")
             model_start = time.time()
 
@@ -414,8 +417,29 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             max_memory = {device_index: max_gpu_memory, "cpu": "32GiB"}
             log_step(f"  GPU {device_index} has {total_vram:.1f}GB, allowing up to {max_gpu_memory}")
 
-            if detected_type == "vl_moe":
-                # Try loading VL+MoE model
+            if detected_type == "text":
+                # Text-only causal LM model (e.g., Qwen3-4B-Instruct, Llama, etc.)
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                log_step("  Loading tokenizer for text-only model...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoTokenizer.from_pretrained(model_path)
+                log_step("  Tokenizer loaded", processor_start)
+
+                log_step("  Using AutoModelForCausalLM")
+                _expansion_model_cache['model'] = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                    max_memory=max_memory,
+                )
+            elif detected_type == "vl_moe":
+                # VL+MoE model
+                from transformers import AutoProcessor
+                log_step("  Loading processor...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+                log_step("  Processor loaded", processor_start)
+
                 try:
                     from transformers import Qwen3VLMoeForConditionalGeneration
                     log_step("  Using Qwen3VLMoeForConditionalGeneration")
@@ -438,6 +462,12 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
                     )
             else:
                 # Standard VL model
+                from transformers import AutoProcessor
+                log_step("  Loading processor...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+                log_step("  Processor loaded", processor_start)
+
                 from transformers import Qwen3VLForConditionalGeneration
                 log_step("  Using Qwen3VLForConditionalGeneration")
                 _expansion_model_cache['model'] = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -491,25 +521,32 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         log_step(f"  Positive prompt context: {len(positive_prompt)} chars")
     log_step(f"  Total user message: {len(user_message_text)} chars")
 
-    # Build messages list with proper Qwen chat format
+    # Build messages list with proper chat format
     # Use system role for system prompt, user role for the actual expansion request
     messages = []
+    detected_type = _expansion_model_cache.get('model_type', 'vl')
 
     # Add system message if system prompt is provided
     if system_prompt and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt.strip()})
 
-    # Build user message content based on whether image is provided
-    if image is not None:
-        log_step("  Including image context")
-        user_content = [
-            {"type": "image", "image": image},
-            {"type": "text", "text": user_message_text}
-        ]
+    # Build user message content based on model type and whether image is provided
+    if detected_type == "text":
+        # Text-only models use simple string content
+        if image is not None:
+            log_step("  Warning: Image provided but text-only model cannot use it")
+        messages.append({"role": "user", "content": user_message_text})
     else:
-        user_content = [{"type": "text", "text": user_message_text}]
-
-    messages.append({"role": "user", "content": user_content})
+        # VL models use structured content with type/text/image
+        if image is not None:
+            log_step("  Including image context")
+            user_content = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": user_message_text}
+            ]
+        else:
+            user_content = [{"type": "text", "text": user_message_text}]
+        messages.append({"role": "user", "content": user_content})
 
     # Apply chat template
     log_step("Applying chat template...")
@@ -524,7 +561,15 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
     # Process/tokenize inputs
     log_step("Tokenizing inputs...")
     tokenize_start = time.time()
-    if image is not None:
+    if detected_type == "text":
+        # Text-only models: tokenizer returns input_ids directly
+        inputs = processor(
+            text_input,
+            padding=True,
+            return_tensors="pt",
+        )
+    elif image is not None:
+        # VL models with image
         inputs = processor(
             text=[text_input],
             images=[image],
@@ -532,6 +577,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             return_tensors="pt",
         )
     else:
+        # VL models without image
         inputs = processor(
             text=[text_input],
             padding=True,

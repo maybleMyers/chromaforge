@@ -438,16 +438,27 @@ def sampling_prepare(unet, x):
     is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
 
     if is_zimage and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
-        # Z-Image uses patch_size=2, so sequence length = (H/2) * (W/2)
-        image_seq_len = (H // 2) * (W // 2)
-        real_model.predictor.apply_mu_transform(
-            seq_len=image_seq_len,
-            base_seq_len=256,
-            max_seq_len=4096,
-            base_shift=0.5,
-            max_shift=1.15,
-        )
-        print(f"Z-Image: Updated mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+        from modules.shared import opts
+
+        # Check if user specified a manual shift value
+        manual_shift = getattr(opts, 'zimage_shift', 0.0)
+
+        if manual_shift > 0:
+            # Use manual shift value directly
+            real_model.predictor.apply_mu_transform(mu=manual_shift)
+            print(f"Z-Image: Using manual mu={manual_shift:.4f} for {H}x{W} latents")
+        else:
+            # Calculate dynamic shift based on resolution
+            # Z-Image uses patch_size=2, so sequence length = (H/2) * (W/2)
+            image_seq_len = (H // 2) * (W // 2)
+            real_model.predictor.apply_mu_transform(
+                seq_len=image_seq_len,
+                base_seq_len=256,
+                max_seq_len=4096,
+                base_shift=0.5,
+                max_shift=1.15,
+            )
+            print(f"Z-Image: Auto mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
 
     # Set up Z-Image CFG handlers
     if is_zimage:

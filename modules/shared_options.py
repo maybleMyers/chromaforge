@@ -201,6 +201,7 @@ options_templates.update(options_section(('sd3', "Stable Diffusion 3", "sd"), {
 options_templates.update(options_section(('zimage', "Z-Image", "sd"), {
     "zimage_prompt_expansion_max_tokens": OptionInfo(512, "Prompt expansion max tokens", gr.Slider, {"minimum": 128, "maximum": 1024, "step": 64}).info("maximum number of tokens to generate when expanding prompts"),
     "zimage_prompt_expansion_temperature": OptionInfo(0.7, "Prompt expansion temperature", gr.Slider, {"minimum": 0.1, "maximum": 1.5, "step": 0.1}).info("higher = more creative, lower = more focused"),
+    "zimage_shift": OptionInfo(0.0, "Time Shift (mu)", gr.Slider, {"minimum": 0.0, "maximum": 30.0, "step": 0.05}).info("0=auto (resolution-dependent, recommended); manual: 0.5-1.15 typical range; higher=more denoising in early steps"),
     "zimage_cfg_normalization": OptionInfo(0.0, "CFG Normalization", gr.Slider, {"minimum": 0.0, "maximum": 3.0, "step": 0.1}).info("rescale CFG result if norm exceeds this multiple of original; 0=disabled, 1.5-2.0 recommended; prevents over-saturation at high CFG"),
     "zimage_cfg_truncation": OptionInfo(1.0, "CFG Truncation", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}).info("disable CFG after this fraction of steps; 1.0=never truncate, 0.5=disable CFG for last 50% of steps; reduces artifacts"),
 }))

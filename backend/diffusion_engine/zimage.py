@@ -180,6 +180,10 @@ class ZImage(ForgeDiffusionEngine):
                 result = self.transformer(x=x, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
                 output_list = result[0] if isinstance(result, tuple) else result
 
+                # Handle Transformer2DModelOutput from diffusers
+                if hasattr(output_list, 'sample'):
+                    output_list = output_list.sample
+
                 # Convert list of [C, F, H, W] tensors back to batched tensor
                 if isinstance(output_list, list):
                     output = torch.stack(output_list, dim=0).squeeze(2)
@@ -260,6 +264,9 @@ class ZImage(ForgeDiffusionEngine):
                     print("WARNING: ControlNet active but control layers not loaded, falling back to normal forward")
                     result = self.transformer(x=x_list, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)
                     output_list = result[0] if isinstance(result, tuple) else result
+                    # Handle Transformer2DModelOutput from diffusers
+                    if hasattr(output_list, 'sample'):
+                        output_list = output_list.sample
                     if isinstance(output_list, list):
                         output = torch.stack(output_list, dim=0).squeeze(2)
                         return -output

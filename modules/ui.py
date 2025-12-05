@@ -168,11 +168,20 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
     """
     import os
     import time
+    import re
 
     prompt_type = "negative" if is_negative else "positive"
     start_time = time.time()
 
     try:
+        # Extract LoRA tags from prompt before expansion
+        # Pattern matches <lora:name:weight> and similar extra network tags
+        lora_pattern = re.compile(r"<lora:[^>]+>")
+        extracted_loras = lora_pattern.findall(prompt)
+        prompt_without_loras = lora_pattern.sub("", prompt).strip()
+        # Clean up any double spaces left behind
+        prompt_without_loras = re.sub(r'\s+', ' ', prompt_without_loras).strip()
+
         print("\n" + "#"*70, flush=True)
         print(f"#  {prompt_type.upper()} PROMPT EXPANSION REQUEST", flush=True)
         print("#"*70, flush=True)
@@ -183,12 +192,15 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         print(f"  Has user input: {user_input is not None and len(user_input.strip()) > 0 if user_input else False}", flush=True)
         if is_negative and positive_prompt:
             print(f"  Using positive prompt as context: Yes ({len(positive_prompt)} chars)", flush=True)
+        if extracted_loras:
+            print(f"  Extracted LoRAs: {extracted_loras}", flush=True)
+            print(f"  Prompt without LoRAs: \"{prompt_without_loras[:200]}{'...' if len(prompt_without_loras) > 200 else ''}\"", flush=True)
         print(f"  Original prompt ({len(prompt)} chars):", flush=True)
         print(f"    \"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\"", flush=True)
         print("#"*70, flush=True)
 
-        if not prompt or prompt.strip() == "":
-            gr.Warning(f"Please enter a {prompt_type} prompt to expand.")
+        if not prompt_without_loras or prompt_without_loras.strip() == "":
+            gr.Warning(f"Please enter a {prompt_type} prompt to expand (not just LoRA tags).")
             return prompt
 
         # Determine model path
@@ -218,9 +230,9 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         else:
             gr.Info(f"Expanding {prompt_type} prompt... This may take a moment.")
 
-        # Use the standalone expansion function
+        # Use the standalone expansion function (with LoRAs removed)
         expanded = expand_prompt_standalone(
-            prompt=prompt.strip(),
+            prompt=prompt_without_loras,
             model_path=model_path,
             system_prompt=system_prompt,
             image=pil_image,
@@ -231,12 +243,20 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
 
         total_time = time.time() - start_time
 
-        if expanded and expanded != prompt:
+        if expanded and expanded != prompt_without_loras:
+            # Append extracted LoRAs to the end of the expanded prompt
+            if extracted_loras:
+                loras_string = " ".join(extracted_loras)
+                expanded = f"{expanded} {loras_string}"
+                print(f"  Re-appended LoRAs: {loras_string}", flush=True)
+
             gr.Info(f"{prompt_type.capitalize()} prompt expanded successfully! ({total_time:.1f}s)")
             print("\n" + "#"*70, flush=True)
             print(f"#  {prompt_type.upper()} PROMPT EXPANSION SUCCESS", flush=True)
             print("#"*70, flush=True)
             print(f"  Total request time: {total_time:.2f}s", flush=True)
+            if extracted_loras:
+                print(f"  LoRAs preserved: {extracted_loras}", flush=True)
             print("#"*70 + "\n", flush=True)
             return expanded
         else:

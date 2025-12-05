@@ -276,14 +276,18 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     print(f'Warning: Could not read Z-Image text encoder precision setting: {e}')
 
             from transformers import Qwen3Config
+
+            # Load as Qwen3Model for text encoding (embeddings for diffusion)
             config = Qwen3Config.from_pretrained(config_path)
             cls = getattr(importlib.import_module('transformers'), cls_name)
             with modeling_utils.no_init_weights():
                 model = cls(config)
             model = model.to(dtype=text_encoder_dtype)
+
             # Strip 'model.' prefix from state_dict keys if present
             if any(k.startswith('model.') for k in state_dict.keys()):
                 state_dict = {k.replace('model.', '', 1): v for k, v in state_dict.items()}
+
             load_state_dict(model, state_dict, log_name=cls_name)
             return model
         if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel']:

@@ -198,6 +198,11 @@ options_templates.update(options_section(('sd3', "Stable Diffusion 3", "sd"), {
     "sd3_enable_t5": OptionInfo(False, "Enable T5").info("load T5 text encoder; increases VRAM use by a lot, potentially improving quality of generation; requires model reload to apply"),
 }))
 
+options_templates.update(options_section(('zimage', "Z-Image", "sd"), {
+    "zimage_prompt_expansion_max_tokens": OptionInfo(512, "Prompt expansion max tokens", gr.Slider, {"minimum": 128, "maximum": 1024, "step": 64}).info("maximum number of tokens to generate when expanding prompts"),
+    "zimage_prompt_expansion_temperature": OptionInfo(0.7, "Prompt expansion temperature", gr.Slider, {"minimum": 0.1, "maximum": 1.5, "step": 0.1}).info("higher = more creative, lower = more focused"),
+}))
+
 options_templates.update(options_section(('vae', "VAE", "sd"), {
     "sd_vae_explanation": OptionHTML("""
 <abbr title='Variational autoencoder'>VAE</abbr> is a neural network that transforms a standard <abbr title='red/green/blue'>RGB</abbr>

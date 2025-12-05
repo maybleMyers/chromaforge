@@ -347,10 +347,17 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
 
             log_step("  Loading model weights (this may take a moment)...")
             model_start = time.time()
+
+            # Get the device the main program is using to avoid loading on wrong GPU
+            from backend import memory_management
+            main_device = memory_management.get_torch_device()
+            device_index = main_device.index if hasattr(main_device, 'index') and main_device.index is not None else 0
+            log_step(f"  Target device: cuda:{device_index}")
+
             _expansion_model_cache['model'] = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
-                device_map="auto",
+                device_map={"": f"cuda:{device_index}"},
             )
             _expansion_model_cache['model_path'] = model_path
             log_step("  Model weights loaded", model_start)

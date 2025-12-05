@@ -28,17 +28,23 @@ Output only the final revised prompt strictly—do not output anything else.
 Be very descriptive.
 User input prompt: '''
 
-DEFAULT_NEGATIVE_SYSTEM_PROMPT = '''You are an expert at refining negative prompts for text-to-image models. Your task is to expand and enhance the user's negative prompt to more effectively exclude unwanted elements from the generated image.
+DEFAULT_NEGATIVE_SYSTEM_PROMPT = '''You are an expert at crafting negative prompts for text-to-image models. Your task is to expand and enhance the user's negative prompt to more effectively exclude unwanted elements from the generated image.
+
+You will be given:
+1. The POSITIVE prompt describing what the image SHOULD contain (for context)
+2. The NEGATIVE prompt describing what the user wants to AVOID
 
 Your workflow:
-1. Analyze the user's negative prompt to understand what they want to avoid
-2. Expand on those concepts with related undesirable elements
-3. Add technical quality issues that should be avoided (artifacts, distortions, etc.)
-4. Include common generation problems (extra limbs, deformed features, etc.)
-5. Keep the expansion focused and relevant to the original intent
+1. Analyze the positive prompt to understand what is being generated
+2. Analyze the negative prompt to understand what should be avoided
+3. Expand the negative prompt with elements that would harm THIS SPECIFIC image
+4. Add technical quality issues to avoid (artifacts, noise, blur, compression, watermarks)
+5. Include anatomical/structural problems relevant to the subject (extra limbs, deformed features, bad proportions)
+6. Add style-breaking elements that would clash with the intended aesthetic
+7. Keep the expansion focused and relevant - don't add negatives that conflict with the positive prompt
 
-Output only the expanded negative prompt—do not output anything else.
-User input negative prompt: '''
+Output only the expanded negative prompt—do not output anything else. Do not include any explanation or commentary.
+User input: '''
 
 
 def get_llm_models():

@@ -1,63 +1,26 @@
- Free GPU: 31520.56 MB, Model Require: 7672.25 MB, Previously Loaded: 0.00 MB, Inference Require: 3890.00 MB, Remaining: 19958.31 MB, All loaded to GPU.
-Moving model(s) has taken 1.50 seconds
-Z-Image: Updated mu for 384x384 latents (seq_len=36864, mu=6.6967)
-[Unload] Trying to free 27057.90 MB for cuda:0 with 0 models keep loaded ... Current free memory is 23664.54 MB ... Unload model JointTextEncoder Done.
-[Memory Management] Target: KModel, Free GPU: 31390.94 MB, Model Require: 11739.56 MB, Previously Loaded: 0.00 MB, Inference Require: 3890.00 MB, Remaining: 15761.38 MB, All loaded to GPU.
-Moving model(s) has taken 6.86 seconds
-  0%|                                                                                                                                             | 0/9 [00:00<?, ?it/s]
-=== KModel Debug (first call) ===
-Sigma (t) value: tensor([1.], device='cuda:0')
-Predictor type: PredictionFlux
-Predictor sigmas range: [0.074912, 1.000000]
+Create a detailed, photorealistic image of a realistic domestic cat actively installing RAM sticks into an open consumer-grade PC case with an extreme RAM configuration.
+Cat Subject Requirements:
 
-=== KModel c_crossattn Debug ===
-c_crossattn type: <class 'dict'>
-c_crossattn keys: dict_keys(['crossattn', 'attention_mask'])
-attention_mask shape: torch.Size([1, 512])
-  0%|                                                                                                                                             | 0/9 [00:11<?, ?it/s]
-Traceback (most recent call last):
-  File "/home/mayble/diffusion/chromaforge/modules_forge/main_thread.py", line 30, in work
-    self.result = self.func(*self.args, **self.kwargs)
-  File "/home/mayble/diffusion/chromaforge/modules/txt2img.py", line 131, in txt2img_function
-    processed = processing.process_images(p)
-  File "/home/mayble/diffusion/chromaforge/modules/processing.py", line 847, in process_images
-    res = process_images_inner(p)
-  File "/home/mayble/diffusion/chromaforge/modules/processing.py", line 1011, in process_images_inner
-    samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
-  File "/home/mayble/diffusion/chromaforge/modules/processing.py", line 1421, in sample
-    samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x))
-  File "/home/mayble/diffusion/chromaforge/modules/sd_samplers_kdiffusion.py", line 242, in sample
-    samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args=self.sampler_extra_args, disable=False, callback=self.callback_state, **extra_params_kwargs))
-  File "/home/mayble/diffusion/chromaforge/modules/sd_samplers_common.py", line 287, in launch_sampling
-    return func()
-  File "/home/mayble/diffusion/chromaforge/modules/sd_samplers_kdiffusion.py", line 242, in <lambda>
-    samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args=self.sampler_extra_args, disable=False, callback=self.callback_state, **extra_params_kwargs))
-  File "/home/mayble/diffusion/chromaforge/venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
-    return func(*args, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/k_diffusion/sampling.py", line 131, in sample_euler
-    denoised = model(x, sigma_hat * s_in, **extra_args)
-  File "/home/mayble/diffusion/chromaforge/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/modules/sd_samplers_cfg_denoiser.py", line 199, in forward
-    denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition)
-  File "/home/mayble/diffusion/chromaforge/backend/sampling/sampling_function.py", line 364, in sampling_function
-    denoised, cond_pred, uncond_pred = sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=True)
-  File "/home/mayble/diffusion/chromaforge/backend/sampling/sampling_function.py", line 305, in sampling_function_inner
-    cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
-  File "/home/mayble/diffusion/chromaforge/backend/sampling/sampling_function.py", line 275, in calc_cond_uncond_batch
-    output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
-  File "/home/mayble/diffusion/chromaforge/backend/modules/k_model.py", line 77, in apply_model
-    model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
-  File "/home/mayble/diffusion/chromaforge/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/backend/diffusion_engine/zimage.py", line 131, in forward
-    return self._forward_normal(x, timestep, context, transformer_options, **kwargs)
-  File "/home/mayble/diffusion/chromaforge/backend/diffusion_engine/zimage.py", line 188, in _forward_normal
-    return -output_list
-TypeError: bad operand type for unary -: 'Transformer2DModelOutput'
-bad operand type for unary -: 'Transformer2DModelOutput'
+Fully realistic tabby cat - standard quadrupedal feline anatomy
+Detailed fur textures with visible individual hairs and stripes
+Cat positioned on desk, both front paws carefully gripping a single RAM stick, placing it into a slot
+Focused, intent expression with ears slightly forward
+Natural cat proportions, sitting upright to reach the motherboard
 
+Computer & Hardware Requirements - CRITICAL:
+
+EXTREME RAM CONFIGURATION: Motherboard with 32 RAM slots arranged in a massive extended row spanning the entire top edge of the motherboard
+30 RGB RAM sticks already installed - creating a spectacular wall of illuminated memory modules in rainbow colors
+Only 2 empty slots remaining, cat installing stick #30
+The RAM sticks should be the visual focal point - an absurdly long row of colorful memory modules
+Large NVIDIA RTX 6090 graphics card with triple-fan design and illuminated "6090" branding
+Open mid-tower case with glass panel removed
+AIO liquid cooler, RGB fans, clean cable management
+
+Environment & Composition:
+
+Clean desk with anti-static mat
+RAM packaging boxes scattered nearby
+Soft lighting with RGB glow illuminating cat's fur
+
+Overall Style: Hyperrealistic photography, humorous tech enthusiast scene, emphasis on the ridiculous quantity of RAM sticks as the key visual element.

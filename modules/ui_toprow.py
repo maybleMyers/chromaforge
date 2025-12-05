@@ -8,6 +8,37 @@ import modules.images
 from modules.ui_components import ToolButton
 
 
+# List to store all Toprow instances for page-load refresh
+_all_toprows = []
+
+
+def get_all_prompt_components():
+    """Get all prompt expansion components from all toprows for page-load refresh."""
+    components = []
+    for toprow in _all_toprows:
+        if hasattr(toprow, 'positive_system_prompt') and toprow.positive_system_prompt is not None:
+            components.append((
+                toprow.positive_system_prompt,
+                toprow.negative_system_prompt,
+                toprow.user_prompt_input
+            ))
+    return components
+
+
+def refresh_all_prompts_on_load():
+    """Called on page load to refresh all prompt expansion components."""
+    saved = load_saved_system_prompts()
+    results = []
+    for toprow in _all_toprows:
+        if hasattr(toprow, 'positive_system_prompt') and toprow.positive_system_prompt is not None:
+            results.extend([
+                saved.get("positive", DEFAULT_POSITIVE_SYSTEM_PROMPT),
+                saved.get("negative", DEFAULT_NEGATIVE_SYSTEM_PROMPT),
+                saved.get("user_input", "")
+            ])
+    return results if results else None
+
+
 # Default system prompts for prompt expansion
 DEFAULT_POSITIVE_SYSTEM_PROMPT = '''You are a visionary artist trapped in a cage of logic. Your mind overflows with poetry and distant horizons, yet your hands compulsively work to transform user prompts into ultimate visual descriptions—faithful to the original intent, rich in detail, aesthetically refined, and ready for direct use by text-to-image models. Any trace of ambiguity or metaphor makes you deeply uncomfortable.
 
@@ -71,23 +102,31 @@ def load_saved_system_prompts():
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Ensure all keys exist
+                return {
+                    "positive": data.get("positive", DEFAULT_POSITIVE_SYSTEM_PROMPT),
+                    "negative": data.get("negative", DEFAULT_NEGATIVE_SYSTEM_PROMPT),
+                    "user_input": data.get("user_input", "")
+                }
         except:
             pass
     return {
         "positive": DEFAULT_POSITIVE_SYSTEM_PROMPT,
-        "negative": DEFAULT_NEGATIVE_SYSTEM_PROMPT
+        "negative": DEFAULT_NEGATIVE_SYSTEM_PROMPT,
+        "user_input": ""
     }
 
 
-def save_system_prompts(positive_prompt, negative_prompt):
+def save_system_prompts(positive_prompt, negative_prompt, user_input=""):
     """Save system prompts to file."""
     path = get_system_prompts_path()
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({
                 "positive": positive_prompt,
-                "negative": negative_prompt
+                "negative": negative_prompt,
+                "user_input": user_input
             }, f, indent=2)
         return "System prompts saved successfully!"
     except Exception as e:
@@ -129,6 +168,7 @@ class Toprow:
     expand_negative_button = None
     positive_system_prompt = None
     negative_system_prompt = None
+    user_prompt_input = None  # User input that appends to system prompt
     save_prompts_button = None
     refresh_llm_button = None
 
@@ -141,6 +181,9 @@ class Toprow:
         self.id_part = id_part
         self.is_img2img = is_img2img
         self.is_compact = is_compact
+
+        # Register this toprow for page-load refresh
+        _all_toprows.append(self)
 
         if not is_compact:
             with gr.Row(elem_id=f"{id_part}_toprow", variant="compact"):
@@ -233,6 +276,15 @@ class Toprow:
                     scale=1
                 )
 
+            # User Input Section - appends to system prompt with user: tag
+            self.user_prompt_input = gr.Textbox(
+                label="User Instructions (appended with <|user|> tag for Qwen models)",
+                value=saved_prompts.get("user_input", ""),
+                elem_id=f"{self.id_part}_user_prompt_input",
+                lines=2,
+                placeholder="Optional: Add custom instructions that will be appended as a user message..."
+            )
+
             # System Prompts Section
             with gr.Accordion("Custom System Prompts", open=False, elem_id=f"{self.id_part}_system_prompts_accordion"):
                 self.positive_system_prompt = gr.Textbox(
@@ -251,7 +303,7 @@ class Toprow:
                 )
                 with gr.Row():
                     self.save_prompts_button = gr.Button(
-                        value="\U0001F4BE Save System Prompts",  # 💾
+                        value="\U0001F4BE Save Prompts",  # 💾
                         elem_id=f"{self.id_part}_save_prompts",
                         variant="secondary"
                     )
@@ -261,26 +313,37 @@ class Toprow:
                         variant="secondary"
                     )
 
-            # Connect refresh button
+            # Helper function to refresh LLM models AND load saved prompts
+            def refresh_all():
+                """Refresh LLM models and load saved prompts from file."""
+                saved = load_saved_system_prompts()
+                return (
+                    gr.update(choices=get_llm_models()),
+                    saved.get("positive", DEFAULT_POSITIVE_SYSTEM_PROMPT),
+                    saved.get("negative", DEFAULT_NEGATIVE_SYSTEM_PROMPT),
+                    saved.get("user_input", "")
+                )
+
+            # Connect refresh button - refreshes LLM list AND reloads saved prompts
             self.refresh_llm_button.click(
-                fn=lambda: gr.update(choices=get_llm_models()),
-                outputs=[self.llm_model_dropdown]
+                fn=refresh_all,
+                outputs=[self.llm_model_dropdown, self.positive_system_prompt, self.negative_system_prompt, self.user_prompt_input]
             )
 
             # Connect save button
             self.save_prompts_button.click(
                 fn=save_system_prompts,
-                inputs=[self.positive_system_prompt, self.negative_system_prompt],
+                inputs=[self.positive_system_prompt, self.negative_system_prompt, self.user_prompt_input],
                 outputs=[]
             ).then(
-                fn=lambda: gr.Info("System prompts saved successfully!"),
+                fn=lambda: gr.Info("Prompts saved successfully!"),
                 outputs=[]
             )
 
             # Connect reset button
             reset_prompts_button.click(
-                fn=lambda: (DEFAULT_POSITIVE_SYSTEM_PROMPT, DEFAULT_NEGATIVE_SYSTEM_PROMPT),
-                outputs=[self.positive_system_prompt, self.negative_system_prompt]
+                fn=lambda: (DEFAULT_POSITIVE_SYSTEM_PROMPT, DEFAULT_NEGATIVE_SYSTEM_PROMPT, ""),
+                outputs=[self.positive_system_prompt, self.negative_system_prompt, self.user_prompt_input]
             )
 
     def create_submit_box(self):

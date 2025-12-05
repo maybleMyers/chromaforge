@@ -153,7 +153,7 @@ def interrogate_deepbooru(image):
     return gr.update() if prompt is None else prompt
 
 
-def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=None, is_negative=False, positive_prompt=None):
+def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=None, is_negative=False, positive_prompt=None, user_input=None):
     """
     Expand the prompt using LLM capabilities.
 
@@ -164,6 +164,7 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         system_prompt: Custom system prompt to use for expansion
         is_negative: Whether this is a negative prompt expansion
         positive_prompt: The positive prompt (used as context for negative expansion)
+        user_input: Optional user instruction to append with <|user|> tag
     """
     import os
     import time
@@ -179,6 +180,7 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         print(f"  LLM Model: {llm_model}", flush=True)
         print(f"  Has image context: {image is not None}", flush=True)
         print(f"  Has custom system prompt: {system_prompt is not None and len(system_prompt) > 0}", flush=True)
+        print(f"  Has user input: {user_input is not None and len(user_input.strip()) > 0 if user_input else False}", flush=True)
         if is_negative and positive_prompt:
             print(f"  Using positive prompt as context: Yes ({len(positive_prompt)} chars)", flush=True)
         print(f"  Original prompt ({len(prompt)} chars):", flush=True)
@@ -223,7 +225,8 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
             system_prompt=system_prompt,
             image=pil_image,
             is_negative=is_negative,
-            positive_prompt=positive_prompt.strip() if positive_prompt else None
+            positive_prompt=positive_prompt.strip() if positive_prompt else None,
+            user_input=user_input.strip() if user_input else None
         )
 
         total_time = time.time() - start_time
@@ -263,7 +266,7 @@ _expansion_model_cache = {
 }
 
 
-def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = None, image=None, is_negative: bool = False, positive_prompt: str = None):
+def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = None, image=None, is_negative: bool = False, positive_prompt: str = None, user_input: str = None):
     """
     Standalone prompt expansion using Qwen3-VL models (standard VL or VL+MoE).
 
@@ -274,6 +277,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         image: Optional PIL Image for context
         is_negative: Whether this is a negative prompt expansion
         positive_prompt: The positive prompt (used as context for negative expansion)
+        user_input: Optional user instruction to append as separate user message
 
     Returns:
         Expanded prompt string
@@ -440,7 +444,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
     processor = _expansion_model_cache['processor']
     model = _expansion_model_cache['model']
 
-    # Build the full prompt with system instruction
+    # Build the messages with proper Qwen chat format (system + user roles)
     log_step("Preparing prompt...")
     prep_start = time.time()
 
@@ -451,31 +455,41 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         # Prepend context about what the image will contain
         effective_prompt = f"The image being generated is: \"{positive_prompt}\"\n\nNow expand this negative prompt to exclude unwanted elements: {prompt}"
 
-    if system_prompt:
-        if '{prompt}' in system_prompt:
-            full_prompt = system_prompt.replace('{prompt}', effective_prompt)
-        else:
-            full_prompt = system_prompt + effective_prompt
-    else:
-        full_prompt = effective_prompt
+    # Build user message content - this is what the user wants to expand
+    # Combine the effective prompt with any additional user instructions
+    user_message_parts = [effective_prompt]
+    if user_input and user_input.strip():
+        log_step(f"  Adding user instructions: {len(user_input)} chars")
+        user_message_parts.append(f"\n\nAdditional instructions: {user_input}")
+
+    user_message_text = "".join(user_message_parts)
 
     log_step(f"  System prompt: {len(system_prompt) if system_prompt else 0} chars")
     log_step(f"  User prompt: {len(prompt)} chars")
+    log_step(f"  User input: {len(user_input) if user_input else 0} chars")
     if is_negative and positive_prompt:
         log_step(f"  Positive prompt context: {len(positive_prompt)} chars")
-    log_step(f"  Combined prompt: {len(full_prompt)} chars")
+    log_step(f"  Total user message: {len(user_message_text)} chars")
 
-    # Build message content based on whether image is provided
+    # Build messages list with proper Qwen chat format
+    # Use system role for system prompt, user role for the actual expansion request
+    messages = []
+
+    # Add system message if system prompt is provided
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+
+    # Build user message content based on whether image is provided
     if image is not None:
         log_step("  Including image context")
-        content = [
+        user_content = [
             {"type": "image", "image": image},
-            {"type": "text", "text": full_prompt}
+            {"type": "text", "text": user_message_text}
         ]
     else:
-        content = [{"type": "text", "text": full_prompt}]
+        user_content = [{"type": "text", "text": user_message_text}]
 
-    messages = [{"role": "user", "content": content}]
+    messages.append({"role": "user", "content": user_content})
 
     # Apply chat template
     log_step("Applying chat template...")
@@ -1021,7 +1035,8 @@ def create_ui():
                     toprow.llm_model_dropdown,
                     toprow.positive_system_prompt,
                     gr.State(False),  # is_negative=False
-                    gr.State(None)  # positive_prompt (not needed for positive expansion)
+                    gr.State(None),  # positive_prompt (not needed for positive expansion)
+                    toprow.user_prompt_input  # User input to append with <|user|> tag
                 ],
                 outputs=[toprow.prompt],
                 show_progress=True,
@@ -1036,7 +1051,8 @@ def create_ui():
                     toprow.llm_model_dropdown,
                     toprow.negative_system_prompt,
                     gr.State(True),  # is_negative=True
-                    toprow.prompt  # Pass positive prompt as context
+                    toprow.prompt,  # Pass positive prompt as context
+                    toprow.user_prompt_input  # User input to append with <|user|> tag
                 ],
                 outputs=[toprow.negative_prompt],
                 show_progress=True,
@@ -1409,7 +1425,8 @@ def create_ui():
                     toprow.llm_model_dropdown,
                     toprow.positive_system_prompt,
                     gr.State(False),  # is_negative=False
-                    gr.State(None)  # positive_prompt (not needed for positive expansion)
+                    gr.State(None),  # positive_prompt (not needed for positive expansion)
+                    toprow.user_prompt_input  # User input to append with <|user|> tag
                 ],
                 outputs=[toprow.prompt],
                 show_progress=True,
@@ -1424,7 +1441,8 @@ def create_ui():
                     toprow.llm_model_dropdown,
                     toprow.negative_system_prompt,
                     gr.State(True),  # is_negative=True
-                    toprow.prompt  # Pass positive prompt as context
+                    toprow.prompt,  # Pass positive prompt as context
+                    toprow.user_prompt_input  # User input to append with <|user|> tag
                 ],
                 outputs=[toprow.negative_prompt],
                 show_progress=True,
@@ -1564,6 +1582,17 @@ def create_ui():
         update_image_cfg_scale_visibility = lambda: gr.update(visible=False)
         settings.text_settings.change(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
         demo.load(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
+
+        # Load saved prompt expansion settings on page load
+        from modules.ui_toprow import get_all_prompt_components, refresh_all_prompts_on_load
+        prompt_components = get_all_prompt_components()
+        if prompt_components:
+            # Flatten the list of component tuples
+            all_outputs = []
+            for pos, neg, user in prompt_components:
+                all_outputs.extend([pos, neg, user])
+            if all_outputs:
+                demo.load(fn=refresh_all_prompts_on_load, inputs=[], outputs=all_outputs)
 
         modelmerger_ui.setup_ui(dummy_component=dummy_component, sd_model_checkpoint_component=main_entry.ui_checkpoint)
 

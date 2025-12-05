@@ -238,26 +238,32 @@ def sigmoid_offset_sigmas(n, sigma_min, sigma_max, inner_model, device):
 
 def zimage_scheduler(n, sigma_min, sigma_max, inner_model, device):
     """
-    Z-Image specific scheduler that uses the official FlowMatchEulerDiscreteScheduler
-    to generate sigmas that exactly match the official Z-Image pipeline.
+    Z-Image specific scheduler that uses dynamic resolution-dependent time shifting.
+
+    Z-Image was trained with Flux-style dynamic time shifting where the shift (mu)
+    is calculated based on image sequence length (resolution-dependent).
+
+    The mu value is updated per-generation in sampling_prepare() based on actual
+    latent dimensions. This scheduler uses the predictor's pre-computed sigmas
+    which reflect the correct shift for the current resolution.
     """
-    from diffusers import FlowMatchEulerDiscreteScheduler
+    # Use the predictor's sigmas which have been updated with the correct mu
+    # based on actual latent dimensions (done in sampling_prepare)
+    predictor_sigmas = inner_model.sigmas
 
-    # Create scheduler with Z-Image config (shift=3.0, no dynamic shifting)
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=1000,
-        shift=3.0,
-        use_dynamic_shifting=False,
-    )
+    # Sample n evenly spaced sigmas from the predictor's sigma schedule
+    # The predictor has sigmas from ~0 to ~1 (flow matching schedule)
+    indices = torch.linspace(0, len(predictor_sigmas) - 1, n + 1, device=device).long()
+    sigmas = predictor_sigmas[indices]
 
-    # Generate timesteps/sigmas for n steps
-    scheduler.set_timesteps(n, device=device)
+    # Reverse so we go from high (noisy) to low (clean)
+    sigmas = sigmas.flip(0)
 
-    # Get the sigmas (already includes terminal 0)
-    sigmas = scheduler.sigmas
+    # Get the mu value for logging (if available)
+    mu = getattr(inner_model, 'mu', None) or getattr(getattr(inner_model, 'predictor', None), 'mu', 'N/A')
 
-    print(f"Z-Image scheduler ({n} steps) from FlowMatchEulerDiscreteScheduler:")
-    print(f"  Sigmas: {sigmas.tolist()}")
+    print(f"Z-Image scheduler ({n} steps) with dynamic shift (mu={mu}):")
+    print(f"  Sigmas range: [{sigmas[0]:.4f}, ..., {sigmas[-1]:.4f}]")
 
     return sigmas.to(device)
 

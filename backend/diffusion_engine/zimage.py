@@ -6,7 +6,7 @@ from backend.patcher.vae import VAE
 from backend.patcher.unet import UnetPatcher
 from backend.text_processing.qwen_engine import QwenTextProcessingEngine
 from backend.args import dynamic_args
-from backend.modules.k_prediction import PredictionZImage
+from backend.modules.k_prediction import PredictionFlux
 from backend import memory_management
 
 # Import control components (lazy loaded when needed)
@@ -395,11 +395,18 @@ class ZImage(ForgeDiffusionEngine):
 
         wrapped_transformer = ZImageTransformerWrapper(components_dict['transformer'])
 
-        # Z-Image uses static shift=3.0 (from scheduler config)
-        # This matches the formula: sigmas = shift * t / (1 + (shift-1) * t)
-        k_predictor = PredictionZImage(
-            shift=3.0,
-            timesteps=1000
+        # Z-Image uses dynamic resolution-dependent shift (like Flux)
+        # The paper states: "we adopt the dynamic time shifting strategy as used in Flux"
+        # Shift (mu) is calculated based on image sequence length:
+        #   image_seq_len = (latent_h // 2) * (latent_w // 2)
+        #   mu = base_shift + (max_shift - base_shift) * (seq_len - base_seq_len) / (max_seq_len - base_seq_len)
+        # Default seq_len=4096 gives mu≈1.15 for large images, will be updated per-generation
+        k_predictor = PredictionFlux(
+            seq_len=4096,
+            base_seq_len=256,
+            max_seq_len=4096,
+            base_shift=0.5,
+            max_shift=1.15,
         )
 
         # Create config object for Z-Image identification (used by LoRA loader)

@@ -368,6 +368,24 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition):
 def sampling_prepare(unet, x):
     B, C, H, W = x.shape
 
+    # Update dynamic shift (mu) for Z-Image models based on latent resolution
+    # Z-Image uses Flux-style resolution-dependent time shifting
+    real_model = unet.model
+    if hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
+        # Check if this is a Z-Image model (has is_zimage config)
+        is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
+        if is_zimage:
+            # Z-Image uses patch_size=2, so sequence length = (H/2) * (W/2)
+            image_seq_len = (H // 2) * (W // 2)
+            real_model.predictor.apply_mu_transform(
+                seq_len=image_seq_len,
+                base_seq_len=256,
+                max_seq_len=4096,
+                base_shift=0.5,
+                max_shift=1.15,
+            )
+            print(f"Z-Image: Updated mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+
     memory_estimation_function = unet.model_options.get('memory_peak_estimation_modifier', unet.memory_required)
 
     unet_inference_memory = memory_estimation_function([B * 2, C, H, W])

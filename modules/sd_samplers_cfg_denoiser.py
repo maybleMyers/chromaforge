@@ -225,4 +225,10 @@ class CFGDenoiser(torch.nn.Module):
             eps = (x - denoised) / sigma[:, None, None, None]
             return eps
 
+        # Z-Image: Keep latents in FP32 during denoising for numerical stability
+        # This matches the official implementation which asserts latents.dtype == torch.float32
+        is_zimage = getattr(getattr(self.inner_model.inner_model.forge_objects.unet.model, 'config', None), 'is_zimage', False)
+        if is_zimage:
+            return denoised.to(device=original_x_device, dtype=torch.float32)
+
         return denoised.to(device=original_x_device, dtype=original_x_dtype)

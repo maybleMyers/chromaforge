@@ -141,6 +141,7 @@ class StableDiffusionProcessing:
     steps: int = 50
     cfg_scale: float = 7.0
     distilled_cfg_scale: float = 3.5
+    zimage_shift: float = 0.0
     width: int = 512
     height: int = 512
     restore_faces: bool = None

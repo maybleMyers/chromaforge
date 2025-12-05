@@ -139,7 +139,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
     def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
         unet_patcher = self.model_wrap.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x)
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, p=p)
 
         steps, t_enc = sd_samplers_common.setup_img2img_steps(p, steps)
 
@@ -199,7 +199,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
     def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
         unet_patcher = self.model_wrap.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x)
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, p=p)
 
         steps = steps or p.steps
 

@@ -429,7 +429,7 @@ def _zimage_cfg_normalization_post(args):
     return denoised
 
 
-def sampling_prepare(unet, x):
+def sampling_prepare(unet, x, p=None):
     B, C, H, W = x.shape
 
     # Update dynamic shift (mu) for Z-Image models based on latent resolution
@@ -438,10 +438,13 @@ def sampling_prepare(unet, x):
     is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
 
     if is_zimage and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
-        from modules.shared import opts
-
-        # Check if user specified a manual shift value
-        manual_shift = getattr(opts, 'zimage_shift', 0.0)
+        # Check if user specified a manual shift value (from UI slider via p, or settings fallback)
+        manual_shift = 0.0
+        if p is not None and hasattr(p, 'zimage_shift'):
+            manual_shift = p.zimage_shift
+        else:
+            from modules.shared import opts
+            manual_shift = getattr(opts, 'zimage_shift', 0.0)
 
         if manual_shift > 0:
             # Use manual shift value directly

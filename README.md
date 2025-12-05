@@ -6,6 +6,7 @@ This is a fork with the patch from https://github.com/croquelois/forgeChroma pre
 I am going to keep updating it with new features. Suggestions are welcome.  
 
 To use:  
+
 git clone https://github.com/maybleMyers/chromaforge  
 Download one of the t5xxl text encoder from https://huggingface.co/flux-safetensors/flux-safetensors/blob/main/t5xxl_fp16.safetensors and place in models/text_encoder.  
 Download the vae from https://huggingface.co/lodestones/Chroma/tree/main ae.safetenstors and put it in models/vae.  
@@ -24,12 +25,17 @@ forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work
 refer to screenshot for working settings.  
 
 there's a bunch of extra samplers/schedulers at these places:  
-https://github.com/DenOfEquity/webUI_ExtraSchedulers
+https://github.com/DenOfEquity/webUI_ExtraSchedulers  
 https://github.com/MisterChief95/sd-forge-extra-samplers
 
 ## To use the Z-Image model
 
-Download the files from here https://huggingface.co/maybleMyers/z-image. put the text encoder in the text encoder folder, vae in vae folder and transformer in the stable diffusion folder. Select z in the top by the ui. It might work with other safetensors I have not tested them.  
+Download the files from here https://huggingface.co/maybleMyers/z-image. put the text encoder in the text encoder folder, vae in vae folder and transformer in the stable diffusion folder. Select z in the top by the ui. It might work with other safetensors I have not tested them. 
+
+To use prompt expansion, download this model into the model directory:
+huggingface-cli download maybleMyers/z-image --include "Qwen3-VL-8B-Caption-V4.5/*" --local-dir . --local-dir-use-symlinks False  
+or here is the direct link: https://huggingface.co/maybleMyers/z-image/blob/main/Qwen3-VL-8B-Caption-V4.5  
+You can click prompt expansion in the txt2img and img2img tabs. Img2img will use the picture as well. It takes a while, on a 16GB gpu it takes about 5 minutes.  
 
 ## Radiance Model
 
@@ -41,6 +47,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+12/4/2025  
+    Support prompt expansion with the z-image model.  
 12/2/2025  
     Support the controlnet model. Put https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union/blob/main/Z-Image-Turbo-Fun-Controlnet-Union.safetensors in the controlnet folder in the models dir. And use in the controlnet extension.  Settings are touchy, needs some experimentation to get right.    
 11/29/2025  

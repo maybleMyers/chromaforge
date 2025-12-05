@@ -491,13 +491,14 @@ class ZImage(ForgeDiffusionEngine):
     _generation_processor = None
 
     @torch.inference_mode()
-    def expand_prompt(self, prompt: str, max_new_tokens: int = None, temperature: float = None) -> str:
+    def expand_prompt(self, prompt: str, image=None, max_new_tokens: int = None, temperature: float = None) -> str:
         """
         Expand a prompt using Qwen3-VL model for generation.
         Loads a separate pre-trained Qwen3-VL model for text generation.
 
         Args:
             prompt: The user's input prompt to expand
+            image: Optional PIL Image to use as context (from img2img)
             max_new_tokens: Maximum tokens to generate (uses settings if None)
             temperature: Generation temperature (uses settings if None)
         """
@@ -553,10 +554,18 @@ User input prompt: '''
         # Format the expansion request as a chat message
         full_prompt = expansion_template + prompt
 
-        # Use chat format for Qwen3-VL (text-only, no images)
-        messages = [
-            {"role": "user", "content": [{"type": "text", "text": full_prompt}]}
-        ]
+        # Build message content based on whether image is provided
+        if image is not None:
+            print("Using image context for prompt expansion...")
+            # Include image in the message for vision-language understanding
+            content = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": full_prompt}
+            ]
+        else:
+            content = [{"type": "text", "text": full_prompt}]
+
+        messages = [{"role": "user", "content": content}]
 
         # Apply chat template
         text_input = processor.apply_chat_template(
@@ -565,12 +574,20 @@ User input prompt: '''
             add_generation_prompt=True,
         )
 
-        # Process inputs (text only, no images)
-        inputs = processor(
-            text=[text_input],
-            padding=True,
-            return_tensors="pt",
-        )
+        # Process inputs (with or without image)
+        if image is not None:
+            inputs = processor(
+                text=[text_input],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
+            )
+        else:
+            inputs = processor(
+                text=[text_input],
+                padding=True,
+                return_tensors="pt",
+            )
 
         # Move to device
         device = next(model.parameters()).device
@@ -594,16 +611,35 @@ User input prompt: '''
         raw_output = processor.decode(generated_ids, skip_special_tokens=True)
 
         # Print full output to console (including thinking if present)
-        print("\n" + "="*60)
-        print("PROMPT EXPANSION OUTPUT:")
-        print("="*60)
-        print(raw_output)
-        print("="*60 + "\n")
+        print("\n" + "="*60, flush=True)
+        print("PROMPT EXPANSION OUTPUT:", flush=True)
+        print("="*60, flush=True)
+        print(raw_output, flush=True)
+        print("="*60, flush=True)
 
         # Clean up the output - remove any thinking tags if present
         expanded_prompt = raw_output
         if "</think>" in expanded_prompt:
             expanded_prompt = expanded_prompt.split("</think>")[-1].strip()
+
+        print("\nCLEANED PROMPT:", flush=True)
+        print("-"*60, flush=True)
+        print(expanded_prompt, flush=True)
+        print("="*60 + "\n", flush=True)
+
+        # Unload Qwen3-VL model to free VRAM for image generation
+        print("Unloading Qwen3-VL model to free VRAM...", flush=True)
+        if ZImage._generation_model is not None:
+            del ZImage._generation_model
+            ZImage._generation_model = None
+        if ZImage._generation_processor is not None:
+            del ZImage._generation_processor
+            ZImage._generation_processor = None
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Qwen3-VL model unloaded.", flush=True)
 
         return expanded_prompt.strip()
 

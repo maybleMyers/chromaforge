@@ -153,7 +153,7 @@ def interrogate_deepbooru(image):
     return gr.update() if prompt is None else prompt
 
 
-def expand_prompt_with_llm(prompt):
+def expand_prompt_with_llm(prompt, image=None):
     """Expand the prompt using the loaded model's LLM capabilities (Z-Image only)."""
     try:
         # Ensure model is loaded (forge loads models lazily)
@@ -161,33 +161,50 @@ def expand_prompt_with_llm(prompt):
 
         if model is None or isinstance(model, sd_models.FakeInitialModel):
             gr.Warning("No model loaded. Please select a Z-Image model first.")
-            return [prompt]
+            return prompt
 
         # Check if this is a Z-Image model with expand_prompt capability
         if not hasattr(model, 'expand_prompt'):
             model_type = type(model).__name__
             gr.Warning(f"Prompt expansion is only available for Z-Image models. Current model ({model_type}) does not support this feature.")
-            return [prompt]
+            return prompt
 
         if not prompt or prompt.strip() == "":
             gr.Warning("Please enter a prompt to expand.")
-            return [prompt]
+            return prompt
 
-        gr.Info("Expanding prompt using Qwen3... This may take a moment.")
-        expanded = model.expand_prompt(prompt.strip())
+        # Extract PIL image if provided (from ForgeCanvas or gr.Image)
+        pil_image = None
+        if image is not None:
+            if hasattr(image, 'convert'):
+                # Already a PIL Image
+                pil_image = image
+            elif isinstance(image, dict) and 'image' in image:
+                # ForgeCanvas format
+                pil_image = image.get('image')
+            elif isinstance(image, dict) and 'background' in image:
+                # ForgeCanvas background format
+                pil_image = image.get('background')
+
+        if pil_image is not None:
+            gr.Info("Expanding prompt using Qwen3-VL with image context... This may take a moment.")
+        else:
+            gr.Info("Expanding prompt using Qwen3-VL... This may take a moment.")
+
+        expanded = model.expand_prompt(prompt.strip(), image=pil_image)
 
         if expanded and expanded != prompt:
             gr.Info("Prompt expanded successfully!")
-            return [expanded]
+            return expanded
         else:
             gr.Warning("Prompt expansion returned empty result, keeping original.")
-            return [prompt]
+            return prompt
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         gr.Warning(f"Error during prompt expansion: {str(e)}")
-        return [prompt]
+        return prompt
 
 
 def connect_clear_prompt(button):
@@ -577,9 +594,9 @@ def create_ui():
             toprow.token_button.click(fn=wrap_queued_call(update_token_counter), inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
 
-            # Connect expand prompt button for Z-Image models
+            # Connect expand prompt button for Z-Image models (no performance wrapper - we don't want HTML in prompt)
             toprow.expand_prompt_button.click(
-                fn=wrap_gradio_gpu_call(expand_prompt_with_llm),
+                fn=expand_prompt_with_llm,
                 inputs=[toprow.prompt],
                 outputs=[toprow.prompt],
                 show_progress=True,
@@ -932,10 +949,10 @@ def create_ui():
             toprow.token_button.click(fn=update_token_counter, inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
 
-            # Connect expand prompt button for Z-Image models
+            # Connect expand prompt button for Z-Image models (with image from img2img, no performance wrapper)
             toprow.expand_prompt_button.click(
-                fn=wrap_gradio_gpu_call(expand_prompt_with_llm),
-                inputs=[toprow.prompt],
+                fn=expand_prompt_with_llm,
+                inputs=[toprow.prompt, init_img.background],
                 outputs=[toprow.prompt],
                 show_progress=True,
             )

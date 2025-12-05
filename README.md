@@ -37,6 +37,10 @@ huggingface-cli download maybleMyers/z-image --include "Qwen3-VL-8B-Caption-V4.5
 or here is the direct link: https://huggingface.co/maybleMyers/z-image/blob/main/Qwen3-VL-8B-Caption-V4.5  
 You can click prompt expansion in the txt2img and img2img tabs. Img2img will use the picture as well. It takes a while, on a 16GB gpu it takes about 5 minutes.  
 
+I have added support for these models as well:  
+https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct  
+https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct  
+
 ## Radiance Model
 
 Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  

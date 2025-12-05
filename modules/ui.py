@@ -153,48 +153,74 @@ def interrogate_deepbooru(image):
     return gr.update() if prompt is None else prompt
 
 
-def expand_prompt_with_llm(prompt, image=None):
-    """Expand the prompt using the loaded model's LLM capabilities (Z-Image only)."""
+def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=None, is_negative=False):
+    """
+    Expand the prompt using LLM capabilities.
+
+    Args:
+        prompt: The user's input prompt to expand
+        image: Optional PIL Image for context (from img2img)
+        llm_model: The LLM model folder name to use (from models/LLM)
+        system_prompt: Custom system prompt to use for expansion
+        is_negative: Whether this is a negative prompt expansion
+    """
+    import os
+
+    prompt_type = "negative" if is_negative else "positive"
+
     try:
-        # Ensure model is loaded (forge loads models lazily)
-        model, _ = sd_models.forge_model_reload()
-
-        if model is None or isinstance(model, sd_models.FakeInitialModel):
-            gr.Warning("No model loaded. Please select a Z-Image model first.")
-            return prompt
-
-        # Check if this is a Z-Image model with expand_prompt capability
-        if not hasattr(model, 'expand_prompt'):
-            model_type = type(model).__name__
-            gr.Warning(f"Prompt expansion is only available for Z-Image models. Current model ({model_type}) does not support this feature.")
-            return prompt
+        print(f"\n{'='*60}", flush=True)
+        print(f"PROMPT EXPANSION STARTED ({prompt_type.upper()})", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"LLM Model: {llm_model}", flush=True)
+        print(f"Original prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}", flush=True)
 
         if not prompt or prompt.strip() == "":
-            gr.Warning("Please enter a prompt to expand.")
+            gr.Warning(f"Please enter a {prompt_type} prompt to expand.")
             return prompt
+
+        # Determine model path
+        if llm_model and llm_model != "No LLM models found":
+            model_path = os.path.join("models", "LLM", llm_model)
+        else:
+            # Fallback to default model
+            model_path = "models/LLM/Qwen3-VL-8B-Caption-V4.5"
+
+        if not os.path.exists(model_path):
+            gr.Warning(f"LLM model not found at: {model_path}")
+            return prompt
+
+        print(f"Using model path: {model_path}", flush=True)
 
         # Extract PIL image if provided (from ForgeCanvas or gr.Image)
         pil_image = None
         if image is not None:
             if hasattr(image, 'convert'):
-                # Already a PIL Image
                 pil_image = image
             elif isinstance(image, dict) and 'image' in image:
-                # ForgeCanvas format
                 pil_image = image.get('image')
             elif isinstance(image, dict) and 'background' in image:
-                # ForgeCanvas background format
                 pil_image = image.get('background')
 
         if pil_image is not None:
-            gr.Info("Expanding prompt using Qwen3-VL with image context... This may take a moment.")
+            gr.Info(f"Expanding {prompt_type} prompt with image context... This may take a moment.")
+            print("Image context provided for expansion.", flush=True)
         else:
-            gr.Info("Expanding prompt using Qwen3-VL... This may take a moment.")
+            gr.Info(f"Expanding {prompt_type} prompt... This may take a moment.")
 
-        expanded = model.expand_prompt(prompt.strip(), image=pil_image)
+        # Use the standalone expansion function
+        expanded = expand_prompt_standalone(
+            prompt=prompt.strip(),
+            model_path=model_path,
+            system_prompt=system_prompt,
+            image=pil_image
+        )
 
         if expanded and expanded != prompt:
-            gr.Info("Prompt expanded successfully!")
+            gr.Info(f"{prompt_type.capitalize()} prompt expanded successfully!")
+            print(f"\n{'='*60}", flush=True)
+            print(f"EXPANSION COMPLETE ({prompt_type.upper()})", flush=True)
+            print(f"{'='*60}\n", flush=True)
             return expanded
         else:
             gr.Warning("Prompt expansion returned empty result, keeping original.")
@@ -205,6 +231,178 @@ def expand_prompt_with_llm(prompt, image=None):
         traceback.print_exc()
         gr.Warning(f"Error during prompt expansion: {str(e)}")
         return prompt
+
+
+# Global cache for LLM model to avoid reloading
+_expansion_model_cache = {
+    'model': None,
+    'processor': None,
+    'model_path': None
+}
+
+
+def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = None, image=None):
+    """
+    Standalone prompt expansion using Qwen3-VL model.
+
+    Args:
+        prompt: The user's input prompt to expand
+        model_path: Path to the LLM model
+        system_prompt: System prompt to use (with {prompt} placeholder)
+        image: Optional PIL Image for context
+
+    Returns:
+        Expanded prompt string
+    """
+    import torch
+    import gc
+    from modules.shared import opts
+
+    global _expansion_model_cache
+
+    # Get settings
+    max_new_tokens = getattr(opts, 'zimage_prompt_expansion_max_tokens', 512)
+    temperature = getattr(opts, 'zimage_prompt_expansion_temperature', 0.7)
+
+    print(f"Max tokens: {max_new_tokens}, Temperature: {temperature}", flush=True)
+
+    # Load model if not cached or different model requested
+    if (_expansion_model_cache['model'] is None or
+        _expansion_model_cache['model_path'] != model_path):
+
+        # Clear old model if exists
+        if _expansion_model_cache['model'] is not None:
+            print("Unloading previous LLM model...", flush=True)
+            del _expansion_model_cache['model']
+            del _expansion_model_cache['processor']
+            _expansion_model_cache['model'] = None
+            _expansion_model_cache['processor'] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        print(f"Loading LLM model from: {model_path}", flush=True)
+
+        try:
+            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+            _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+            _expansion_model_cache['model'] = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            _expansion_model_cache['model_path'] = model_path
+            print("LLM model loaded successfully!", flush=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load LLM model: {e}")
+
+    processor = _expansion_model_cache['processor']
+    model = _expansion_model_cache['model']
+
+    # Build the full prompt with system instruction
+    if system_prompt:
+        # If system prompt contains {prompt} placeholder, use it
+        if '{prompt}' in system_prompt:
+            full_prompt = system_prompt.replace('{prompt}', prompt)
+        else:
+            # Otherwise append the user prompt
+            full_prompt = system_prompt + prompt
+    else:
+        # Use default - just the prompt itself
+        full_prompt = prompt
+
+    print(f"Full prompt length: {len(full_prompt)} chars", flush=True)
+
+    # Build message content based on whether image is provided
+    if image is not None:
+        print("Including image in prompt expansion...", flush=True)
+        content = [
+            {"type": "image", "image": image},
+            {"type": "text", "text": full_prompt}
+        ]
+    else:
+        content = [{"type": "text", "text": full_prompt}]
+
+    messages = [{"role": "user", "content": content}]
+
+    # Apply chat template
+    text_input = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # Process inputs
+    if image is not None:
+        inputs = processor(
+            text=[text_input],
+            images=[image],
+            padding=True,
+            return_tensors="pt",
+        )
+    else:
+        inputs = processor(
+            text=[text_input],
+            padding=True,
+            return_tensors="pt",
+        )
+
+    # Move to device
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    print("Generating expanded prompt...", flush=True)
+
+    # Generate expanded prompt
+    import torch
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=0.9,
+            top_k=50,
+            repetition_penalty=1.1,
+        )
+
+    # Decode the generated text
+    input_len = inputs['input_ids'].shape[1]
+    generated_ids = outputs[0][input_len:]
+    raw_output = processor.decode(generated_ids, skip_special_tokens=True)
+
+    # Print output to console
+    print(f"\n{'-'*60}", flush=True)
+    print("RAW EXPANSION OUTPUT:", flush=True)
+    print(f"{'-'*60}", flush=True)
+    print(raw_output, flush=True)
+    print(f"{'-'*60}", flush=True)
+
+    # Clean up output - remove thinking tags if present
+    expanded_prompt = raw_output
+    if "</think>" in expanded_prompt:
+        expanded_prompt = expanded_prompt.split("</think>")[-1].strip()
+
+    print(f"\nCLEANED OUTPUT:", flush=True)
+    print(f"{'-'*60}", flush=True)
+    print(expanded_prompt, flush=True)
+    print(f"{'-'*60}\n", flush=True)
+
+    # Unload model to free VRAM
+    print("Unloading LLM model to free VRAM...", flush=True)
+    if _expansion_model_cache['model'] is not None:
+        del _expansion_model_cache['model']
+        _expansion_model_cache['model'] = None
+    if _expansion_model_cache['processor'] is not None:
+        del _expansion_model_cache['processor']
+        _expansion_model_cache['processor'] = None
+    _expansion_model_cache['model_path'] = None
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("LLM model unloaded.", flush=True)
+
+    return expanded_prompt.strip()
 
 
 def connect_clear_prompt(button):
@@ -594,7 +792,36 @@ def create_ui():
             toprow.token_button.click(fn=wrap_queued_call(update_token_counter), inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
 
-            # Connect expand prompt button for Z-Image models (no performance wrapper - we don't want HTML in prompt)
+            # Connect expand prompt buttons for Prompt Expansion accordion
+            # Expand Positive Prompt button
+            toprow.expand_positive_button.click(
+                fn=expand_prompt_with_llm,
+                inputs=[
+                    toprow.prompt,
+                    gr.State(None),  # No image for txt2img positive
+                    toprow.llm_model_dropdown,
+                    toprow.positive_system_prompt,
+                    gr.State(False)  # is_negative=False
+                ],
+                outputs=[toprow.prompt],
+                show_progress=True,
+            )
+
+            # Expand Negative Prompt button
+            toprow.expand_negative_button.click(
+                fn=expand_prompt_with_llm,
+                inputs=[
+                    toprow.negative_prompt,
+                    gr.State(None),  # No image for txt2img negative
+                    toprow.llm_model_dropdown,
+                    toprow.negative_system_prompt,
+                    gr.State(True)  # is_negative=True
+                ],
+                outputs=[toprow.negative_prompt],
+                show_progress=True,
+            )
+
+            # Legacy expand prompt button (hidden, but kept for backward compatibility)
             toprow.expand_prompt_button.click(
                 fn=expand_prompt_with_llm,
                 inputs=[toprow.prompt],
@@ -949,7 +1176,36 @@ def create_ui():
             toprow.token_button.click(fn=update_token_counter, inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
 
-            # Connect expand prompt button for Z-Image models (with image from img2img, no performance wrapper)
+            # Connect expand prompt buttons for Prompt Expansion accordion (img2img with image context)
+            # Expand Positive Prompt button - uses image from img2img
+            toprow.expand_positive_button.click(
+                fn=expand_prompt_with_llm,
+                inputs=[
+                    toprow.prompt,
+                    init_img.background,  # Image context from img2img
+                    toprow.llm_model_dropdown,
+                    toprow.positive_system_prompt,
+                    gr.State(False)  # is_negative=False
+                ],
+                outputs=[toprow.prompt],
+                show_progress=True,
+            )
+
+            # Expand Negative Prompt button - uses image from img2img
+            toprow.expand_negative_button.click(
+                fn=expand_prompt_with_llm,
+                inputs=[
+                    toprow.negative_prompt,
+                    init_img.background,  # Image context from img2img
+                    toprow.llm_model_dropdown,
+                    toprow.negative_system_prompt,
+                    gr.State(True)  # is_negative=True
+                ],
+                outputs=[toprow.negative_prompt],
+                show_progress=True,
+            )
+
+            # Legacy expand prompt button (hidden, but kept for backward compatibility)
             toprow.expand_prompt_button.click(
                 fn=expand_prompt_with_llm,
                 inputs=[toprow.prompt, init_img.background],

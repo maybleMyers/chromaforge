@@ -32,7 +32,7 @@ https://github.com/MisterChief95/sd-forge-extra-samplers
 
 Download the files from here https://huggingface.co/maybleMyers/z-image. put the text encoder in the text encoder folder, vae in vae folder and transformer in the stable diffusion folder. Select z in the top by the ui. It might work with other safetensors I have not tested them. 
 
-To use prompt expansion, download this model into the model directory:
+To use prompt expansion, download this model into the models/LLM directory:
 huggingface-cli download maybleMyers/z-image --include "Qwen3-VL-8B-Caption-V4.5/*" --local-dir . --local-dir-use-symlinks False  
 or here is the direct link: https://huggingface.co/maybleMyers/z-image/blob/main/Qwen3-VL-8B-Caption-V4.5  
 You can click prompt expansion in the txt2img and img2img tabs. Img2img will use the picture as well. It takes a while, on a 16GB gpu it takes about 5 minutes.  
@@ -47,6 +47,8 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+12/5/2025  
+    Better prompt expansion support, supports expanding negative as well.  
 12/4/2025  
     Support prompt expansion with the z-image model.  
 12/2/2025  

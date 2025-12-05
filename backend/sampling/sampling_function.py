@@ -365,26 +365,117 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition):
     return denoised, cond_pred, uncond_pred
 
 
+# ============================================================================
+# Z-Image CFG Handlers
+# ============================================================================
+
+def _zimage_cfg_truncation_modifier(model, cond, uncond, x, timestep, cond_scale, model_options, seed):
+    """
+    CFG Truncation for Z-Image: Disable CFG in later denoising steps.
+
+    This reduces artifacts that can appear when CFG is applied to nearly-clean images.
+    The cfg_truncation value determines when to stop using CFG:
+    - 1.0 = never truncate (use CFG for all steps)
+    - 0.5 = disable CFG for last 50% of steps
+    - 0.0 = never use CFG
+    """
+    cfg_truncation = model_options.get('zimage_cfg_truncation', 1.0)
+
+    if cfg_truncation >= 1.0:
+        return model, x, timestep, uncond, cond, cond_scale, model_options, seed
+
+    # For flow matching: sigma goes from ~1 (noisy) to ~0 (clean)
+    # We want to disable CFG when (1 - sigma) > cfg_truncation
+    # i.e., when sigma < (1 - cfg_truncation)
+    sigma_value = timestep[0].item() if hasattr(timestep, '__getitem__') else float(timestep)
+    threshold = 1.0 - cfg_truncation
+
+    if sigma_value < threshold:
+        # Disable CFG by setting scale to 1.0
+        cond_scale = 1.0
+
+    return model, x, timestep, uncond, cond, cond_scale, model_options, seed
+
+
+def _zimage_cfg_normalization_post(args):
+    """
+    CFG Normalization for Z-Image: Rescale CFG result to prevent over-saturation.
+
+    After applying CFG, the resulting prediction's norm can be much larger than
+    the original conditional prediction. This can cause over-saturation and artifacts,
+    especially at high CFG scales.
+
+    This function rescales the denoised result if its norm exceeds a threshold
+    (cfg_normalization * original_cond_norm).
+    """
+    cfg_normalization = args['model_options'].get('zimage_cfg_normalization', 0.0)
+
+    if cfg_normalization <= 0.0:
+        return args['denoised']
+
+    denoised = args['denoised']
+    cond_denoised = args['cond_denoised']
+
+    # Calculate norms for each item in the batch
+    for i in range(denoised.shape[0]):
+        cond_norm = torch.linalg.vector_norm(cond_denoised[i])
+        denoised_norm = torch.linalg.vector_norm(denoised[i])
+        max_norm = cond_norm * cfg_normalization
+
+        if denoised_norm > max_norm:
+            # Rescale to keep norm within bounds
+            denoised[i] = denoised[i] * (max_norm / denoised_norm)
+
+    return denoised
+
+
 def sampling_prepare(unet, x):
     B, C, H, W = x.shape
 
     # Update dynamic shift (mu) for Z-Image models based on latent resolution
     # Z-Image uses Flux-style resolution-dependent time shifting
     real_model = unet.model
-    if hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
-        # Check if this is a Z-Image model (has is_zimage config)
-        is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
-        if is_zimage:
-            # Z-Image uses patch_size=2, so sequence length = (H/2) * (W/2)
-            image_seq_len = (H // 2) * (W // 2)
-            real_model.predictor.apply_mu_transform(
-                seq_len=image_seq_len,
-                base_seq_len=256,
-                max_seq_len=4096,
-                base_shift=0.5,
-                max_shift=1.15,
-            )
-            print(f"Z-Image: Updated mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+    is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
+
+    if is_zimage and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
+        # Z-Image uses patch_size=2, so sequence length = (H/2) * (W/2)
+        image_seq_len = (H // 2) * (W // 2)
+        real_model.predictor.apply_mu_transform(
+            seq_len=image_seq_len,
+            base_seq_len=256,
+            max_seq_len=4096,
+            base_shift=0.5,
+            max_shift=1.15,
+        )
+        print(f"Z-Image: Updated mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+
+    # Set up Z-Image CFG handlers
+    if is_zimage:
+        from modules.shared import opts
+
+        # Get Z-Image CFG settings
+        cfg_normalization = getattr(opts, 'zimage_cfg_normalization', 0.0)
+        cfg_truncation = getattr(opts, 'zimage_cfg_truncation', 1.0)
+
+        # Store settings in model_options for handlers to access
+        unet.model_options['zimage_cfg_normalization'] = cfg_normalization
+        unet.model_options['zimage_cfg_truncation'] = cfg_truncation
+
+        # Register CFG truncation modifier (modifies cond_scale based on timestep)
+        if cfg_truncation < 1.0:
+            if 'conditioning_modifiers' not in unet.model_options:
+                unet.model_options['conditioning_modifiers'] = []
+            if _zimage_cfg_truncation_modifier not in unet.model_options['conditioning_modifiers']:
+                unet.model_options['conditioning_modifiers'].append(_zimage_cfg_truncation_modifier)
+            print(f"Z-Image: CFG truncation enabled (threshold={cfg_truncation})")
+
+        # Register CFG normalization post-processor
+        if cfg_normalization > 0.0:
+            if 'sampler_post_cfg_function' not in unet.model_options:
+                unet.model_options['sampler_post_cfg_function'] = []
+            if _zimage_cfg_normalization_post not in unet.model_options['sampler_post_cfg_function']:
+                unet.model_options['sampler_post_cfg_function'].append(_zimage_cfg_normalization_post)
+            print(f"Z-Image: CFG normalization enabled (factor={cfg_normalization})")
 
     memory_estimation_function = unet.model_options.get('memory_peak_estimation_modifier', unet.memory_required)
 

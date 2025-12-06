@@ -9,13 +9,300 @@ Key Mappings:
   LoRA: diffusion_model.layers.N.attention.to_q -> Model: layers.N.attention.to_q.weight
   LoRA: diffusion_model.layers.N.feed_forward.w1 -> Model: layers.N.feed_forward.w1.weight
   etc.
+
+This module provides two approaches for loading LoRAs:
+1. Patch-based (original): Creates patches for Forge's LoRA system
+2. Direct merge (new): Directly modifies model weights, better for multiple LoRAs
 """
 
 import torch
+from typing import Optional
 try:
     from safetensors.torch import load_file
 except ImportError:
     load_file = None
+
+
+class ZImageLoRAManager:
+    """
+    Manages direct LoRA merging for Z-Image models.
+
+    This approach directly modifies model weights instead of using patches,
+    which is more reliable for multiple LoRAs. It maintains a backup of
+    original weights for restoration.
+
+    Usage:
+        manager = ZImageLoRAManager(model)
+        manager.apply_loras([
+            ('lora1.safetensors', 0.8),
+            ('lora2.safetensors', 0.6),
+        ])
+        # Later, to switch LoRAs:
+        manager.clear_loras()
+        manager.apply_loras([...])
+    """
+
+    def __init__(self, model):
+        """
+        Initialize the LoRA manager.
+
+        Args:
+            model: The Z-Image model (ZImageTransformerWrapper or the underlying transformer)
+        """
+        self.model = model
+        self.weight_backup = {}  # {key: original_weight_tensor}
+        self.applied_loras = []  # [(filename, strength), ...]
+        self._model_state_keys = None
+
+    def _get_model_state_keys(self):
+        """Get and cache model state dict keys."""
+        if self._model_state_keys is None:
+            self._model_state_keys = set(self.model.state_dict().keys())
+        return self._model_state_keys
+
+    def _find_model_key(self, lora_base_key: str) -> Optional[str]:
+        """
+        Find the actual model key for a LoRA key, trying multiple prefixes.
+
+        Args:
+            lora_base_key: The base key from the LoRA file
+
+        Returns:
+            The actual model key, or None if not found
+        """
+        model_keys = self._get_model_state_keys()
+        model_key = lora_key_to_model_key(lora_base_key)
+
+        # Try multiple prefixes to find the key in the model
+        prefixes_to_try = [
+            '',  # Direct match
+            'diffusion_model.',  # Standard prefix
+            'diffusion_model.transformer.',  # Wrapped transformer
+            'transformer.',  # Just transformer prefix
+        ]
+
+        for prefix in prefixes_to_try:
+            candidate = prefix + model_key
+            if candidate in model_keys:
+                return candidate
+
+        return None
+
+    def _get_parameter(self, key: str) -> torch.nn.Parameter:
+        """Navigate to and return a parameter by its key path."""
+        parts = key.split('.')
+        target = self.model
+        for part in parts[:-1]:
+            if part.isdigit():
+                target = target[int(part)]
+            else:
+                target = getattr(target, part)
+        return getattr(target, parts[-1])
+
+    def _set_parameter(self, key: str, value: torch.Tensor):
+        """Set a parameter by its key path."""
+        parts = key.split('.')
+        target = self.model
+        for part in parts[:-1]:
+            if part.isdigit():
+                target = target[int(part)]
+            else:
+                target = getattr(target, part)
+
+        # Convert to parameter if needed
+        if not isinstance(value, torch.nn.Parameter):
+            value = torch.nn.Parameter(value, requires_grad=False)
+        setattr(target, parts[-1], value)
+
+    def _backup_weight(self, key: str):
+        """Backup a weight if not already backed up."""
+        if key not in self.weight_backup:
+            param = self._get_parameter(key)
+            # Store a copy on CPU to save GPU memory
+            self.weight_backup[key] = param.data.clone().cpu()
+
+    def clear_loras(self):
+        """
+        Remove all applied LoRAs by restoring original weights.
+        """
+        if not self.weight_backup:
+            return
+
+        print(f"[Z-Image LoRA] Restoring {len(self.weight_backup)} original weights")
+
+        for key, original_weight in self.weight_backup.items():
+            try:
+                param = self._get_parameter(key)
+                device = param.device
+                dtype = param.dtype
+                param.data.copy_(original_weight.to(device=device, dtype=dtype))
+            except Exception as e:
+                print(f"[Z-Image LoRA] Warning: Failed to restore {key}: {e}")
+
+        self.weight_backup.clear()
+        self.applied_loras.clear()
+        self._model_state_keys = None  # Clear cache in case model structure changed
+
+        print("[Z-Image LoRA] All LoRAs cleared, original weights restored")
+
+    def apply_loras(self, lora_configs: list[tuple[str, float]], computation_dtype=torch.float32) -> dict:
+        """
+        Apply multiple LoRAs directly to model weights.
+
+        This method first restores original weights (if any LoRAs were previously applied),
+        then applies all specified LoRAs in order.
+
+        Args:
+            lora_configs: List of (lora_path, strength) tuples
+            computation_dtype: Dtype for intermediate computations (default float32)
+
+        Returns:
+            Dict with statistics about the merge operation
+        """
+        # Clear any previously applied LoRAs first
+        if self.applied_loras:
+            self.clear_loras()
+
+        total_applied = 0
+        total_matched = 0
+        total_unmatched = 0
+
+        for lora_path, strength in lora_configs:
+            print(f"[Z-Image LoRA] Direct merge: {lora_path} (strength={strength})")
+
+            # Load LoRA state dict
+            if load_file is None:
+                raise ImportError("safetensors is required for LoRA loading")
+
+            try:
+                lora_state = load_file(lora_path)
+            except Exception as e:
+                print(f"[Z-Image LoRA] Failed to load {lora_path}: {e}")
+                continue
+
+            # Group LoRA keys by base key
+            lora_groups = {}
+            for key in lora_state.keys():
+                result = extract_lora_base_key(key)
+                if result:
+                    base_key, key_type = result
+                    if base_key not in lora_groups:
+                        lora_groups[base_key] = {}
+                    lora_groups[base_key][key_type] = lora_state[key]
+
+            matched = 0
+            applied = 0
+            unmatched_keys = []
+
+            for lora_base_key, lora_weights in lora_groups.items():
+                # Find the actual model key
+                model_key = self._find_model_key(lora_base_key)
+
+                if model_key is None:
+                    unmatched_keys.append(lora_base_key)
+                    continue
+
+                matched += 1
+
+                # Get LoRA components
+                lora_up = lora_weights.get('up')
+                lora_down = lora_weights.get('down')
+                alpha = lora_weights.get('alpha')
+
+                if lora_up is None or lora_down is None:
+                    continue
+
+                # Backup original weight before first modification
+                self._backup_weight(model_key)
+
+                # Get current parameter
+                param = self._get_parameter(model_key)
+                device = param.device
+                dtype = param.dtype
+
+                # Calculate scale: alpha / rank * strength
+                rank = lora_down.shape[0]
+                if alpha is not None:
+                    alpha_val = alpha.item() if isinstance(alpha, torch.Tensor) else alpha
+                    scale = (alpha_val / rank) * strength
+                else:
+                    scale = strength
+
+                # Move LoRA weights to computation device/dtype
+                lora_up = lora_up.to(device=device, dtype=computation_dtype)
+                lora_down = lora_down.to(device=device, dtype=computation_dtype)
+
+                # Compute delta: up @ down * scale
+                # Handle different tensor shapes (Linear vs Conv2d)
+                if len(lora_up.shape) == 4:
+                    # Conv2d: [out, rank, 1, 1] @ [rank, in, kh, kw]
+                    delta = torch.mm(
+                        lora_up.squeeze(3).squeeze(2),
+                        lora_down.squeeze(3).squeeze(2)
+                    ).unsqueeze(2).unsqueeze(3) * scale
+                else:
+                    # Linear: [out, rank] @ [rank, in]
+                    delta = (lora_up @ lora_down) * scale
+
+                # Apply delta to weight
+                with torch.no_grad():
+                    if param.shape == delta.shape:
+                        param.data.add_(delta.to(dtype=dtype))
+                        applied += 1
+                    else:
+                        print(f"[Z-Image LoRA] Shape mismatch for {model_key}: "
+                              f"param={param.shape}, delta={delta.shape}")
+
+            if unmatched_keys:
+                print(f"[Z-Image LoRA] {len(unmatched_keys)} unmatched keys in {lora_path}")
+                if len(unmatched_keys) <= 5:
+                    print(f"[Z-Image LoRA] Unmatched: {unmatched_keys}")
+
+            print(f"[Z-Image LoRA] Applied {applied}/{matched} layers from {lora_path}")
+
+            self.applied_loras.append((lora_path, strength))
+            total_applied += applied
+            total_matched += matched
+            total_unmatched += len(unmatched_keys)
+
+        return {
+            'applied': total_applied,
+            'matched': total_matched,
+            'unmatched': total_unmatched,
+            'loras_loaded': len(self.applied_loras),
+        }
+
+    def get_applied_loras(self) -> list[tuple[str, float]]:
+        """Return list of currently applied LoRAs."""
+        return self.applied_loras.copy()
+
+
+# Global manager instance per model (weak reference would be better but this is simpler)
+_lora_managers = {}
+
+
+def get_lora_manager(model) -> ZImageLoRAManager:
+    """
+    Get or create a LoRA manager for a model.
+
+    Args:
+        model: The Z-Image model
+
+    Returns:
+        ZImageLoRAManager instance for this model
+    """
+    model_id = id(model)
+    if model_id not in _lora_managers:
+        _lora_managers[model_id] = ZImageLoRAManager(model)
+    return _lora_managers[model_id]
+
+
+def clear_lora_manager(model):
+    """Remove the LoRA manager for a model (call when model is unloaded)."""
+    model_id = id(model)
+    if model_id in _lora_managers:
+        _lora_managers[model_id].clear_loras()
+        del _lora_managers[model_id]
 
 
 def lora_key_to_model_key(lora_key: str) -> str:

@@ -10,7 +10,7 @@ from backend.args import dynamic_args
 from modules import shared, sd_models, errors, scripts
 from backend.utils import load_torch_file
 from backend.patcher.lora import model_lora_keys_clip, model_lora_keys_unet, load_lora
-from backend.lora.zimage_lora import load_zimage_lora_patches
+from backend.lora.zimage_lora import load_zimage_lora_patches, get_lora_manager, clear_lora_manager
 
 
 def load_lora_for_models(model, clip, lora, strength_model, strength_clip, filename='default', online_mode=False):
@@ -85,6 +85,69 @@ def load_network(name, network_on_disk):
     return net
 
 
+def _is_zimage_model(model):
+    """Check if the model is a Z-Image model."""
+    if model is None:
+        return False
+    model_config = getattr(model.model, 'config', None)
+    if model_config is not None and getattr(model_config, 'is_zimage', False):
+        return True
+    model_flag = type(model.model).__name__
+    if 'ZImage' in model_flag:
+        return True
+    return False
+
+
+def _load_zimage_loras_direct(current_sd, compiled_lora_targets):
+    """
+    Load LoRAs for Z-Image models using direct weight merge.
+
+    This approach modifies model weights directly instead of using patches,
+    which is more reliable for multiple LoRAs.
+    """
+    model = current_sd.forge_objects.unet
+    clip = current_sd.forge_objects.clip
+
+    # Get or create LoRA manager for the model
+    lora_manager = get_lora_manager(model.model)
+
+    # Prepare LoRA configs for the transformer (UNet equivalent)
+    unet_lora_configs = []
+    clip_lora_configs = []
+
+    for filename, strength_model, strength_clip, online_mode in compiled_lora_targets:
+        if strength_model != 0:
+            unet_lora_configs.append((filename, strength_model))
+        if strength_clip != 0:
+            clip_lora_configs.append((filename, strength_clip))
+
+    # Apply LoRAs to transformer using direct merge
+    if unet_lora_configs:
+        print(f"[Z-Image LoRA] Using direct merge for {len(unet_lora_configs)} LoRA(s)")
+        stats = lora_manager.apply_loras(unet_lora_configs)
+        print(f"[Z-Image LoRA] Direct merge complete: {stats['applied']} layers modified, "
+              f"{stats['unmatched']} unmatched keys")
+
+    # Apply CLIP LoRAs using the standard patch system (works fine for single models)
+    if clip_lora_configs and clip is not None:
+        new_clip = clip.clone()
+        for filename, strength_clip in clip_lora_configs:
+            lora_sd = load_lora_state_dict(filename)
+            clip_keys = model_lora_keys_clip(clip.cond_stage_model)
+            lora_clip, lora_unmatch = load_lora(lora_sd, clip_keys)
+
+            if len(lora_clip) > 0:
+                loaded_keys = new_clip.add_patches(
+                    filename=filename,
+                    patches=lora_clip,
+                    strength_patch=strength_clip,
+                    online_mode=False  # Always use offline mode for CLIP
+                )
+                print(f"[Z-Image LoRA] Loaded CLIP LoRA from {filename} with {len(loaded_keys)} keys")
+
+        current_sd.forge_objects.clip = new_clip
+
+
 def load_networks(names, te_multipliers=None, unet_multipliers=None, dyn_dims=None):
     global lora_state_dict_cache
 
@@ -134,14 +197,33 @@ def load_networks(names, te_multipliers=None, unet_multipliers=None, dyn_dims=No
         return
 
     current_sd.current_lora_hash = compiled_lora_targets_hash
-    current_sd.forge_objects.unet = current_sd.forge_objects_original.unet
-    current_sd.forge_objects.clip = current_sd.forge_objects_original.clip
 
-    for filename, strength_model, strength_clip, online_mode in compiled_lora_targets:
-        lora_sd = load_lora_state_dict(filename)
-        current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(
-            current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip,
-            filename=filename, online_mode=online_mode)
+    # Check if this is a Z-Image model - use direct merge approach
+    is_zimage = _is_zimage_model(current_sd.forge_objects.unet)
+
+    if is_zimage:
+        # Z-Image: Use direct merge for transformer, standard patches for CLIP
+        print("[Z-Image LoRA] Using direct merge approach for multiple LoRA support")
+
+        # Clear any existing LoRA manager state
+        lora_manager = get_lora_manager(current_sd.forge_objects.unet.model)
+        lora_manager.clear_loras()
+
+        # Reset CLIP to original (we'll re-apply CLIP LoRAs)
+        current_sd.forge_objects.clip = current_sd.forge_objects_original.clip
+
+        # Apply LoRAs using direct merge
+        _load_zimage_loras_direct(current_sd, compiled_lora_targets)
+    else:
+        # Standard models: Use the original patch-based approach
+        current_sd.forge_objects.unet = current_sd.forge_objects_original.unet
+        current_sd.forge_objects.clip = current_sd.forge_objects_original.clip
+
+        for filename, strength_model, strength_clip, online_mode in compiled_lora_targets:
+            lora_sd = load_lora_state_dict(filename)
+            current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(
+                current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip,
+                filename=filename, online_mode=online_mode)
 
     current_sd.forge_objects_after_applying_lora = current_sd.forge_objects.shallow_copy()
     return

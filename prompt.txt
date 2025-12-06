@@ -1,1 +1,0 @@
-Examine the prompt expansion pipeline when using the z image tab of the gui launched with webui-user.bat. Currently we are getting the error in console.txt. The script needs to unload the models currently in vram before loading the llm for prompt expansion.

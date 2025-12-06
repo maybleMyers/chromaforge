@@ -394,14 +394,14 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             log_step("Previous model unloaded", unload_start)
 
         # Unload diffusion models from VRAM to make room for LLM
+        # Use emergency_memory_cleanup which forcibly clears all model references
         log_step("Unloading diffusion models from VRAM to make room for LLM...")
         unload_diffusion_start = time.time()
         try:
             from backend import memory_management
-            memory_management.unload_all_models()
-            memory_management.soft_empty_cache(force=True)
-            gc.collect()
-            torch.cuda.empty_cache()
+            # emergency_memory_cleanup forcibly clears shared.sd_model and all forge_objects
+            # This is necessary because unload_all_models() won't unload models with active references
+            memory_management.emergency_memory_cleanup()
             gpu_mem = get_gpu_memory()
             if gpu_mem:
                 log_step(f"  After diffusion unload: {gpu_mem}")

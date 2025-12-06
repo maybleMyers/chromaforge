@@ -393,6 +393,22 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             torch.cuda.empty_cache()
             log_step("Previous model unloaded", unload_start)
 
+        # Unload diffusion models from VRAM to make room for LLM
+        log_step("Unloading diffusion models from VRAM to make room for LLM...")
+        unload_diffusion_start = time.time()
+        try:
+            from backend import memory_management
+            memory_management.unload_all_models()
+            memory_management.soft_empty_cache(force=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+            gpu_mem = get_gpu_memory()
+            if gpu_mem:
+                log_step(f"  After diffusion unload: {gpu_mem}")
+            log_step("Diffusion models unloaded", unload_diffusion_start)
+        except Exception as e:
+            log_step(f"  Warning: Could not unload diffusion models: {e}")
+
         log_step(f"Loading LLM model: {model_path}")
         load_start = time.time()
 

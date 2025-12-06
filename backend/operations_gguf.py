@@ -37,9 +37,13 @@ class ParameterGGUF(torch.nn.Parameter):
         return super().__new__(cls, torch.tensor(tensor.data), requires_grad=requires_grad)
 
     def dequantize_as_pytorch_parameter(self):
-        if self.gguf_cls is not None:
+        if self.gguf_cls is not None and hasattr(self.gguf_cls, 'bake'):
             self.gguf_cls.bake(self)
-        return torch.nn.Parameter(dequantize_tensor(self), requires_grad=False)
+        dequantized = dequantize_tensor(self)
+        # Ensure it's a plain tensor before creating Parameter
+        if not isinstance(dequantized, torch.Tensor) or isinstance(dequantized, torch.nn.Parameter):
+            dequantized = dequantized.data.clone()
+        return torch.nn.Parameter(dequantized.clone().detach(), requires_grad=False)
 
     def copy_with_data(self, data):
         new = ParameterGGUF(data, no_init=True)
@@ -68,4 +72,23 @@ def dequantize_tensor(tensor):
     if gguf_cls is None:
         return tensor
 
-    return gguf_cls.dequantize_pytorch(tensor)
+    # Handle both old and new gguf library API
+    if hasattr(gguf_cls, 'dequantize_pytorch'):
+        result = gguf_cls.dequantize_pytorch(tensor)
+    else:
+        # New gguf library uses numpy-based dequantize
+        import numpy as np
+        # Get the raw data as numpy array
+        data_np = tensor.data.cpu().numpy()
+        # Dequantize using the gguf library
+        dequantized_np = gguf_cls.dequantize(data_np)
+        # Get the real shape and reshape
+        real_shape = tensor.real_shape if hasattr(tensor, 'real_shape') else tensor.shape
+        dequantized_np = dequantized_np.reshape(real_shape)
+        # Convert back to torch tensor
+        result = torch.from_numpy(dequantized_np.copy()).to(tensor.computation_dtype if hasattr(tensor, 'computation_dtype') else torch.float16)
+
+    # Ensure we return a plain tensor, not a ParameterGGUF subclass
+    if hasattr(result, 'gguf_cls'):
+        result = result.data.clone()
+    return result

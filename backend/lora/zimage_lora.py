@@ -126,18 +126,41 @@ class ZImageLoRAManager:
         Remove all applied LoRAs by restoring original weights.
         """
         if not self.weight_backup:
+            print("[Z-Image LoRA] clear_loras called but no backup exists")
             return
 
         print(f"[Z-Image LoRA] Restoring {len(self.weight_backup)} original weights")
 
+        # Debug: Sample a weight before and after restoration
+        sample_key = next(iter(self.weight_backup.keys()))
+        sample_backup = self.weight_backup[sample_key]
+        try:
+            param = self._get_parameter(sample_key)
+            print(f"[Z-Image LoRA DEBUG] Before restore - {sample_key}: mean={param.data.mean().item():.6f}, std={param.data.std().item():.6f}")
+            print(f"[Z-Image LoRA DEBUG] Backup values - mean={sample_backup.mean().item():.6f}, std={sample_backup.std().item():.6f}")
+        except Exception as e:
+            print(f"[Z-Image LoRA DEBUG] Error sampling before restore: {e}")
+
+        restored_count = 0
         for key, original_weight in self.weight_backup.items():
             try:
                 param = self._get_parameter(key)
                 device = param.device
                 dtype = param.dtype
+                # Restore with proper dtype conversion
                 param.data.copy_(original_weight.to(device=device, dtype=dtype))
+                restored_count += 1
             except Exception as e:
                 print(f"[Z-Image LoRA] Warning: Failed to restore {key}: {e}")
+
+        # Debug: Verify restoration
+        try:
+            param = self._get_parameter(sample_key)
+            print(f"[Z-Image LoRA DEBUG] After restore - {sample_key}: mean={param.data.mean().item():.6f}, std={param.data.std().item():.6f}")
+        except Exception as e:
+            print(f"[Z-Image LoRA DEBUG] Error sampling after restore: {e}")
+
+        print(f"[Z-Image LoRA] Successfully restored {restored_count}/{len(self.weight_backup)} weights")
 
         self.weight_backup.clear()
         self.applied_loras.clear()
@@ -167,7 +190,15 @@ class ZImageLoRAManager:
         total_matched = 0
         total_unmatched = 0
 
-        for lora_path, strength in lora_configs:
+        # Track first modified key for debugging
+        first_modified_key = None
+        first_modified_before = None
+
+        # Track which keys are modified by each LoRA
+        keys_modified_by_lora = {}
+        overlapping_keys = set()
+
+        for lora_idx, (lora_path, strength) in enumerate(lora_configs):
             print(f"[Z-Image LoRA] Direct merge: {lora_path} (strength={strength})")
 
             # Load LoRA state dict
@@ -247,7 +278,57 @@ class ZImageLoRAManager:
                 # Apply delta to weight
                 with torch.no_grad():
                     if param.shape == delta.shape:
-                        param.data.add_(delta.to(dtype=dtype))
+                        # Track overlapping keys
+                        if model_key in keys_modified_by_lora:
+                            overlapping_keys.add(model_key)
+                            # Log when same key is modified by second LoRA
+                            if len(overlapping_keys) == 1:  # First overlap detected
+                                current_val = (param.data.mean().item(), param.data.std().item())
+                                print(f"[Z-Image LoRA DEBUG] OVERLAP: {model_key} modified by LoRA {lora_idx+1}")
+                                print(f"[Z-Image LoRA DEBUG] Current (after LoRA1): mean={current_val[0]:.6f}, std={current_val[1]:.6f}")
+                                print(f"[Z-Image LoRA DEBUG] Adding delta: mean={delta.mean().item():.6f}, std={delta.std().item():.6f}")
+                        keys_modified_by_lora[model_key] = lora_idx
+
+                        # Debug: Track first modified key across all LoRAs
+                        if first_modified_key is None:
+                            first_modified_key = model_key
+                            first_modified_before = (param.data.mean().item(), param.data.std().item(),
+                                                     param.data.min().item(), param.data.max().item())
+                            print(f"[Z-Image LoRA DEBUG] First modified key: {model_key}")
+                            print(f"[Z-Image LoRA DEBUG] Before: mean={first_modified_before[0]:.6f}, "
+                                  f"std={first_modified_before[1]:.6f}, min={first_modified_before[2]:.6f}, "
+                                  f"max={first_modified_before[3]:.6f}")
+
+                        # Log delta statistics for first delta of each LoRA
+                        if applied == 0:
+                            print(f"[Z-Image LoRA DEBUG] Delta stats for {model_key}: "
+                                  f"mean={delta.mean().item():.6f}, std={delta.std().item():.6f}, "
+                                  f"min={delta.min().item():.6f}, max={delta.max().item():.6f}, "
+                                  f"scale={scale:.6f}, rank={rank}")
+                            if torch.isnan(delta).any() or torch.isinf(delta).any():
+                                print(f"[Z-Image LoRA DEBUG] ERROR: Delta contains NaN or Inf!")
+
+                        # IMPORTANT: Do the addition in float32 to avoid bfloat16 precision loss
+                        # bfloat16 has only 7 bits of mantissa, so small deltas get lost
+                        if applied == 0:
+                            # Debug: Show specific value before/after for first weight
+                            val_before = param.data[0, 0].item() if len(param.shape) >= 2 else param.data[0].item()
+                            print(f"[Z-Image LoRA DEBUG] dtype={dtype}, param device={param.device}")
+                            print(f"[Z-Image LoRA DEBUG] Single value before: {val_before:.10f}")
+
+                        if dtype == torch.bfloat16 or dtype == torch.float16:
+                            new_data = (param.data.float() + delta).to(dtype=dtype)
+                            param.data.copy_(new_data)
+                        else:
+                            param.data.add_(delta.to(dtype=dtype))
+
+                        if applied == 0:
+                            val_after = param.data[0, 0].item() if len(param.shape) >= 2 else param.data[0].item()
+                            delta_val = delta[0, 0].item() if len(delta.shape) >= 2 else delta[0].item()
+                            print(f"[Z-Image LoRA DEBUG] Delta value: {delta_val:.10f}")
+                            print(f"[Z-Image LoRA DEBUG] Single value after: {val_after:.10f}")
+                            print(f"[Z-Image LoRA DEBUG] Actual change: {val_after - val_before:.10f}")
+
                         applied += 1
                     else:
                         print(f"[Z-Image LoRA] Shape mismatch for {model_key}: "
@@ -264,6 +345,35 @@ class ZImageLoRAManager:
             total_applied += applied
             total_matched += matched
             total_unmatched += len(unmatched_keys)
+
+        # Debug: Check the first modified weight after all modifications
+        if first_modified_key:
+            try:
+                param = self._get_parameter(first_modified_key)
+                after = (param.data.mean().item(), param.data.std().item(),
+                         param.data.min().item(), param.data.max().item())
+                print(f"[Z-Image LoRA DEBUG] After all LoRAs - {first_modified_key}:")
+                print(f"[Z-Image LoRA DEBUG] After: mean={after[0]:.6f}, std={after[1]:.6f}, "
+                      f"min={after[2]:.6f}, max={after[3]:.6f}")
+
+                # Show the change
+                if first_modified_before:
+                    mean_diff = after[0] - first_modified_before[0]
+                    std_diff = after[1] - first_modified_before[1]
+                    print(f"[Z-Image LoRA DEBUG] Change: mean_diff={mean_diff:.6f}, std_diff={std_diff:.6f}")
+
+                # Check if values are reasonable
+                if abs(after[0]) > 100 or after[1] > 100:
+                    print(f"[Z-Image LoRA DEBUG] WARNING: Weight values seem abnormally large!")
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    print(f"[Z-Image LoRA DEBUG] ERROR: Weight contains NaN or Inf values!")
+            except Exception as e:
+                print(f"[Z-Image LoRA DEBUG] Error checking weight: {e}")
+
+        # Debug: Check backup status and overlaps
+        print(f"[Z-Image LoRA DEBUG] Backup contains {len(self.weight_backup)} weights")
+        print(f"[Z-Image LoRA DEBUG] Total unique keys modified: {len(keys_modified_by_lora)}")
+        print(f"[Z-Image LoRA DEBUG] Overlapping keys (modified by multiple LoRAs): {len(overlapping_keys)}")
 
         return {
             'applied': total_applied,
@@ -295,6 +405,81 @@ def get_lora_manager(model) -> ZImageLoRAManager:
     if model_id not in _lora_managers:
         _lora_managers[model_id] = ZImageLoRAManager(model)
     return _lora_managers[model_id]
+
+
+def verify_lora_weights(model, sample_key: str = None) -> dict:
+    """
+    Verify that LoRA modifications are still present on the model.
+    Call this during inference to ensure weights haven't been reset.
+
+    Args:
+        model: The model to verify
+        sample_key: Specific key to check (optional)
+
+    Returns:
+        Dict with verification results
+    """
+    model_id = id(model)
+    if model_id not in _lora_managers:
+        return {'status': 'no_manager', 'message': 'No LoRA manager found for this model'}
+
+    manager = _lora_managers[model_id]
+    if not manager.weight_backup:
+        return {'status': 'no_backup', 'message': 'No weight backup exists (no LoRAs applied?)'}
+
+    results = {
+        'status': 'ok',
+        'loras_applied': len(manager.applied_loras),
+        'weights_backed_up': len(manager.weight_backup),
+        'sample_checks': []
+    }
+
+    # Check a few sample weights
+    keys_to_check = list(manager.weight_backup.keys())[:3]
+    if sample_key and sample_key in manager.weight_backup:
+        keys_to_check = [sample_key] + [k for k in keys_to_check if k != sample_key][:2]
+
+    for key in keys_to_check:
+        try:
+            param = manager._get_parameter(key)
+            backup = manager.weight_backup[key]
+
+            # Move backup to same device for comparison
+            backup_on_device = backup.to(device=param.device)
+
+            current_mean = param.data.mean().item()
+            backup_mean = backup.mean().item()
+
+            # Check individual values (first few elements)
+            current_flat = param.data.flatten()[:5]
+            backup_flat = backup_on_device.flatten()[:5]
+
+            # Calculate actual difference
+            diff = (param.data.float() - backup_on_device.float()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            # Check if current weights differ from backup (meaning LoRAs are applied)
+            is_modified = max_diff > 1e-7
+
+            results['sample_checks'].append({
+                'key': key,
+                'current_mean': current_mean,
+                'backup_mean': backup_mean,
+                'max_diff': max_diff,
+                'mean_diff': mean_diff,
+                'current_sample': [v.item() for v in current_flat],
+                'backup_sample': [v.item() for v in backup_flat],
+                'is_modified': is_modified,
+                'device': str(param.device)
+            })
+        except Exception as e:
+            results['sample_checks'].append({
+                'key': key,
+                'error': str(e)
+            })
+
+    return results
 
 
 def clear_lora_manager(model):

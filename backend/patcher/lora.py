@@ -352,8 +352,14 @@ class LoraLoader:
     def refresh(self, lora_patches, offload_device=torch.device('cpu'), force_refresh=False):
         hashes = str(list(lora_patches.keys()))
 
+        # Debug: Show what refresh_loras is doing
+        print(f"[LoraLoader DEBUG] refresh called: hash={hashes[:50]}, loaded_hash={self.loaded_hash[:50]}, backup_size={len(self.backup)}")
+
         if hashes == self.loaded_hash and not force_refresh:
+            print(f"[LoraLoader DEBUG] Skipping refresh (hash matches)")
             return
+
+        print(f"[LoraLoader DEBUG] Proceeding with refresh, will restore {len(self.backup)} weights")
 
         # Merge Patches
 

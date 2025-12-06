@@ -4,6 +4,13 @@ from backend import memory_management, attention
 from backend.modules.k_prediction import k_prediction_from_diffusers_scheduler
 
 
+# Import verification function for LoRA debugging
+try:
+    from backend.lora.zimage_lora import verify_lora_weights
+except ImportError:
+    verify_lora_weights = None
+
+
 class KModel(torch.nn.Module):
     def __init__(self, model, diffusers_scheduler, k_predictor=None, config=None):
         super().__init__()
@@ -32,6 +39,28 @@ class KModel(torch.nn.Module):
             print(f"Sigma (t) value: {sigma}")
             print(f"Predictor type: {type(self.predictor).__name__}")
             print(f"Predictor sigmas range: [{self.predictor.sigma_min:.6f}, {self.predictor.sigma_max:.6f}]")
+
+            # Verify LoRA weights are still applied
+            if verify_lora_weights is not None:
+                lora_check = verify_lora_weights(self)
+                print(f"\n=== LoRA Verification at Inference ===")
+                print(f"Status: {lora_check.get('status')}")
+                if lora_check.get('status') == 'ok':
+                    print(f"LoRAs applied: {lora_check.get('loras_applied')}")
+                    print(f"Weights backed up: {lora_check.get('weights_backed_up')}")
+                    for check in lora_check.get('sample_checks', []):
+                        if 'error' in check:
+                            print(f"  {check['key']}: ERROR - {check['error']}")
+                        else:
+                            status = "MODIFIED" if check['is_modified'] else "UNCHANGED (weights reset!)"
+                            print(f"  {check['key'][:60]}...")
+                            print(f"    max_diff={check['max_diff']:.8f}, mean_diff={check['mean_diff']:.8f} [{status}]")
+                            print(f"    device={check['device']}")
+                            print(f"    current[0:5]: {[f'{v:.6f}' for v in check['current_sample']]}")
+                            print(f"    backup[0:5]:  {[f'{v:.6f}' for v in check['backup_sample']]}")
+                else:
+                    print(f"Message: {lora_check.get('message')}")
+                print(f"======================================\n")
             print(f"\n=== KModel c_crossattn Debug ===")
             print(f"c_crossattn type: {type(c_crossattn)}")
             if isinstance(c_crossattn, dict):

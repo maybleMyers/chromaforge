@@ -205,15 +205,53 @@ def load_networks(names, te_multipliers=None, unet_multipliers=None, dyn_dims=No
         # Z-Image: Use direct merge for transformer, standard patches for CLIP
         print("[Z-Image LoRA] Using direct merge approach for multiple LoRA support")
 
+        # Debug: Check model identity
+        model = current_sd.forge_objects.unet.model
+        print(f"[Z-Image LoRA DEBUG] Model id: {id(model)}, type: {type(model).__name__}")
+
         # Clear any existing LoRA manager state
-        lora_manager = get_lora_manager(current_sd.forge_objects.unet.model)
+        lora_manager = get_lora_manager(model)
+        print(f"[Z-Image LoRA DEBUG] Manager has {len(lora_manager.weight_backup)} backed up weights, "
+              f"{len(lora_manager.applied_loras)} applied LoRAs")
         lora_manager.clear_loras()
 
         # Reset CLIP to original (we'll re-apply CLIP LoRAs)
         current_sd.forge_objects.clip = current_sd.forge_objects_original.clip
 
+        # IMPORTANT: Clear the patcher's lora_patches to prevent interference with direct merge
+        # The patcher's refresh_loras() is called when loading to GPU - we don't want it doing anything
+        if hasattr(current_sd.forge_objects.unet, 'lora_patches'):
+            if current_sd.forge_objects.unet.lora_patches:
+                print(f"[Z-Image LoRA DEBUG] Clearing {len(current_sd.forge_objects.unet.lora_patches)} patches from patcher")
+            current_sd.forge_objects.unet.lora_patches = {}
+
+        # Also reset the lora_loader's state to prevent it from restoring/patching
+        if hasattr(current_sd.forge_objects.unet, 'lora_loader'):
+            loader = current_sd.forge_objects.unet.lora_loader
+            if loader.backup:
+                print(f"[Z-Image LoRA DEBUG] Clearing {len(loader.backup)} backups from lora_loader")
+                loader.backup = {}
+            loader.loaded_hash = str([])  # Reset hash so it doesn't skip refresh
+
         # Apply LoRAs using direct merge
         _load_zimage_loras_direct(current_sd, compiled_lora_targets)
+
+        # Final verification: sample a weight to confirm modification
+        try:
+            sample_key = list(lora_manager.weight_backup.keys())[0] if lora_manager.weight_backup else None
+            if sample_key:
+                param = lora_manager._get_parameter(sample_key)
+                backup = lora_manager.weight_backup[sample_key]
+                # Compare first 3 values
+                current_vals = param.data.flatten()[:3].tolist()
+                backup_vals = backup.flatten()[:3].tolist()
+                print(f"[Z-Image LoRA DEBUG] Final verification after direct merge:")
+                print(f"[Z-Image LoRA DEBUG] Sample key: {sample_key[:50]}...")
+                print(f"[Z-Image LoRA DEBUG] Current (with LoRA): {[f'{v:.8f}' for v in current_vals]}")
+                print(f"[Z-Image LoRA DEBUG] Backup (original):   {[f'{v:.8f}' for v in backup_vals]}")
+                print(f"[Z-Image LoRA DEBUG] Model device: {param.device}, patcher state: lora_patches={len(getattr(current_sd.forge_objects.unet, 'lora_patches', {}))}")
+        except Exception as e:
+            print(f"[Z-Image LoRA DEBUG] Verification error: {e}")
     else:
         # Standard models: Use the original patch-based approach
         current_sd.forge_objects.unet = current_sd.forge_objects_original.unet

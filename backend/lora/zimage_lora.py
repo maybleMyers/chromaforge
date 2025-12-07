@@ -182,6 +182,10 @@ class ZImageLoRAManager:
         Returns:
             Dict with statistics about the merge operation
         """
+        # Reset format detection flag for new LoRA loading session
+        global _logged_format_detection
+        _logged_format_detection = False
+
         # Clear any previously applied LoRAs first
         if self.applied_loras:
             self.clear_loras()
@@ -213,13 +217,23 @@ class ZImageLoRAManager:
 
             # Group LoRA keys by base key
             lora_groups = {}
+            sample_conversions = []  # Track first few conversions for debug
             for key in lora_state.keys():
                 result = extract_lora_base_key(key)
                 if result:
                     base_key, key_type = result
                     if base_key not in lora_groups:
                         lora_groups[base_key] = {}
+                        # Log first few conversions for debugging
+                        if len(sample_conversions) < 3 and key.startswith('lora_unet_'):
+                            sample_conversions.append((key.split('.')[0], base_key))
                     lora_groups[base_key][key_type] = lora_state[key]
+
+            # Show sample key conversions if this is sd-scripts format
+            if sample_conversions:
+                print(f"[Z-Image LoRA] Sample key conversions:")
+                for orig, converted in sample_conversions:
+                    print(f"  {orig} -> {converted}")
 
             matched = 0
             applied = 0
@@ -608,6 +622,81 @@ def load_zimage_lora_patches(lora_state: dict, model) -> tuple[dict, dict]:
     return patch_dict, remaining_dict
 
 
+def convert_sdscripts_key_to_dotted(key: str) -> str:
+    """
+    Convert sd-scripts/musubi-tuner format key to dot-separated format.
+
+    sd-scripts format uses underscores for the entire path:
+        lora_unet_layers_0_attention_to_q -> diffusion_model.layers.0.attention.to_q
+        lora_unet_layers_0_attention_to_out_0 -> diffusion_model.layers.0.attention.to_out.0
+        lora_unet_layers_0_feed_forward_w1 -> diffusion_model.layers.0.feed_forward.w1
+
+    This requires careful parsing because some module names contain underscores
+    (e.g., to_q, to_out, feed_forward) that should NOT be converted to dots.
+    """
+    import re
+
+    if not key.startswith('lora_unet_'):
+        return key
+
+    path = key[len('lora_unet_'):]
+
+    # Handle Z-Image transformer structure:
+    # layers.{N}.attention.{to_q|to_k|to_v|to_out.0|norm_q|norm_k}
+    # layers.{N}.feed_forward.{w1|w2|w3}
+
+    # Pattern for attention submodules
+    m = re.match(r'layers_(\d+)_attention_(.+)', path)
+    if m:
+        layer_idx = m.group(1)
+        submodule = m.group(2)
+        # Handle to_out_0 -> to_out.0 (ModuleList index)
+        submodule = re.sub(r'_(\d+)$', r'.\1', submodule)
+        return f'diffusion_model.layers.{layer_idx}.attention.{submodule}'
+
+    # Pattern for feed_forward submodules
+    m = re.match(r'layers_(\d+)_feed_forward_(.+)', path)
+    if m:
+        layer_idx = m.group(1)
+        submodule = m.group(2)
+        return f'diffusion_model.layers.{layer_idx}.feed_forward.{submodule}'
+
+    # Handle noise_refiner and context_refiner blocks
+    m = re.match(r'(noise_refiner|context_refiner)_(\d+)_attention_(.+)', path)
+    if m:
+        block_name = m.group(1)
+        block_idx = m.group(2)
+        submodule = m.group(3)
+        submodule = re.sub(r'_(\d+)$', r'.\1', submodule)
+        return f'diffusion_model.{block_name}.{block_idx}.attention.{submodule}'
+
+    m = re.match(r'(noise_refiner|context_refiner)_(\d+)_feed_forward_(.+)', path)
+    if m:
+        block_name = m.group(1)
+        block_idx = m.group(2)
+        submodule = m.group(3)
+        return f'diffusion_model.{block_name}.{block_idx}.feed_forward.{submodule}'
+
+    # Fallback: simple underscore-to-dot conversion
+    # Replace underscores before digits (handles layer indices)
+    path = re.sub(r'_(\d+)', r'.\1', path)
+    # Replace remaining underscores that are likely module separators
+    # But preserve underscores in known compound names
+    for compound in ['feed_forward', 'to_out', 'to_q', 'to_k', 'to_v', 'norm_q', 'norm_k',
+                     'noise_refiner', 'context_refiner', 'attention_norm1', 'attention_norm2',
+                     'ffn_norm1', 'ffn_norm2', 'adaLN_modulation']:
+        placeholder = compound.replace('_', '@@UNDERSCORE@@')
+        path = path.replace(compound, placeholder)
+    path = path.replace('_', '.')
+    path = path.replace('@@UNDERSCORE@@', '_')
+
+    return 'diffusion_model.' + path
+
+
+# Track if we've logged the format detection message
+_logged_format_detection = False
+
+
 def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
     """
     Extract the base key and type from a full LoRA key.
@@ -615,11 +704,36 @@ def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
     Returns (base_key, type) where type is 'up', 'down', or 'alpha'
     Returns None if not a valid LoRA key.
 
-    Supports two LoRA formats:
+    Supports multiple LoRA formats:
     - Kohya/WebUI format: .lora_up.weight, .lora_down.weight
     - PEFT/HuggingFace format: .lora_B.weight (up), .lora_A.weight (down)
+    - sd-scripts/musubi-tuner format: lora_unet_*
     """
-    # Kohya/WebUI format
+    global _logged_format_detection
+
+    # First, detect and convert sd-scripts format
+    # sd-scripts keys look like: lora_unet_layers_0_attention_to_q.lora_down.weight
+    if full_key.startswith('lora_unet_'):
+        if not _logged_format_detection:
+            print("[Z-Image LoRA] Detected sd-scripts/musubi-tuner LoRA format")
+            _logged_format_detection = True
+
+        # Extract the suffix (.lora_up.weight, .lora_down.weight, .alpha)
+        if '.lora_up.weight' in full_key:
+            base_part = full_key.split('.lora_up.weight')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'up'
+        elif '.lora_down.weight' in full_key:
+            base_part = full_key.split('.lora_down.weight')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'down'
+        elif '.alpha' in full_key:
+            base_part = full_key.split('.alpha')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'alpha'
+        return None
+
+    # Kohya/WebUI format (with dot-separated paths)
     if full_key.endswith('.lora_up.weight'):
         return full_key[:-len('.lora_up.weight')], 'up'
     elif full_key.endswith('.lora_down.weight'):

@@ -530,42 +530,91 @@ def clear_chat_handler():
     return []
 
 
+def batch_caption_handler(
+    folder_path: str,
+    prompt: str,
+    system_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    progress=gr.Progress(),
+):
+    """Process a folder of images and generate captions."""
+    if vlm_manager is None or vlm_manager.model is None:
+        return "Error: No model loaded. Please load a model first."
+
+    if not folder_path or not os.path.isdir(folder_path):
+        return f"Error: Invalid folder path: {folder_path}"
+
+    # Supported image extensions
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+
+    # Find all images in folder
+    image_files = []
+    for f in os.listdir(folder_path):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in image_extensions:
+            image_files.append(f)
+
+    if not image_files:
+        return f"No images found in {folder_path}"
+
+    results = []
+    total = len(image_files)
+
+    for i, filename in enumerate(image_files):
+        progress((i / total), desc=f"Processing {filename}...")
+
+        image_path = os.path.join(folder_path, filename)
+        try:
+            # Load image
+            img = Image.open(image_path).convert("RGB")
+
+            # Build messages
+            messages = []
+            if system_prompt.strip():
+                messages.append({"role": "system", "content": system_prompt})
+
+            content = [
+                {"type": "image", "image": img},
+                {"type": "text", "text": prompt},
+            ]
+            messages.append({"role": "user", "content": content})
+
+            # Generate caption
+            caption = vlm_manager.generate(
+                messages=messages,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+            )
+
+            # Save caption to .txt file
+            base_name = os.path.splitext(filename)[0]
+            txt_path = os.path.join(folder_path, f"{base_name}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(caption)
+
+            results.append(f"[OK] {filename} -> {base_name}.txt")
+
+        except Exception as e:
+            results.append(f"[ERROR] {filename}: {str(e)}")
+
+    progress(1.0, desc="Complete!")
+    return f"Processed {total} images:\n\n" + "\n".join(results)
+
+
 def create_ui():
     """Create the Gradio interface."""
     available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
 
-    with gr.Blocks(title="Chromaforge VLM Chat", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# Chromaforge VLM Chat")
-        gr.Markdown("Chat with Qwen Vision-Language models using images, videos, and text.")
-
-        with gr.Accordion("Setup Instructions", open=False):
-            gr.Markdown("""
-### How to Use
-
-1. **Download a model** to `models/LLM/` directory:
-   - Recommended: `Qwen3-VL-8B-Caption-V4.5` (good balance of quality and speed)
-   - Smaller: `Qwen3-VL-4B-Instruct` (faster, less VRAM)
-   - Larger: `Qwen3-VL-30B-A3B-Instruct` (best quality, requires more VRAM)
-
-2. **Load the model** using the Load Model button
-
-3. **Chat** with the model by typing messages and optionally uploading images or videos
-
-### Command Line Options
-
-- `--lowvram` - Enable low VRAM mode for GPUs with limited memory
-- `--port PORT` - Change the server port (default: 7862)
-- `--share` - Create a public Gradio link
-
-### Tips
-
-- Use the **System Prompt** to guide the model's behavior
-- Enable **Auto-unload** if you need to free VRAM after each response
-- For videos, adjust **Max Video Frames** to control how many frames are analyzed
-            """)
-
+    with gr.Blocks(title="Chromaforge VLM", theme=gr.themes.Soft()) as demo:
         with gr.Row():
-            # Left column - Settings
+            # Left column - Settings (shared across tabs)
             with gr.Column(scale=1):
                 gr.Markdown("### Model Settings")
 
@@ -671,39 +720,65 @@ def create_ui():
                     info="Unload model after each response (saves VRAM but slower)",
                 )
 
-            # Right column - Chat
+            # Right column - Tabs
             with gr.Column(scale=2):
-                gr.Markdown("### Chat")
-
-                chatbot = gr.Chatbot(
-                    label="Conversation",
-                    height=400,
-                    show_copy_button=True,
-                )
-
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        image_input = gr.Image(
-                            label="Upload Image (optional)",
-                            type="pil",
-                            height=150,
-                        )
-                    with gr.Column(scale=1):
-                        video_input = gr.Video(
-                            label="Upload Video (optional)",
-                            height=150,
+                with gr.Tabs():
+                    # Chat Tab
+                    with gr.TabItem("Chat"):
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=400,
+                            show_copy_button=True,
                         )
 
-                with gr.Row():
-                    msg_input = gr.Textbox(
-                        label="Message",
-                        placeholder="Type your message here...",
-                        lines=2,
-                        scale=4,
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1)
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                image_input = gr.Image(
+                                    label="Upload Image (optional)",
+                                    type="pil",
+                                    height=150,
+                                )
+                            with gr.Column(scale=1):
+                                video_input = gr.Video(
+                                    label="Upload Video (optional)",
+                                    height=150,
+                                )
 
-                clear_btn = gr.Button("Clear Chat")
+                        with gr.Row():
+                            msg_input = gr.Textbox(
+                                label="Message",
+                                placeholder="Type your message here...",
+                                lines=2,
+                                scale=4,
+                            )
+                            send_btn = gr.Button("Send", variant="primary", scale=1)
+
+                        clear_btn = gr.Button("Clear Chat")
+
+                    # Batch Caption Tab
+                    with gr.TabItem("Batch Caption"):
+                        gr.Markdown("Generate captions for all images in a folder. Outputs .txt files with matching names.")
+
+                        batch_folder = gr.Textbox(
+                            label="Folder Path",
+                            placeholder="Enter the full path to folder containing images...",
+                            lines=1,
+                        )
+
+                        batch_prompt = gr.Textbox(
+                            label="Caption Prompt",
+                            placeholder="Describe this image in detail.",
+                            lines=2,
+                            value="Describe this image in detail.",
+                        )
+
+                        batch_start_btn = gr.Button("Start Batch Captioning", variant="primary")
+
+                        batch_output = gr.Textbox(
+                            label="Output",
+                            lines=15,
+                            interactive=False,
+                        )
 
         # Event handlers
         def refresh_models():
@@ -768,6 +843,15 @@ def create_ui():
         clear_btn.click(
             fn=clear_chat_handler,
             outputs=[chatbot],
+        )
+
+        batch_start_btn.click(
+            fn=batch_caption_handler,
+            inputs=[
+                batch_folder, batch_prompt, system_prompt,
+                max_tokens, temperature, top_p, top_k, repetition_penalty
+            ],
+            outputs=[batch_output],
         )
 
     return demo

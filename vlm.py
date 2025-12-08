@@ -366,11 +366,22 @@ class VLMManager:
                     processed_messages.append(msg)
 
             # Apply chat template
+            print(f"[Debug] Messages being sent to model: {len(processed_messages)} messages")
+            for i, msg in enumerate(processed_messages):
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    preview = content[:100] + "..." if len(content) > 100 else content
+                else:
+                    preview = f"[{len(content)} content items]"
+                print(f"  [{i}] {role}: {preview}")
+
             text_input = self.processor.apply_chat_template(
                 processed_messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            print(f"[Debug] Formatted prompt preview: {text_input[:500]}...")
 
             # Process inputs
             process_kwargs = {"text": [text_input], "padding": True, "return_tensors": "pt"}

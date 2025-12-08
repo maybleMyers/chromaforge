@@ -226,9 +226,15 @@ class VLMManager:
                     from transformers import BitsAndBytesConfig
                     load_kwargs["quantization_config"] = BitsAndBytesConfig(
                         load_in_8bit=True,
+                        llm_int8_enable_fp32_cpu_offload=True,
                     )
                     load_kwargs["device_map"] = "auto"
-                    print("Using 8-bit quantization")
+                    # Use disk offloading for very large models during quantization
+                    offload_dir = Path(tempfile.gettempdir()) / "vlm_offload"
+                    offload_dir.mkdir(exist_ok=True)
+                    load_kwargs["offload_folder"] = str(offload_dir)
+                    load_kwargs["offload_state_dict"] = True
+                    print(f"Using 8-bit quantization (offloading to {offload_dir})")
                 except ImportError:
                     print("Warning: bitsandbytes not installed, falling back to bfloat16")
                     load_kwargs["torch_dtype"] = torch.bfloat16

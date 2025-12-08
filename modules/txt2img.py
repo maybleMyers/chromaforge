@@ -18,6 +18,9 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
     if force_enable_hr:
         enable_hr = True
 
+    # Capture checkpoint at request time for tab isolation
+    checkpoint_override = shared.opts.sd_model_checkpoint
+
     p = processing.StableDiffusionProcessingTxt2Img(
         outpath_samples=opts.outdir_samples or opts.outdir_txt2img_samples,
         outpath_grids=opts.outdir_grids or opts.outdir_txt2img_grids,
@@ -47,6 +50,7 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
         hr_cfg=hr_cfg,
         hr_distilled_cfg=hr_distilled_cfg,
         override_settings=override_settings,
+        checkpoint_override=checkpoint_override,  # Per-request checkpoint for tab isolation
     )
 
     p.scripts = modules.scripts.scripts_txt2img

@@ -162,6 +162,7 @@ class StableDiffusionProcessing:
     override_settings: dict[str, Any] = None
     override_settings_restore_afterwards: bool = True
     sampler_index: int = None
+    checkpoint_override: str = None  # Per-request checkpoint override for tab isolation
     refiner_checkpoint: str = None
     refiner_switch_at: float = None
     token_merging_ratio = 0
@@ -938,6 +939,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             if not getattr(p, 'txt2img_upscale', False) or p.hr_checkpoint_name is None:
                 # hiresfix quickbutton may not need reload of firstpass model
+                # Apply per-request checkpoint override if set (for tab isolation)
+                if p.checkpoint_override is not None:
+                    from modules_forge import main_entry
+                    main_entry.checkpoint_change(p.checkpoint_override, save=False, refresh=False)
+                    main_entry.refresh_model_loading_parameters()
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
@@ -1437,21 +1443,51 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             fp_additional_modules = getattr(shared.opts, 'forge_additional_modules')
 
             reload = False
+            is_cross_architecture = False
+
             if hasattr(self, 'hr_additional_modules') and 'Use same choices' not in self.hr_additional_modules:
                 modules_changed = main_entry.modules_change(self.hr_additional_modules, save=False, refresh=False)
                 if modules_changed:
                     reload = True
 
             if self.hr_checkpoint_name and self.hr_checkpoint_name != 'Use same checkpoint':
+                # Detect cross-architecture switch (Z-Image <-> Chroma)
+                fp_checkpoint_info = sd_models.get_closet_checkpoint_match(fp_checkpoint)
+                hr_checkpoint_info = sd_models.get_closet_checkpoint_match(self.hr_checkpoint_name)
+
+                if fp_checkpoint_info and hr_checkpoint_info:
+                    fp_arch = fp_checkpoint_info.architecture
+                    hr_arch = hr_checkpoint_info.architecture
+                    if fp_arch != hr_arch:
+                        is_cross_architecture = True
+                        if sd_models.is_cross_architecture_compatible(fp_arch, hr_arch):
+                            print(f"Cross-architecture hires fix: {fp_arch} -> {hr_arch}")
+                        else:
+                            print(f"Warning: Incompatible architectures for hires fix: {fp_arch} -> {hr_arch}")
+
                 checkpoint_changed = main_entry.checkpoint_change(self.hr_checkpoint_name, save=False, refresh=False)
                 if checkpoint_changed:
                     self.firstpass_use_distilled_cfg_scale = self.sd_model.use_distilled_cfg_scale
                     reload = True
 
+            # For cross-architecture, force pixel-space upscaling (can't interpolate latents across different architectures)
+            if is_cross_architecture and self.latent_scale_mode is not None:
+                print("Cross-architecture: Forcing pixel-space upscaling (latent interpolation disabled)")
+                self.latent_scale_mode = None
+                # Re-decode samples to RGB if we haven't already
+                if decoded_samples is None:
+                    decoded_samples = torch.stack(decode_latent_batch(self.sd_model, samples, target_device=devices.cpu, check_for_nans=True)).to(dtype=torch.float32)
+
             if reload:
                 try:
                     main_entry.refresh_model_loading_parameters()
                     sd_models.forge_model_reload()
+                    # For cross-architecture, force recalculation of conditioning with new text encoder
+                    if is_cross_architecture:
+                        self.hr_c = None
+                        self.hr_uc = None
+                        self.cached_hr_c = [None, None, None]
+                        self.cached_hr_uc = [None, None, None]
                 finally:
                     main_entry.modules_change(fp_additional_modules, save=False, refresh=False)
                     main_entry.checkpoint_change(fp_checkpoint, save=False, refresh=False)

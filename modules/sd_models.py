@@ -28,6 +28,104 @@ model_dir = "Stable-diffusion"
 model_path = os.path.abspath(os.path.join(paths.models_path, model_dir))
 
 checkpoints_list = {}
+
+# Architecture type constants
+ARCH_SD15 = 'sd15'
+ARCH_SD20 = 'sd20'
+ARCH_SDXL = 'sdxl'
+ARCH_SDXL_REFINER = 'sdxl_refiner'
+ARCH_SD3 = 'sd3'
+ARCH_FLUX = 'flux'
+ARCH_CHROMA = 'chroma'
+ARCH_ZIMAGE = 'zimage'
+ARCH_UNKNOWN = 'unknown'
+
+
+def detect_architecture_from_keys(keys):
+    """
+    Detect model architecture from state dict keys without loading tensor data.
+
+    Args:
+        keys: List or set of state dict keys
+
+    Returns:
+        Architecture string constant (ARCH_*)
+    """
+    keys_set = set(keys) if not isinstance(keys, set) else keys
+
+    # Z-Image detection - has ZImage-specific embedder structure
+    # Diffusers format: all_x_embedder.2-1.weight
+    # ComfyUI format: x_embedder.weight (with cap_pad_token)
+    if any('all_x_embedder' in k for k in keys_set) or \
+       ('x_embedder.weight' in keys_set and 'cap_pad_token' in keys_set):
+        return ARCH_ZIMAGE
+
+    # Chroma detection - has T5 text encoder pattern with specific transformer structure
+    # Chroma uses ChromaTransformer2DModel
+    if any('model.diffusion_model.context_embedder.weight' in k for k in keys_set):
+        # Check if it's Chroma (has T5 text encoder, different from FLUX)
+        has_flux_structure = any('double_blocks' in k for k in keys_set)
+        if not has_flux_structure:
+            return ARCH_CHROMA
+
+    # FLUX detection - has double_blocks with img_attn.norm.key_norm structure
+    flux_test = "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale"
+    if flux_test in keys_set or any('double_blocks' in k and 'img_attn.norm.key_norm' in k for k in keys_set):
+        return ARCH_FLUX
+
+    # SD3 detection - has specific adaLN_modulation structure
+    sd3_test = "model.diffusion_model.final_layer.adaLN_modulation.1.bias"
+    if sd3_test in keys_set:
+        return ARCH_SD3
+
+    # Legacy SD models detection via transformer attention key shapes
+    legacy_test_key = "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight"
+    if legacy_test_key in keys_set:
+        # We can't determine shape from keys alone, so check for SDXL-specific keys
+        # SDXL has conditioner.embedders structure
+        if any('conditioner.embedders.1' in k for k in keys_set):
+            return ARCH_SDXL
+        elif any('conditioner.embedders.0.model' in k for k in keys_set):
+            return ARCH_SDXL_REFINER
+        elif any('cond_stage_model.transformer' in k for k in keys_set):
+            return ARCH_SD15
+        elif any('cond_stage_model.model' in k for k in keys_set):
+            return ARCH_SD20
+        # Default to SD1.5 for legacy models
+        return ARCH_SD15
+
+    return ARCH_UNKNOWN
+
+
+def get_safetensors_keys(filename):
+    """Get keys from a safetensors file without loading tensor data."""
+    try:
+        from safetensors import safe_open
+        with safe_open(filename, framework="pt", device="cpu") as f:
+            return list(f.keys())
+    except Exception as e:
+        print(f"Warning: Could not read keys from {filename}: {e}")
+        return []
+
+
+def get_checkpoint_keys(filename):
+    """Get keys from a checkpoint file (safetensors or pytorch)."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == '.safetensors':
+        return get_safetensors_keys(filename)
+    else:
+        # For .ckpt/.pt files, we need to load the state dict
+        try:
+            state_dict = load_torch_file(filename, safe_load=True)
+            keys = list(state_dict.keys())
+            del state_dict
+            gc.collect()
+            return keys
+        except Exception as e:
+            print(f"Warning: Could not read keys from {filename}: {e}")
+            return []
+
+
 checkpoint_aliases = {}
 checkpoint_alisases = checkpoint_aliases  # for compatibility with old name
 checkpoints_loaded = collections.OrderedDict()
@@ -105,6 +203,24 @@ class CheckpointInfo:
         if self.shorthash:
             self.ids += [self.shorthash, self.sha256, f'{self.name} [{self.shorthash}]', f'{self.name_for_extra} [{self.shorthash}]']
 
+        # Architecture detection (lazy loaded)
+        self._architecture = None
+
+    @property
+    def architecture(self):
+        """Lazily detect and cache model architecture."""
+        if self._architecture is None:
+            try:
+                keys = get_checkpoint_keys(self.filename)
+                if keys:
+                    self._architecture = detect_architecture_from_keys(keys)
+                else:
+                    self._architecture = ARCH_UNKNOWN
+            except Exception as e:
+                print(f"Warning: Could not detect architecture for {self.name}: {e}")
+                self._architecture = ARCH_UNKNOWN
+        return self._architecture
+
     def register(self):
         checkpoints_list[self.title] = self
         for id in self.ids:
@@ -138,6 +254,80 @@ class CheckpointInfo:
 
     def __repr__(self):
         return str(dict(filename=self.filename, hash=self.hash))
+
+
+def get_checkpoints_by_architecture(architectures=None):
+    """
+    Get checkpoints filtered by architecture(s).
+
+    Args:
+        architectures: Single architecture string or list of architectures.
+                      If None, returns all checkpoints.
+
+    Returns:
+        List of checkpoint titles matching the architecture(s).
+    """
+    if architectures is None:
+        return list(checkpoints_list.keys())
+
+    if isinstance(architectures, str):
+        architectures = [architectures]
+
+    result = []
+    for title, info in checkpoints_list.items():
+        if info.architecture in architectures:
+            result.append(title)
+    return result
+
+
+def checkpoint_tiles_by_architecture(architectures=None, use_short=False):
+    """
+    Get checkpoint tile names filtered by architecture.
+
+    Args:
+        architectures: Single architecture or list of architectures.
+                      If None, returns all checkpoints.
+        use_short: If True, return short titles instead of full titles.
+
+    Returns:
+        List of checkpoint tile names.
+    """
+    if architectures is None:
+        return checkpoint_tiles(use_short=use_short)
+
+    if isinstance(architectures, str):
+        architectures = [architectures]
+
+    result = []
+    for title, info in checkpoints_list.items():
+        if info.architecture in architectures:
+            result.append(info.short_title if use_short else info.title)
+    return result
+
+
+def is_cross_architecture_compatible(arch1, arch2):
+    """
+    Check if two architectures can work together for cross-architecture refining.
+    Currently supports Z-Image <-> Chroma cross-architecture refining.
+
+    Args:
+        arch1: First architecture string
+        arch2: Second architecture string
+
+    Returns:
+        True if the architectures can work together, False otherwise.
+    """
+    # Same architecture is always compatible
+    if arch1 == arch2:
+        return True
+
+    # Z-Image and Chroma are compatible for cross-architecture refining
+    cross_compatible_pairs = [
+        {ARCH_ZIMAGE, ARCH_CHROMA},
+    ]
+
+    pair = {arch1, arch2}
+    return pair in cross_compatible_pairs
 
 
 # try:

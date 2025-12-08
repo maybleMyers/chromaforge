@@ -14,6 +14,8 @@ from typing import Optional, List, Tuple, Dict, Any
 
 import torch
 import gradio as gr
+from gradio import themes
+from gradio.themes.utils import colors
 from PIL import Image
 
 # Try to import video processing utilities
@@ -619,7 +621,56 @@ def create_ui():
     """Create the Gradio interface."""
     available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
 
-    with gr.Blocks(title="Chromaforge VLM", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(
+        title="Chromaforge VLM",
+        theme=themes.Default(
+            primary_hue=colors.Color(
+                name="custom",
+                c50="#E6F0FF",
+                c100="#CCE0FF",
+                c200="#99C1FF",
+                c300="#66A3FF",
+                c400="#3384FF",
+                c500="#0060df",
+                c600="#0052C2",
+                c700="#003D91",
+                c800="#002961",
+                c900="#001430",
+                c950="#000A18"
+            )
+        ),
+        css="""
+        .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
+        .gallery-item:first-child:hover { border-color: #45a049 !important; }
+        .green-btn {
+            background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
+            color: white !important;
+            border: none !important;
+        }
+        .green-btn:hover {
+            background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+        }
+        .refresh-btn {
+            max-width: 40px !important;
+            min-width: 40px !important;
+            height: 40px !important;
+            border-radius: 50% !important;
+            padding: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        .light-blue-btn {
+            background: linear-gradient(to bottom right, #AEC6CF, #9AB8C4) !important;
+            color: #333 !important;
+            border: 1px solid #9AB8C4 !important;
+        }
+        .light-blue-btn:hover {
+            background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important;
+            border-color: #8AA9B5 !important;
+        }
+        """,
+    ) as demo:
         with gr.Row():
             # Left column - Settings (shared across tabs)
             with gr.Column(scale=1):
@@ -772,14 +823,21 @@ def create_ui():
                             lines=1,
                         )
 
+                        batch_system_prompt = gr.Textbox(
+                            label="System Prompt",
+                            placeholder="System instructions for captioning...",
+                            lines=3,
+                            value="You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
+                        )
+
                         batch_prompt = gr.Textbox(
                             label="Caption Prompt",
                             placeholder="Describe this image in detail.",
                             lines=2,
-                            value="Describe this image in detail.",
+                            value="Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
                         )
 
-                        batch_start_btn = gr.Button("Start Batch Captioning", variant="primary")
+                        batch_start_btn = gr.Button("Start Batch Captioning", variant="primary", elem_classes=["green-btn"])
 
                         batch_output = gr.Textbox(
                             label="Output",
@@ -855,7 +913,7 @@ def create_ui():
         batch_start_btn.click(
             fn=batch_caption_handler,
             inputs=[
-                batch_folder, batch_prompt, system_prompt,
+                batch_folder, batch_prompt, batch_system_prompt,
                 max_tokens, temperature, top_p, top_k, repetition_penalty
             ],
             outputs=[batch_output],

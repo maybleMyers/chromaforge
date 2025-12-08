@@ -168,11 +168,20 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
     """
     import os
     import time
+    import re
 
     prompt_type = "negative" if is_negative else "positive"
     start_time = time.time()
 
     try:
+        # Extract LoRA tags from prompt before expansion
+        # Pattern matches <lora:name:weight> and similar extra network tags
+        lora_pattern = re.compile(r"<lora:[^>]+>")
+        extracted_loras = lora_pattern.findall(prompt)
+        prompt_without_loras = lora_pattern.sub("", prompt).strip()
+        # Clean up any double spaces left behind
+        prompt_without_loras = re.sub(r'\s+', ' ', prompt_without_loras).strip()
+
         print("\n" + "#"*70, flush=True)
         print(f"#  {prompt_type.upper()} PROMPT EXPANSION REQUEST", flush=True)
         print("#"*70, flush=True)
@@ -183,12 +192,15 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         print(f"  Has user input: {user_input is not None and len(user_input.strip()) > 0 if user_input else False}", flush=True)
         if is_negative and positive_prompt:
             print(f"  Using positive prompt as context: Yes ({len(positive_prompt)} chars)", flush=True)
+        if extracted_loras:
+            print(f"  Extracted LoRAs: {extracted_loras}", flush=True)
+            print(f"  Prompt without LoRAs: \"{prompt_without_loras[:200]}{'...' if len(prompt_without_loras) > 200 else ''}\"", flush=True)
         print(f"  Original prompt ({len(prompt)} chars):", flush=True)
         print(f"    \"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\"", flush=True)
         print("#"*70, flush=True)
 
-        if not prompt or prompt.strip() == "":
-            gr.Warning(f"Please enter a {prompt_type} prompt to expand.")
+        if not prompt_without_loras or prompt_without_loras.strip() == "":
+            gr.Warning(f"Please enter a {prompt_type} prompt to expand (not just LoRA tags).")
             return prompt
 
         # Determine model path
@@ -218,9 +230,9 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
         else:
             gr.Info(f"Expanding {prompt_type} prompt... This may take a moment.")
 
-        # Use the standalone expansion function
+        # Use the standalone expansion function (with LoRAs removed)
         expanded = expand_prompt_standalone(
-            prompt=prompt.strip(),
+            prompt=prompt_without_loras,
             model_path=model_path,
             system_prompt=system_prompt,
             image=pil_image,
@@ -231,12 +243,20 @@ def expand_prompt_with_llm(prompt, image=None, llm_model=None, system_prompt=Non
 
         total_time = time.time() - start_time
 
-        if expanded and expanded != prompt:
+        if expanded and expanded != prompt_without_loras:
+            # Append extracted LoRAs to the end of the expanded prompt
+            if extracted_loras:
+                loras_string = " ".join(extracted_loras)
+                expanded = f"{expanded} {loras_string}"
+                print(f"  Re-appended LoRAs: {loras_string}", flush=True)
+
             gr.Info(f"{prompt_type.capitalize()} prompt expanded successfully! ({total_time:.1f}s)")
             print("\n" + "#"*70, flush=True)
             print(f"#  {prompt_type.upper()} PROMPT EXPANSION SUCCESS", flush=True)
             print("#"*70, flush=True)
             print(f"  Total request time: {total_time:.2f}s", flush=True)
+            if extracted_loras:
+                print(f"  LoRAs preserved: {extracted_loras}", flush=True)
             print("#"*70 + "\n", flush=True)
             return expanded
         else:
@@ -314,7 +334,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         return None
 
     def detect_model_type(model_path):
-        """Detect whether model is standard VL or VL+MoE from config."""
+        """Detect whether model is VL, VL+MoE, or text-only from config."""
         config_path = os.path.join(model_path, "config.json")
         if os.path.exists(config_path):
             try:
@@ -325,11 +345,21 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
 
                 # Check for VL+MoE models (e.g., Qwen3VLMoeForConditionalGeneration)
                 if any("Moe" in arch or "MoE" in arch for arch in architectures):
-                    return "vl_moe"
-                if "moe" in model_type.lower():
-                    return "vl_moe"
+                    if "vl" in model_type.lower() or any("VL" in arch for arch in architectures):
+                        return "vl_moe"
 
-                # Default to standard VL
+                # Check for VL models (must have "vl" in model_type or architecture)
+                if "vl" in model_type.lower() or any("VL" in arch for arch in architectures):
+                    return "vl"
+
+                # Check for text-only causal LM models (Qwen3, Llama, etc.)
+                # These don't have VL in their architecture and are ForCausalLM
+                if any("CausalLM" in arch or "ForCausalLM" in arch for arch in architectures):
+                    return "text"
+                if model_type.lower() in ["qwen3", "qwen2", "llama", "mistral", "gemma", "phi"]:
+                    return "text"
+
+                # Default to VL for img2img support
                 return "vl"
             except Exception as e:
                 log_step(f"  Warning: Could not read config.json: {e}")
@@ -363,6 +393,22 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             torch.cuda.empty_cache()
             log_step("Previous model unloaded", unload_start)
 
+        # Unload diffusion models from VRAM to make room for LLM
+        # Use emergency_memory_cleanup which forcibly clears all model references
+        log_step("Unloading diffusion models from VRAM to make room for LLM...")
+        unload_diffusion_start = time.time()
+        try:
+            from backend import memory_management
+            # emergency_memory_cleanup forcibly clears shared.sd_model and all forge_objects
+            # This is necessary because unload_all_models() won't unload models with active references
+            memory_management.emergency_memory_cleanup()
+            gpu_mem = get_gpu_memory()
+            if gpu_mem:
+                log_step(f"  After diffusion unload: {gpu_mem}")
+            log_step("Diffusion models unloaded", unload_diffusion_start)
+        except Exception as e:
+            log_step(f"  Warning: Could not unload diffusion models: {e}")
+
         log_step(f"Loading LLM model: {model_path}")
         load_start = time.time()
 
@@ -371,13 +417,6 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         log_step(f"  Detected model type: {detected_type}")
 
         try:
-            from transformers import AutoProcessor
-
-            log_step("  Loading processor...")
-            processor_start = time.time()
-            _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
-            log_step("  Processor loaded", processor_start)
-
             log_step("  Loading model weights (this may take a moment)...")
             model_start = time.time()
 
@@ -394,8 +433,29 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             max_memory = {device_index: max_gpu_memory, "cpu": "32GiB"}
             log_step(f"  GPU {device_index} has {total_vram:.1f}GB, allowing up to {max_gpu_memory}")
 
-            if detected_type == "vl_moe":
-                # Try loading VL+MoE model
+            if detected_type == "text":
+                # Text-only causal LM model (e.g., Qwen3-4B-Instruct, Llama, etc.)
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                log_step("  Loading tokenizer for text-only model...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoTokenizer.from_pretrained(model_path)
+                log_step("  Tokenizer loaded", processor_start)
+
+                log_step("  Using AutoModelForCausalLM")
+                _expansion_model_cache['model'] = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                    max_memory=max_memory,
+                )
+            elif detected_type == "vl_moe":
+                # VL+MoE model
+                from transformers import AutoProcessor
+                log_step("  Loading processor...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+                log_step("  Processor loaded", processor_start)
+
                 try:
                     from transformers import Qwen3VLMoeForConditionalGeneration
                     log_step("  Using Qwen3VLMoeForConditionalGeneration")
@@ -418,6 +478,12 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
                     )
             else:
                 # Standard VL model
+                from transformers import AutoProcessor
+                log_step("  Loading processor...")
+                processor_start = time.time()
+                _expansion_model_cache['processor'] = AutoProcessor.from_pretrained(model_path)
+                log_step("  Processor loaded", processor_start)
+
                 from transformers import Qwen3VLForConditionalGeneration
                 log_step("  Using Qwen3VLForConditionalGeneration")
                 _expansion_model_cache['model'] = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -471,25 +537,32 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
         log_step(f"  Positive prompt context: {len(positive_prompt)} chars")
     log_step(f"  Total user message: {len(user_message_text)} chars")
 
-    # Build messages list with proper Qwen chat format
+    # Build messages list with proper chat format
     # Use system role for system prompt, user role for the actual expansion request
     messages = []
+    detected_type = _expansion_model_cache.get('model_type', 'vl')
 
     # Add system message if system prompt is provided
     if system_prompt and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt.strip()})
 
-    # Build user message content based on whether image is provided
-    if image is not None:
-        log_step("  Including image context")
-        user_content = [
-            {"type": "image", "image": image},
-            {"type": "text", "text": user_message_text}
-        ]
+    # Build user message content based on model type and whether image is provided
+    if detected_type == "text":
+        # Text-only models use simple string content
+        if image is not None:
+            log_step("  Warning: Image provided but text-only model cannot use it")
+        messages.append({"role": "user", "content": user_message_text})
     else:
-        user_content = [{"type": "text", "text": user_message_text}]
-
-    messages.append({"role": "user", "content": user_content})
+        # VL models use structured content with type/text/image
+        if image is not None:
+            log_step("  Including image context")
+            user_content = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": user_message_text}
+            ]
+        else:
+            user_content = [{"type": "text", "text": user_message_text}]
+        messages.append({"role": "user", "content": user_content})
 
     # Apply chat template
     log_step("Applying chat template...")
@@ -504,7 +577,15 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
     # Process/tokenize inputs
     log_step("Tokenizing inputs...")
     tokenize_start = time.time()
-    if image is not None:
+    if detected_type == "text":
+        # Text-only models: tokenizer returns input_ids directly
+        inputs = processor(
+            text_input,
+            padding=True,
+            return_tensors="pt",
+        )
+    elif image is not None:
+        # VL models with image
         inputs = processor(
             text=[text_input],
             images=[image],
@@ -512,6 +593,7 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
             return_tensors="pt",
         )
     else:
+        # VL models without image
         inputs = processor(
             text=[text_input],
             padding=True,

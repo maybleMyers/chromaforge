@@ -257,9 +257,19 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have Qwen3 text encoder state dict!'
 
             text_encoder_dtype = memory_management.text_encoder_dtype()
+            storage_dtype = text_encoder_dtype
+            state_dict_dtype_detected = memory_management.state_dict_dtype(state_dict)
 
-            # Check for Z-Image specific text encoder precision
-            if getattr(guess, 'is_zimage', False):
+            # Check for GGUF/quantized formats
+            if state_dict_dtype_detected in ['nf4', 'fp4', 'gguf']:
+                print(f'Using Detected Qwen3 Data Type: {state_dict_dtype_detected}')
+                storage_dtype = state_dict_dtype_detected
+                print(f'Using pre-quant state dict!')
+                if state_dict_dtype_detected == 'gguf':
+                    beautiful_print_gguf_state_dict_statics(state_dict)
+
+            # Check for Z-Image specific text encoder precision (only for non-quantized formats)
+            if storage_dtype not in ['nf4', 'fp4', 'gguf'] and getattr(guess, 'is_zimage', False):
                 try:
                     from modules import shared
                     z_text_encoder_dtype = getattr(shared.opts, 'z_text_encoder_dtype', 'Automatic')
@@ -271,6 +281,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         }
                         if z_text_encoder_dtype in dtype_map:
                             text_encoder_dtype = dtype_map[z_text_encoder_dtype]
+                            storage_dtype = text_encoder_dtype
                             print(f'Z-Image Text Encoder: Using user-specified dtype: {text_encoder_dtype}')
                 except Exception as e:
                     print(f'Warning: Could not read Z-Image text encoder precision setting: {e}')
@@ -280,9 +291,55 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             # Load as Qwen3Model for text encoding (embeddings for diffusion)
             config = Qwen3Config.from_pretrained(config_path)
             cls = getattr(importlib.import_module('transformers'), cls_name)
-            with modeling_utils.no_init_weights():
-                model = cls(config)
-            model = model.to(dtype=text_encoder_dtype)
+
+            if storage_dtype in ['nf4', 'fp4', 'gguf']:
+                with modeling_utils.no_init_weights():
+                    with using_forge_operations(device=memory_management.cpu, dtype=text_encoder_dtype, manual_cast_enabled=False, bnb_dtype=storage_dtype):
+                        model = cls(config)
+            else:
+                with modeling_utils.no_init_weights():
+                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
+                        model = cls(config)
+
+            # Convert GGUF keys to HuggingFace format if needed
+            if storage_dtype == 'gguf' and 'blk.0.attn_k.weight' in state_dict:
+                print('[Qwen3] Converting GGUF keys to HuggingFace format...')
+                # Order matters - longer/more specific patterns must come first
+                gguf_to_hf_mapping = [
+                    ("blk.", "layers."),
+                    (".attn_k_norm.", ".self_attn.k_norm."),  # Must come before .attn_k.
+                    (".attn_q_norm.", ".self_attn.q_norm."),  # Must come before .attn_q.
+                    (".attn_output.", ".self_attn.o_proj."),
+                    (".attn_k.", ".self_attn.k_proj."),
+                    (".attn_q.", ".self_attn.q_proj."),
+                    (".attn_v.", ".self_attn.v_proj."),
+                    (".attn_norm.", ".input_layernorm."),
+                    (".ffn_down.", ".mlp.down_proj."),
+                    (".ffn_gate.", ".mlp.gate_proj."),
+                    (".ffn_up.", ".mlp.up_proj."),
+                    (".ffn_norm.", ".post_attention_layernorm."),
+                    ("token_embd.", "embed_tokens."),
+                    ("output_norm.", "norm."),
+                ]
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_k = k
+                    for src, dst in gguf_to_hf_mapping:
+                        new_k = new_k.replace(src, dst)
+                    new_state_dict[new_k] = v
+                state_dict = new_state_dict
+
+                # Dequantize embeddings and layernorms (they can't use GGUF quantized format)
+                keys_to_dequantize = ['embed_tokens.weight', 'norm.weight']
+                for k in keys_to_dequantize:
+                    if k in state_dict and hasattr(state_dict[k], 'dequantize_as_pytorch_parameter'):
+                        print(f'[Qwen3] Dequantizing {k}')
+                        state_dict[k] = state_dict[k].dequantize_as_pytorch_parameter()
+                # Also dequantize all layernorm weights
+                for k in list(state_dict.keys()):
+                    if ('layernorm' in k.lower() or k.endswith('norm.weight')) and hasattr(state_dict[k], 'dequantize_as_pytorch_parameter'):
+                        print(f'[Qwen3] Dequantizing {k}')
+                        state_dict[k] = state_dict[k].dequantize_as_pytorch_parameter()
 
             # Strip 'model.' prefix from state_dict keys if present
             if any(k.startswith('model.') for k in state_dict.keys()):
@@ -762,7 +819,8 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
                 # Determine if it's VAE or text encoder based on keys
                 if 'decoder.conv_in.weight' in module_sd or 'decoder.up_blocks.0.resnets.0.conv1.weight' in module_sd:
                     state_dicts['vae'] = module_sd
-                elif 'model.embed_tokens.weight' in module_sd or 'embed_tokens.weight' in module_sd:
+                elif 'model.embed_tokens.weight' in module_sd or 'embed_tokens.weight' in module_sd or 'token_embd.weight' in module_sd:
+                    # token_embd.weight is the GGUF format key for embed_tokens
                     state_dicts['text_encoder'] = module_sd
 
         # Create minimal config for Z-Image

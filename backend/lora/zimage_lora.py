@@ -9,13 +9,499 @@ Key Mappings:
   LoRA: diffusion_model.layers.N.attention.to_q -> Model: layers.N.attention.to_q.weight
   LoRA: diffusion_model.layers.N.feed_forward.w1 -> Model: layers.N.feed_forward.w1.weight
   etc.
+
+This module provides two approaches for loading LoRAs:
+1. Patch-based (original): Creates patches for Forge's LoRA system
+2. Direct merge (new): Directly modifies model weights, better for multiple LoRAs
 """
 
 import torch
+from typing import Optional
 try:
     from safetensors.torch import load_file
 except ImportError:
     load_file = None
+
+
+class ZImageLoRAManager:
+    """
+    Manages direct LoRA merging for Z-Image models.
+
+    This approach directly modifies model weights instead of using patches,
+    which is more reliable for multiple LoRAs. It maintains a backup of
+    original weights for restoration.
+
+    Usage:
+        manager = ZImageLoRAManager(model)
+        manager.apply_loras([
+            ('lora1.safetensors', 0.8),
+            ('lora2.safetensors', 0.6),
+        ])
+        # Later, to switch LoRAs:
+        manager.clear_loras()
+        manager.apply_loras([...])
+    """
+
+    def __init__(self, model):
+        """
+        Initialize the LoRA manager.
+
+        Args:
+            model: The Z-Image model (ZImageTransformerWrapper or the underlying transformer)
+        """
+        self.model = model
+        self.weight_backup = {}  # {key: original_weight_tensor}
+        self.applied_loras = []  # [(filename, strength), ...]
+        self._model_state_keys = None
+
+    def _get_model_state_keys(self):
+        """Get and cache model state dict keys."""
+        if self._model_state_keys is None:
+            self._model_state_keys = set(self.model.state_dict().keys())
+        return self._model_state_keys
+
+    def _find_model_key(self, lora_base_key: str) -> Optional[str]:
+        """
+        Find the actual model key for a LoRA key, trying multiple prefixes.
+
+        Args:
+            lora_base_key: The base key from the LoRA file
+
+        Returns:
+            The actual model key, or None if not found
+        """
+        model_keys = self._get_model_state_keys()
+        model_key = lora_key_to_model_key(lora_base_key)
+
+        # Try multiple prefixes to find the key in the model
+        prefixes_to_try = [
+            '',  # Direct match
+            'diffusion_model.',  # Standard prefix
+            'diffusion_model.transformer.',  # Wrapped transformer
+            'transformer.',  # Just transformer prefix
+        ]
+
+        for prefix in prefixes_to_try:
+            candidate = prefix + model_key
+            if candidate in model_keys:
+                return candidate
+
+        return None
+
+    def _get_parameter(self, key: str) -> torch.nn.Parameter:
+        """Navigate to and return a parameter by its key path."""
+        parts = key.split('.')
+        target = self.model
+        for part in parts[:-1]:
+            if part.isdigit():
+                target = target[int(part)]
+            else:
+                target = getattr(target, part)
+        return getattr(target, parts[-1])
+
+    def _set_parameter(self, key: str, value: torch.Tensor):
+        """Set a parameter by its key path."""
+        parts = key.split('.')
+        target = self.model
+        for part in parts[:-1]:
+            if part.isdigit():
+                target = target[int(part)]
+            else:
+                target = getattr(target, part)
+
+        # Convert to parameter if needed
+        if not isinstance(value, torch.nn.Parameter):
+            value = torch.nn.Parameter(value, requires_grad=False)
+        setattr(target, parts[-1], value)
+
+    def _backup_weight(self, key: str):
+        """Backup a weight if not already backed up."""
+        if key not in self.weight_backup:
+            param = self._get_parameter(key)
+            # Store a copy on CPU to save GPU memory
+            self.weight_backup[key] = param.data.clone().cpu()
+
+    def clear_loras(self):
+        """
+        Remove all applied LoRAs by restoring original weights.
+        """
+        if not self.weight_backup:
+            print("[Z-Image LoRA] clear_loras called but no backup exists")
+            return
+
+        print(f"[Z-Image LoRA] Restoring {len(self.weight_backup)} original weights")
+
+        # Debug: Sample a weight before and after restoration
+        sample_key = next(iter(self.weight_backup.keys()))
+        sample_backup = self.weight_backup[sample_key]
+        try:
+            param = self._get_parameter(sample_key)
+            print(f"[Z-Image LoRA DEBUG] Before restore - {sample_key}: mean={param.data.mean().item():.6f}, std={param.data.std().item():.6f}")
+            print(f"[Z-Image LoRA DEBUG] Backup values - mean={sample_backup.mean().item():.6f}, std={sample_backup.std().item():.6f}")
+        except Exception as e:
+            print(f"[Z-Image LoRA DEBUG] Error sampling before restore: {e}")
+
+        restored_count = 0
+        for key, original_weight in self.weight_backup.items():
+            try:
+                param = self._get_parameter(key)
+                device = param.device
+                dtype = param.dtype
+                # Restore with proper dtype conversion
+                param.data.copy_(original_weight.to(device=device, dtype=dtype))
+                restored_count += 1
+            except Exception as e:
+                print(f"[Z-Image LoRA] Warning: Failed to restore {key}: {e}")
+
+        # Debug: Verify restoration
+        try:
+            param = self._get_parameter(sample_key)
+            print(f"[Z-Image LoRA DEBUG] After restore - {sample_key}: mean={param.data.mean().item():.6f}, std={param.data.std().item():.6f}")
+        except Exception as e:
+            print(f"[Z-Image LoRA DEBUG] Error sampling after restore: {e}")
+
+        print(f"[Z-Image LoRA] Successfully restored {restored_count}/{len(self.weight_backup)} weights")
+
+        self.weight_backup.clear()
+        self.applied_loras.clear()
+        self._model_state_keys = None  # Clear cache in case model structure changed
+
+        print("[Z-Image LoRA] All LoRAs cleared, original weights restored")
+
+    def apply_loras(self, lora_configs: list[tuple[str, float]], computation_dtype=torch.float32) -> dict:
+        """
+        Apply multiple LoRAs directly to model weights.
+
+        This method first restores original weights (if any LoRAs were previously applied),
+        then applies all specified LoRAs in order.
+
+        Args:
+            lora_configs: List of (lora_path, strength) tuples
+            computation_dtype: Dtype for intermediate computations (default float32)
+
+        Returns:
+            Dict with statistics about the merge operation
+        """
+        # Reset format detection flag for new LoRA loading session
+        global _logged_format_detection
+        _logged_format_detection = False
+
+        # Clear any previously applied LoRAs first
+        if self.applied_loras:
+            self.clear_loras()
+
+        total_applied = 0
+        total_matched = 0
+        total_unmatched = 0
+
+        # Track first modified key for debugging
+        first_modified_key = None
+        first_modified_before = None
+
+        # Track which keys are modified by each LoRA
+        keys_modified_by_lora = {}
+        overlapping_keys = set()
+
+        for lora_idx, (lora_path, strength) in enumerate(lora_configs):
+            print(f"[Z-Image LoRA] Direct merge: {lora_path} (strength={strength})")
+
+            # Load LoRA state dict
+            if load_file is None:
+                raise ImportError("safetensors is required for LoRA loading")
+
+            try:
+                lora_state = load_file(lora_path)
+            except Exception as e:
+                print(f"[Z-Image LoRA] Failed to load {lora_path}: {e}")
+                continue
+
+            # Group LoRA keys by base key
+            lora_groups = {}
+            sample_conversions = []  # Track first few conversions for debug
+            for key in lora_state.keys():
+                result = extract_lora_base_key(key)
+                if result:
+                    base_key, key_type = result
+                    if base_key not in lora_groups:
+                        lora_groups[base_key] = {}
+                        # Log first few conversions for debugging
+                        if len(sample_conversions) < 3 and key.startswith('lora_unet_'):
+                            sample_conversions.append((key.split('.')[0], base_key))
+                    lora_groups[base_key][key_type] = lora_state[key]
+
+            # Show sample key conversions if this is sd-scripts format
+            if sample_conversions:
+                print(f"[Z-Image LoRA] Sample key conversions:")
+                for orig, converted in sample_conversions:
+                    print(f"  {orig} -> {converted}")
+
+            matched = 0
+            applied = 0
+            unmatched_keys = []
+
+            for lora_base_key, lora_weights in lora_groups.items():
+                # Find the actual model key
+                model_key = self._find_model_key(lora_base_key)
+
+                if model_key is None:
+                    unmatched_keys.append(lora_base_key)
+                    continue
+
+                matched += 1
+
+                # Get LoRA components
+                lora_up = lora_weights.get('up')
+                lora_down = lora_weights.get('down')
+                alpha = lora_weights.get('alpha')
+
+                if lora_up is None or lora_down is None:
+                    continue
+
+                # Backup original weight before first modification
+                self._backup_weight(model_key)
+
+                # Get current parameter
+                param = self._get_parameter(model_key)
+                device = param.device
+                dtype = param.dtype
+
+                # Calculate scale: alpha / rank * strength
+                rank = lora_down.shape[0]
+                if alpha is not None:
+                    alpha_val = alpha.item() if isinstance(alpha, torch.Tensor) else alpha
+                    scale = (alpha_val / rank) * strength
+                else:
+                    scale = strength
+
+                # Move LoRA weights to computation device/dtype
+                lora_up = lora_up.to(device=device, dtype=computation_dtype)
+                lora_down = lora_down.to(device=device, dtype=computation_dtype)
+
+                # Compute delta: up @ down * scale
+                # Handle different tensor shapes (Linear vs Conv2d)
+                if len(lora_up.shape) == 4:
+                    # Conv2d: [out, rank, 1, 1] @ [rank, in, kh, kw]
+                    delta = torch.mm(
+                        lora_up.squeeze(3).squeeze(2),
+                        lora_down.squeeze(3).squeeze(2)
+                    ).unsqueeze(2).unsqueeze(3) * scale
+                else:
+                    # Linear: [out, rank] @ [rank, in]
+                    delta = (lora_up @ lora_down) * scale
+
+                # Apply delta to weight
+                with torch.no_grad():
+                    if param.shape == delta.shape:
+                        # Track overlapping keys
+                        if model_key in keys_modified_by_lora:
+                            overlapping_keys.add(model_key)
+                            # Log when same key is modified by second LoRA
+                            if len(overlapping_keys) == 1:  # First overlap detected
+                                current_val = (param.data.mean().item(), param.data.std().item())
+                                print(f"[Z-Image LoRA DEBUG] OVERLAP: {model_key} modified by LoRA {lora_idx+1}")
+                                print(f"[Z-Image LoRA DEBUG] Current (after LoRA1): mean={current_val[0]:.6f}, std={current_val[1]:.6f}")
+                                print(f"[Z-Image LoRA DEBUG] Adding delta: mean={delta.mean().item():.6f}, std={delta.std().item():.6f}")
+                        keys_modified_by_lora[model_key] = lora_idx
+
+                        # Debug: Track first modified key across all LoRAs
+                        if first_modified_key is None:
+                            first_modified_key = model_key
+                            first_modified_before = (param.data.mean().item(), param.data.std().item(),
+                                                     param.data.min().item(), param.data.max().item())
+                            print(f"[Z-Image LoRA DEBUG] First modified key: {model_key}")
+                            print(f"[Z-Image LoRA DEBUG] Before: mean={first_modified_before[0]:.6f}, "
+                                  f"std={first_modified_before[1]:.6f}, min={first_modified_before[2]:.6f}, "
+                                  f"max={first_modified_before[3]:.6f}")
+
+                        # Log delta statistics for first delta of each LoRA
+                        if applied == 0:
+                            print(f"[Z-Image LoRA DEBUG] Delta stats for {model_key}: "
+                                  f"mean={delta.mean().item():.6f}, std={delta.std().item():.6f}, "
+                                  f"min={delta.min().item():.6f}, max={delta.max().item():.6f}, "
+                                  f"scale={scale:.6f}, rank={rank}")
+                            if torch.isnan(delta).any() or torch.isinf(delta).any():
+                                print(f"[Z-Image LoRA DEBUG] ERROR: Delta contains NaN or Inf!")
+
+                        # IMPORTANT: Do the addition in float32 to avoid bfloat16 precision loss
+                        # bfloat16 has only 7 bits of mantissa, so small deltas get lost
+                        if applied == 0:
+                            # Debug: Show specific value before/after for first weight
+                            val_before = param.data[0, 0].item() if len(param.shape) >= 2 else param.data[0].item()
+                            print(f"[Z-Image LoRA DEBUG] dtype={dtype}, param device={param.device}")
+                            print(f"[Z-Image LoRA DEBUG] Single value before: {val_before:.10f}")
+
+                        if dtype == torch.bfloat16 or dtype == torch.float16:
+                            new_data = (param.data.float() + delta).to(dtype=dtype)
+                            param.data.copy_(new_data)
+                        else:
+                            param.data.add_(delta.to(dtype=dtype))
+
+                        if applied == 0:
+                            val_after = param.data[0, 0].item() if len(param.shape) >= 2 else param.data[0].item()
+                            delta_val = delta[0, 0].item() if len(delta.shape) >= 2 else delta[0].item()
+                            print(f"[Z-Image LoRA DEBUG] Delta value: {delta_val:.10f}")
+                            print(f"[Z-Image LoRA DEBUG] Single value after: {val_after:.10f}")
+                            print(f"[Z-Image LoRA DEBUG] Actual change: {val_after - val_before:.10f}")
+
+                        applied += 1
+                    else:
+                        print(f"[Z-Image LoRA] Shape mismatch for {model_key}: "
+                              f"param={param.shape}, delta={delta.shape}")
+
+            if unmatched_keys:
+                print(f"[Z-Image LoRA] {len(unmatched_keys)} unmatched keys in {lora_path}")
+                if len(unmatched_keys) <= 5:
+                    print(f"[Z-Image LoRA] Unmatched: {unmatched_keys}")
+
+            print(f"[Z-Image LoRA] Applied {applied}/{matched} layers from {lora_path}")
+
+            self.applied_loras.append((lora_path, strength))
+            total_applied += applied
+            total_matched += matched
+            total_unmatched += len(unmatched_keys)
+
+        # Debug: Check the first modified weight after all modifications
+        if first_modified_key:
+            try:
+                param = self._get_parameter(first_modified_key)
+                after = (param.data.mean().item(), param.data.std().item(),
+                         param.data.min().item(), param.data.max().item())
+                print(f"[Z-Image LoRA DEBUG] After all LoRAs - {first_modified_key}:")
+                print(f"[Z-Image LoRA DEBUG] After: mean={after[0]:.6f}, std={after[1]:.6f}, "
+                      f"min={after[2]:.6f}, max={after[3]:.6f}")
+
+                # Show the change
+                if first_modified_before:
+                    mean_diff = after[0] - first_modified_before[0]
+                    std_diff = after[1] - first_modified_before[1]
+                    print(f"[Z-Image LoRA DEBUG] Change: mean_diff={mean_diff:.6f}, std_diff={std_diff:.6f}")
+
+                # Check if values are reasonable
+                if abs(after[0]) > 100 or after[1] > 100:
+                    print(f"[Z-Image LoRA DEBUG] WARNING: Weight values seem abnormally large!")
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    print(f"[Z-Image LoRA DEBUG] ERROR: Weight contains NaN or Inf values!")
+            except Exception as e:
+                print(f"[Z-Image LoRA DEBUG] Error checking weight: {e}")
+
+        # Debug: Check backup status and overlaps
+        print(f"[Z-Image LoRA DEBUG] Backup contains {len(self.weight_backup)} weights")
+        print(f"[Z-Image LoRA DEBUG] Total unique keys modified: {len(keys_modified_by_lora)}")
+        print(f"[Z-Image LoRA DEBUG] Overlapping keys (modified by multiple LoRAs): {len(overlapping_keys)}")
+
+        return {
+            'applied': total_applied,
+            'matched': total_matched,
+            'unmatched': total_unmatched,
+            'loras_loaded': len(self.applied_loras),
+        }
+
+    def get_applied_loras(self) -> list[tuple[str, float]]:
+        """Return list of currently applied LoRAs."""
+        return self.applied_loras.copy()
+
+
+# Global manager instance per model (weak reference would be better but this is simpler)
+_lora_managers = {}
+
+
+def get_lora_manager(model) -> ZImageLoRAManager:
+    """
+    Get or create a LoRA manager for a model.
+
+    Args:
+        model: The Z-Image model
+
+    Returns:
+        ZImageLoRAManager instance for this model
+    """
+    model_id = id(model)
+    if model_id not in _lora_managers:
+        _lora_managers[model_id] = ZImageLoRAManager(model)
+    return _lora_managers[model_id]
+
+
+def verify_lora_weights(model, sample_key: str = None) -> dict:
+    """
+    Verify that LoRA modifications are still present on the model.
+    Call this during inference to ensure weights haven't been reset.
+
+    Args:
+        model: The model to verify
+        sample_key: Specific key to check (optional)
+
+    Returns:
+        Dict with verification results
+    """
+    model_id = id(model)
+    if model_id not in _lora_managers:
+        return {'status': 'no_manager', 'message': 'No LoRA manager found for this model'}
+
+    manager = _lora_managers[model_id]
+    if not manager.weight_backup:
+        return {'status': 'no_backup', 'message': 'No weight backup exists (no LoRAs applied?)'}
+
+    results = {
+        'status': 'ok',
+        'loras_applied': len(manager.applied_loras),
+        'weights_backed_up': len(manager.weight_backup),
+        'sample_checks': []
+    }
+
+    # Check a few sample weights
+    keys_to_check = list(manager.weight_backup.keys())[:3]
+    if sample_key and sample_key in manager.weight_backup:
+        keys_to_check = [sample_key] + [k for k in keys_to_check if k != sample_key][:2]
+
+    for key in keys_to_check:
+        try:
+            param = manager._get_parameter(key)
+            backup = manager.weight_backup[key]
+
+            # Move backup to same device for comparison
+            backup_on_device = backup.to(device=param.device)
+
+            current_mean = param.data.mean().item()
+            backup_mean = backup.mean().item()
+
+            # Check individual values (first few elements)
+            current_flat = param.data.flatten()[:5]
+            backup_flat = backup_on_device.flatten()[:5]
+
+            # Calculate actual difference
+            diff = (param.data.float() - backup_on_device.float()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            # Check if current weights differ from backup (meaning LoRAs are applied)
+            is_modified = max_diff > 1e-7
+
+            results['sample_checks'].append({
+                'key': key,
+                'current_mean': current_mean,
+                'backup_mean': backup_mean,
+                'max_diff': max_diff,
+                'mean_diff': mean_diff,
+                'current_sample': [v.item() for v in current_flat],
+                'backup_sample': [v.item() for v in backup_flat],
+                'is_modified': is_modified,
+                'device': str(param.device)
+            })
+        except Exception as e:
+            results['sample_checks'].append({
+                'key': key,
+                'error': str(e)
+            })
+
+    return results
+
+
+def clear_lora_manager(model):
+    """Remove the LoRA manager for a model (call when model is unloaded)."""
+    model_id = id(model)
+    if model_id in _lora_managers:
+        _lora_managers[model_id].clear_loras()
+        del _lora_managers[model_id]
 
 
 def lora_key_to_model_key(lora_key: str) -> str:
@@ -136,6 +622,81 @@ def load_zimage_lora_patches(lora_state: dict, model) -> tuple[dict, dict]:
     return patch_dict, remaining_dict
 
 
+def convert_sdscripts_key_to_dotted(key: str) -> str:
+    """
+    Convert sd-scripts/musubi-tuner format key to dot-separated format.
+
+    sd-scripts format uses underscores for the entire path:
+        lora_unet_layers_0_attention_to_q -> diffusion_model.layers.0.attention.to_q
+        lora_unet_layers_0_attention_to_out_0 -> diffusion_model.layers.0.attention.to_out.0
+        lora_unet_layers_0_feed_forward_w1 -> diffusion_model.layers.0.feed_forward.w1
+
+    This requires careful parsing because some module names contain underscores
+    (e.g., to_q, to_out, feed_forward) that should NOT be converted to dots.
+    """
+    import re
+
+    if not key.startswith('lora_unet_'):
+        return key
+
+    path = key[len('lora_unet_'):]
+
+    # Handle Z-Image transformer structure:
+    # layers.{N}.attention.{to_q|to_k|to_v|to_out.0|norm_q|norm_k}
+    # layers.{N}.feed_forward.{w1|w2|w3}
+
+    # Pattern for attention submodules
+    m = re.match(r'layers_(\d+)_attention_(.+)', path)
+    if m:
+        layer_idx = m.group(1)
+        submodule = m.group(2)
+        # Handle to_out_0 -> to_out.0 (ModuleList index)
+        submodule = re.sub(r'_(\d+)$', r'.\1', submodule)
+        return f'diffusion_model.layers.{layer_idx}.attention.{submodule}'
+
+    # Pattern for feed_forward submodules
+    m = re.match(r'layers_(\d+)_feed_forward_(.+)', path)
+    if m:
+        layer_idx = m.group(1)
+        submodule = m.group(2)
+        return f'diffusion_model.layers.{layer_idx}.feed_forward.{submodule}'
+
+    # Handle noise_refiner and context_refiner blocks
+    m = re.match(r'(noise_refiner|context_refiner)_(\d+)_attention_(.+)', path)
+    if m:
+        block_name = m.group(1)
+        block_idx = m.group(2)
+        submodule = m.group(3)
+        submodule = re.sub(r'_(\d+)$', r'.\1', submodule)
+        return f'diffusion_model.{block_name}.{block_idx}.attention.{submodule}'
+
+    m = re.match(r'(noise_refiner|context_refiner)_(\d+)_feed_forward_(.+)', path)
+    if m:
+        block_name = m.group(1)
+        block_idx = m.group(2)
+        submodule = m.group(3)
+        return f'diffusion_model.{block_name}.{block_idx}.feed_forward.{submodule}'
+
+    # Fallback: simple underscore-to-dot conversion
+    # Replace underscores before digits (handles layer indices)
+    path = re.sub(r'_(\d+)', r'.\1', path)
+    # Replace remaining underscores that are likely module separators
+    # But preserve underscores in known compound names
+    for compound in ['feed_forward', 'to_out', 'to_q', 'to_k', 'to_v', 'norm_q', 'norm_k',
+                     'noise_refiner', 'context_refiner', 'attention_norm1', 'attention_norm2',
+                     'ffn_norm1', 'ffn_norm2', 'adaLN_modulation']:
+        placeholder = compound.replace('_', '@@UNDERSCORE@@')
+        path = path.replace(compound, placeholder)
+    path = path.replace('_', '.')
+    path = path.replace('@@UNDERSCORE@@', '_')
+
+    return 'diffusion_model.' + path
+
+
+# Track if we've logged the format detection message
+_logged_format_detection = False
+
+
 def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
     """
     Extract the base key and type from a full LoRA key.
@@ -143,11 +704,36 @@ def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
     Returns (base_key, type) where type is 'up', 'down', or 'alpha'
     Returns None if not a valid LoRA key.
 
-    Supports two LoRA formats:
+    Supports multiple LoRA formats:
     - Kohya/WebUI format: .lora_up.weight, .lora_down.weight
     - PEFT/HuggingFace format: .lora_B.weight (up), .lora_A.weight (down)
+    - sd-scripts/musubi-tuner format: lora_unet_*
     """
-    # Kohya/WebUI format
+    global _logged_format_detection
+
+    # First, detect and convert sd-scripts format
+    # sd-scripts keys look like: lora_unet_layers_0_attention_to_q.lora_down.weight
+    if full_key.startswith('lora_unet_'):
+        if not _logged_format_detection:
+            print("[Z-Image LoRA] Detected sd-scripts/musubi-tuner LoRA format")
+            _logged_format_detection = True
+
+        # Extract the suffix (.lora_up.weight, .lora_down.weight, .alpha)
+        if '.lora_up.weight' in full_key:
+            base_part = full_key.split('.lora_up.weight')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'up'
+        elif '.lora_down.weight' in full_key:
+            base_part = full_key.split('.lora_down.weight')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'down'
+        elif '.alpha' in full_key:
+            base_part = full_key.split('.alpha')[0]
+            converted = convert_sdscripts_key_to_dotted(base_part)
+            return converted, 'alpha'
+        return None
+
+    # Kohya/WebUI format (with dot-separated paths)
     if full_key.endswith('.lora_up.weight'):
         return full_key[:-len('.lora_up.weight')], 'up'
     elif full_key.endswith('.lora_down.weight'):

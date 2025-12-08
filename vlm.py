@@ -224,19 +224,32 @@ class VLMManager:
             elif quantization == "8bit":
                 try:
                     from transformers import BitsAndBytesConfig
+
+                    # Clear GPU memory before loading
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    print("Using 8-bit quantization...")
+
+                    # 8-bit quantization must happen on GPU (bitsandbytes requirement)
+                    # But we can control memory by loading weights incrementally
                     load_kwargs["quantization_config"] = BitsAndBytesConfig(
                         load_in_8bit=True,
-                        llm_int8_enable_fp32_cpu_offload=True,
+                        # Skip quantizing certain modules to save memory during loading
+                        llm_int8_skip_modules=["lm_head", "embed_tokens"],
                     )
-                    load_kwargs["device_map"] = "auto"
-                    # Use disk offloading for very large models during quantization
+                    load_kwargs["device_map"] = "sequential"  # Load layers one by one
+                    load_kwargs["max_memory"] = {0: "45GiB", "cpu": "100GiB"}
+
+                    # Offload folder for overflow
                     offload_dir = Path(tempfile.gettempdir()) / "vlm_offload"
                     offload_dir.mkdir(exist_ok=True)
                     load_kwargs["offload_folder"] = str(offload_dir)
-                    load_kwargs["offload_state_dict"] = True
-                    print(f"Using 8-bit quantization (offloading to {offload_dir})")
-                except ImportError:
-                    print("Warning: bitsandbytes not installed, falling back to bfloat16")
+
+                except ImportError as e:
+                    print(f"Warning: bitsandbytes not installed, falling back to bfloat16")
                     load_kwargs["torch_dtype"] = torch.bfloat16
                     load_kwargs["device_map"] = "auto"
             else:

@@ -471,8 +471,7 @@ class ZImage(ForgeDiffusionEngine):
             return_tensors="pt",
         )
 
-        # Move to device
-        device = text_encoder.device
+        device = text_encoder.embed_tokens.weight.device
         text_input_ids = text_inputs.input_ids.to(device)
         prompt_masks = text_inputs.attention_mask.to(device).bool()
 
@@ -531,13 +530,27 @@ class ZImage(ForgeDiffusionEngine):
 
             try:
                 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+                from modules import shared
 
                 ZImage._generation_processor = AutoProcessor.from_pretrained(model_path)
-                ZImage._generation_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto",
-                )
+
+                # Check if --lowram flag is set (weight_load_location is None when --lowram is used)
+                # When --lowram is set, load directly to GPU to avoid RAM usage
+                if shared.weight_load_location is None:
+                    print("--lowram detected: Loading prompt expansion model directly to GPU...")
+                    ZImage._generation_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        device_map={"": memory_management.get_torch_device()},
+                    )
+                else:
+                    # Default behavior: let accelerate decide (may use RAM as buffer)
+                    ZImage._generation_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                    )
                 print("Qwen3-VL generation model loaded successfully!")
             except Exception as e:
                 raise RuntimeError(f"Failed to load Qwen3-VL generation model: {e}")

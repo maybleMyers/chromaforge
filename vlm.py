@@ -1,0 +1,823 @@
+"""
+VLM Chat Interface for Qwen Vision-Language Models
+A standalone GUI for interacting with Qwen VL models using images, videos, and text.
+"""
+
+import os
+import sys
+import gc
+import argparse
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
+
+import torch
+import gradio as gr
+from PIL import Image
+
+# Try to import video processing utilities
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("Warning: opencv-python not installed. Video support will be limited.")
+
+# Default model paths (relative to models/LLM)
+DEFAULT_MODELS = {
+    "Qwen3-VL-8B-Caption-V4.5": "models/LLM/Qwen3-VL-8B-Caption-V4.5",
+    "Qwen3-VL-4B-Instruct": "models/LLM/Qwen3-VL-4B-Instruct",
+    "Qwen3-VL-30B-A3B-Instruct": "models/LLM/Qwen3-VL-30B-A3B-Instruct",
+}
+
+
+def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448)) -> List[Image.Image]:
+    """
+    Extract frames from a video file for VLM processing.
+
+    Args:
+        video_path: Path to the video file
+        max_frames: Maximum number of frames to extract
+        target_size: Target size for frames (width, height)
+
+    Returns:
+        List of PIL Images
+    """
+    if not CV2_AVAILABLE:
+        raise RuntimeError("opencv-python is required for video processing. Install with: pip install opencv-python")
+
+    frames = []
+    cap = cv2.VideoCapture(video_path)
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return frames
+
+        # Calculate frame indices to extract (evenly spaced)
+        if total_frames <= max_frames:
+            frame_indices = list(range(total_frames))
+        else:
+            frame_indices = [int(i * (total_frames - 1) / (max_frames - 1)) for i in range(max_frames)]
+
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+                # Resize to target size
+                pil_image = pil_image.resize(target_size, Image.Resampling.LANCZOS)
+                frames.append(pil_image)
+    finally:
+        cap.release()
+
+    return frames
+
+
+class VLMManager:
+    """Manages Qwen VL model loading, inference, and memory."""
+
+    def __init__(self, low_vram: bool = False):
+        self.model = None
+        self.processor = None
+        self.model_name = None
+        self.low_vram = low_vram
+        self.device = self._get_device()
+
+    def _get_device(self) -> torch.device:
+        """Get the best available device."""
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def get_available_models(self) -> List[str]:
+        """Scan for available models in the models/LLM directory."""
+        models = []
+        llm_dir = Path("models/LLM")
+
+        if llm_dir.exists():
+            for item in llm_dir.iterdir():
+                if item.is_dir():
+                    # Check if it looks like a valid model directory
+                    if (item / "config.json").exists() or (item / "model.safetensors").exists():
+                        models.append(item.name)
+
+        # Also check default paths
+        for name, path in DEFAULT_MODELS.items():
+            if Path(path).exists() and name not in models:
+                models.append(name)
+
+        return sorted(models) if models else ["No models found"]
+
+    def _detect_model_type(self, model_path: str) -> str:
+        """Detect the model type from config.json."""
+        import json
+        config_path = Path(model_path) / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                model_type = config.get("model_type", "").lower()
+                if "qwen3" in model_type:
+                    return "qwen3_vl"
+                elif "qwen2_5" in model_type or "qwen2.5" in model_type:
+                    return "qwen2_5_vl"
+                elif "qwen2" in model_type:
+                    return "qwen2_vl"
+            except Exception as e:
+                print(f"Warning: Could not read config.json: {e}")
+
+        # Fallback to name-based detection
+        model_name_lower = Path(model_path).name.lower()
+        if "qwen3" in model_name_lower:
+            return "qwen3_vl"
+        elif "qwen2.5" in model_name_lower or "qwen2_5" in model_name_lower:
+            return "qwen2_5_vl"
+
+        return "qwen2_5_vl"  # Default fallback
+
+    def load_model(self, model_name: str, quantization: str = "none", use_flash_attn: bool = False, progress=gr.Progress()) -> str:
+        """Load a Qwen VL model.
+
+        Args:
+            model_name: Name of the model to load
+            quantization: "none", "4bit", or "8bit"
+            use_flash_attn: Whether to use Flash Attention 2
+            progress: Gradio progress callback
+        """
+        if model_name == "No models found":
+            return "No models available. Please download a model first."
+
+        # Check if already loaded
+        if self.model is not None and self.model_name == model_name:
+            return f"Model '{model_name}' is already loaded."
+
+        # Unload existing model first
+        if self.model is not None:
+            self.unload_model()
+
+        progress(0.1, desc="Loading model...")
+
+        # Determine model path
+        if model_name in DEFAULT_MODELS:
+            model_path = DEFAULT_MODELS[model_name]
+        else:
+            model_path = f"models/LLM/{model_name}"
+
+        if not Path(model_path).exists():
+            return f"Model path not found: {model_path}"
+
+        try:
+            # Detect model type from config
+            model_type = self._detect_model_type(model_path)
+            print(f"Detected model type: {model_type}")
+
+            from transformers import AutoProcessor
+
+            progress(0.3, desc="Loading processor...")
+            self.processor = AutoProcessor.from_pretrained(model_path)
+
+            progress(0.5, desc=f"Loading model weights ({model_type})...")
+
+            # Select the correct model class based on detected type
+            if model_type == "qwen3_vl":
+                from transformers import Qwen3VLForConditionalGeneration as ModelClass
+            else:
+                from transformers import Qwen2_5_VLForConditionalGeneration as ModelClass
+
+            # Build loading kwargs
+            load_kwargs = {
+                "low_cpu_mem_usage": True,
+            }
+
+            # Configure quantization for faster inference with less VRAM
+            if quantization == "4bit":
+                try:
+                    from transformers import BitsAndBytesConfig
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                    # 4-bit models must use device_map for proper loading
+                    load_kwargs["device_map"] = "auto"
+                    print("Using 4-bit quantization (NF4)")
+                except ImportError:
+                    print("Warning: bitsandbytes not installed, falling back to bfloat16")
+                    load_kwargs["torch_dtype"] = torch.bfloat16
+                    load_kwargs["device_map"] = "auto"
+            elif quantization == "8bit":
+                try:
+                    from transformers import BitsAndBytesConfig
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                    )
+                    load_kwargs["device_map"] = "auto"
+                    print("Using 8-bit quantization")
+                except ImportError:
+                    print("Warning: bitsandbytes not installed, falling back to bfloat16")
+                    load_kwargs["torch_dtype"] = torch.bfloat16
+                    load_kwargs["device_map"] = "auto"
+            else:
+                load_kwargs["torch_dtype"] = torch.bfloat16
+                # Set device map based on low_vram setting
+                if self.low_vram:
+                    load_kwargs["device_map"] = {"": self.device}
+                else:
+                    load_kwargs["device_map"] = "auto"
+
+            # Use Flash Attention 2 if requested
+            if use_flash_attn:
+                load_kwargs["attn_implementation"] = "flash_attention_2"
+                print("Using Flash Attention 2")
+
+            self.model = ModelClass.from_pretrained(model_path, **load_kwargs)
+
+            self.model_name = model_name
+            progress(1.0, desc="Model loaded!")
+
+            quant_info = f", {quantization}" if quantization != "none" else ""
+            flash_info = ", flash_attn" if use_flash_attn else ""
+            return f"Successfully loaded '{model_name}' ({model_type}{quant_info}{flash_info})"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Failed to load model: {str(e)}"
+
+    def unload_model(self) -> str:
+        """Unload the current model to free memory."""
+        if self.model is None:
+            return "No model is currently loaded."
+
+        model_name = self.model_name
+
+        del self.model
+        del self.processor
+        self.model = None
+        self.processor = None
+        self.model_name = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return f"Unloaded '{model_name}' and freed memory."
+
+    def get_memory_info(self) -> str:
+        """Get current GPU memory usage."""
+        if not torch.cuda.is_available():
+            return "CUDA not available"
+
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+
+        return f"GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {total:.1f}GB total"
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        repetition_penalty: float = 1.1,
+        video_max_frames: int = 8,
+    ) -> str:
+        """Generate a response from the model."""
+        if self.model is None:
+            return "Error: No model loaded. Please load a model first."
+
+        try:
+            # Extract images and videos from messages, process videos into frames
+            images = []
+            processed_messages = []
+
+            for msg in messages:
+                if isinstance(msg.get("content"), list):
+                    new_content = []
+                    for item in msg["content"]:
+                        if item.get("type") == "image" and "image" in item:
+                            images.append(item["image"])
+                            new_content.append({"type": "image", "image": item["image"]})
+                        elif item.get("type") == "video" and "video" in item:
+                            # Process video into frames
+                            video_path = item["video"]
+                            if isinstance(video_path, str) and os.path.exists(video_path):
+                                try:
+                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                    # Add each frame as an image
+                                    for frame in frames:
+                                        images.append(frame)
+                                        new_content.append({"type": "image", "image": frame})
+                                    # Add a note about video frames
+                                    if frames:
+                                        new_content.append({"type": "text", "text": f"[The above {len(frames)} images are frames extracted from a video]"})
+                                except Exception as e:
+                                    new_content.append({"type": "text", "text": f"[Video processing error: {str(e)}]"})
+                            else:
+                                new_content.append({"type": "text", "text": "[Video file not found]"})
+                        else:
+                            new_content.append(item)
+                    processed_messages.append({"role": msg["role"], "content": new_content})
+                else:
+                    processed_messages.append(msg)
+
+            # Apply chat template
+            text_input = self.processor.apply_chat_template(
+                processed_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            # Process inputs
+            process_kwargs = {"text": [text_input], "padding": True, "return_tensors": "pt"}
+
+            if images:
+                process_kwargs["images"] = images
+
+            inputs = self.processor(**process_kwargs)
+
+            # Move to device
+            device = next(self.model.parameters()).device
+            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+
+            # Generate with timing
+            input_len = inputs['input_ids'].shape[1]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else 1.0,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+            )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+
+            # Calculate throughput
+            generated_ids = outputs[0][input_len:]
+            num_generated_tokens = len(generated_ids)
+            generation_time = end_time - start_time
+            tokens_per_sec = num_generated_tokens / generation_time if generation_time > 0 else 0
+
+            print(f"[Inference] Generated {num_generated_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
+
+            response = self.processor.decode(generated_ids, skip_special_tokens=True)
+
+            # Clean up thinking tags if present
+            if "</think>" in response:
+                response = response.split("</think>")[-1].strip()
+
+            return response
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Error during generation: {str(e)}"
+
+
+# Global manager instance
+vlm_manager: Optional[VLMManager] = None
+
+
+def initialize_manager(low_vram: bool = False):
+    """Initialize the global VLM manager."""
+    global vlm_manager
+    vlm_manager = VLMManager(low_vram=low_vram)
+
+
+def load_model_handler(model_name: str, quantization: str, use_flash_attn: bool, progress=gr.Progress()):
+    """Handle model loading from UI."""
+    if vlm_manager is None:
+        return "Manager not initialized"
+    return vlm_manager.load_model(model_name, quantization, use_flash_attn, progress)
+
+
+def unload_model_handler():
+    """Handle model unloading from UI."""
+    if vlm_manager is None:
+        return "Manager not initialized"
+    return vlm_manager.unload_model()
+
+
+def get_memory_handler():
+    """Handle memory info request from UI."""
+    if vlm_manager is None:
+        return "Manager not initialized"
+    return vlm_manager.get_memory_info()
+
+
+def chat_handler(
+    message: str,
+    history: List[Tuple[str, str]],
+    system_prompt: str,
+    image,
+    video,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    video_max_frames: int = 8,
+    auto_unload: bool = False,
+):
+    """Handle chat messages from UI."""
+    if vlm_manager is None or vlm_manager.model is None:
+        return history + [(message, "Error: No model loaded. Please load a model first.")], ""
+
+    # Build messages list for the model
+    messages = []
+
+    # Add system prompt if provided
+    if system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+
+    # Add chat history (convert from Gradio tuple format to model format)
+    for user_msg, assistant_msg in history:
+        # Skip image-only entries (where assistant_msg is None)
+        if assistant_msg is None:
+            continue
+
+        # Extract text from user message (may contain tuples for files)
+        if isinstance(user_msg, tuple):
+            # Tuple format is (filepath,) for images - skip these in history
+            continue
+        elif isinstance(user_msg, str):
+            user_text = user_msg
+        else:
+            user_text = str(user_msg)
+
+        if user_text:  # Only add non-empty messages
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": assistant_msg})
+
+    # Build current message content for the model
+    model_content = []
+
+    if image is not None:
+        model_content.append({"type": "image", "image": image})
+
+    if video is not None:
+        model_content.append({"type": "video", "video": video})
+
+    model_content.append({"type": "text", "text": message})
+
+    messages.append({"role": "user", "content": model_content})
+
+    # Generate response
+    response = vlm_manager.generate(
+        messages=messages,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        video_max_frames=video_max_frames,
+    )
+
+    # Build display content for chatbot (classic tuple format)
+    # Format: [(user_msg, bot_msg), ...] where user_msg can be (filepath,) for files
+    new_history = list(history)
+
+    if image is not None:
+        # Save image to temp file for display
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"vlm_chat_{id(image)}.png")
+        image.save(temp_path)
+        # Add image as separate message, then text+response
+        new_history.append(((temp_path,), None))
+        if message:
+            new_history.append((message, response))
+        else:
+            # If no text, attach response to a placeholder
+            new_history.append(("[Describe this image]", response))
+    elif video is not None:
+        new_history.append(((video,), None))
+        if message:
+            new_history.append((message, response))
+        else:
+            new_history.append(("[Describe this video]", response))
+    else:
+        new_history.append((message, response))
+
+    # Auto-unload if requested
+    status_msg = ""
+    if auto_unload and vlm_manager.model is not None:
+        status_msg = vlm_manager.unload_model()
+
+    return new_history, status_msg
+
+
+def clear_chat_handler():
+    """Clear chat history."""
+    return []
+
+
+def create_ui():
+    """Create the Gradio interface."""
+    available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
+
+    with gr.Blocks(title="Chromaforge VLM Chat", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# Chromaforge VLM Chat")
+        gr.Markdown("Chat with Qwen Vision-Language models using images, videos, and text.")
+
+        with gr.Accordion("Setup Instructions", open=False):
+            gr.Markdown("""
+### How to Use
+
+1. **Download a model** to `models/LLM/` directory:
+   - Recommended: `Qwen3-VL-8B-Caption-V4.5` (good balance of quality and speed)
+   - Smaller: `Qwen3-VL-4B-Instruct` (faster, less VRAM)
+   - Larger: `Qwen3-VL-30B-A3B-Instruct` (best quality, requires more VRAM)
+
+2. **Load the model** using the Load Model button
+
+3. **Chat** with the model by typing messages and optionally uploading images or videos
+
+### Command Line Options
+
+- `--lowvram` - Enable low VRAM mode for GPUs with limited memory
+- `--port PORT` - Change the server port (default: 7862)
+- `--share` - Create a public Gradio link
+
+### Tips
+
+- Use the **System Prompt** to guide the model's behavior
+- Enable **Auto-unload** if you need to free VRAM after each response
+- For videos, adjust **Max Video Frames** to control how many frames are analyzed
+            """)
+
+        with gr.Row():
+            # Left column - Settings
+            with gr.Column(scale=1):
+                gr.Markdown("### Model Settings")
+
+                model_dropdown = gr.Dropdown(
+                    choices=available_models,
+                    value=available_models[0] if available_models else None,
+                    label="Select Model",
+                    interactive=True,
+                )
+
+                refresh_models_btn = gr.Button("Refresh Model List", size="sm")
+
+                quantization_dropdown = gr.Dropdown(
+                    choices=["none", "4bit", "8bit"],
+                    value="none",
+                    label="Quantization",
+                    info="4-bit: ~4GB VRAM, 8-bit: ~8GB VRAM, none: ~16GB for 8B model",
+                    interactive=True,
+                )
+
+                use_flash_attn = gr.Checkbox(
+                    label="Use Flash Attention 2",
+                    value=False,
+                    info="Faster attention, requires flash-attn package",
+                )
+
+                with gr.Row():
+                    load_btn = gr.Button("Load Model", variant="primary")
+                    unload_btn = gr.Button("Unload Model", variant="secondary")
+
+                model_status = gr.Textbox(
+                    label="Model Status",
+                    value="No model loaded",
+                    interactive=False,
+                )
+
+                refresh_btn = gr.Button("Refresh Memory Info")
+                memory_info = gr.Textbox(
+                    label="Memory Info",
+                    value=vlm_manager.get_memory_info() if vlm_manager else "N/A",
+                    interactive=False,
+                )
+
+                gr.Markdown("### System Prompt")
+                system_prompt = gr.Textbox(
+                    label="System Prompt",
+                    placeholder="Enter a system prompt to guide the model's behavior...",
+                    lines=4,
+                    value="You are a helpful AI assistant that can understand and describe images and videos in detail.",
+                )
+
+                gr.Markdown("### Generation Settings")
+                max_tokens = gr.Slider(
+                    minimum=64,
+                    maximum=2048,
+                    value=512,
+                    step=64,
+                    label="Max New Tokens",
+                )
+                temperature = gr.Slider(
+                    minimum=0.0,
+                    maximum=2.0,
+                    value=0.7,
+                    step=0.1,
+                    label="Temperature",
+                )
+                top_p = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=0.9,
+                    step=0.05,
+                    label="Top P",
+                )
+                top_k = gr.Slider(
+                    minimum=1,
+                    maximum=100,
+                    value=50,
+                    step=1,
+                    label="Top K",
+                )
+                repetition_penalty = gr.Slider(
+                    minimum=1.0,
+                    maximum=2.0,
+                    value=1.1,
+                    step=0.05,
+                    label="Repetition Penalty",
+                )
+
+                gr.Markdown("### Video Settings")
+                video_max_frames = gr.Slider(
+                    minimum=1,
+                    maximum=32,
+                    value=8,
+                    step=1,
+                    label="Max Video Frames",
+                    info="Number of frames to extract from videos",
+                )
+
+                gr.Markdown("### Memory Settings")
+                auto_unload = gr.Checkbox(
+                    label="Auto-unload after generation",
+                    value=False,
+                    info="Unload model after each response (saves VRAM but slower)",
+                )
+
+            # Right column - Chat
+            with gr.Column(scale=2):
+                gr.Markdown("### Chat")
+
+                chatbot = gr.Chatbot(
+                    label="Conversation",
+                    height=400,
+                    show_copy_button=True,
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        image_input = gr.Image(
+                            label="Upload Image (optional)",
+                            type="pil",
+                            height=150,
+                        )
+                    with gr.Column(scale=1):
+                        video_input = gr.Video(
+                            label="Upload Video (optional)",
+                            height=150,
+                        )
+
+                with gr.Row():
+                    msg_input = gr.Textbox(
+                        label="Message",
+                        placeholder="Type your message here...",
+                        lines=2,
+                        scale=4,
+                    )
+                    send_btn = gr.Button("Send", variant="primary", scale=1)
+
+                clear_btn = gr.Button("Clear Chat")
+
+        # Event handlers
+        def refresh_models():
+            """Refresh the list of available models."""
+            if vlm_manager is None:
+                return gr.update(choices=["Manager not initialized"])
+            models = vlm_manager.get_available_models()
+            return gr.update(choices=models, value=models[0] if models else None)
+
+        refresh_models_btn.click(
+            fn=refresh_models,
+            outputs=[model_dropdown],
+        )
+
+        load_btn.click(
+            fn=load_model_handler,
+            inputs=[model_dropdown, quantization_dropdown, use_flash_attn],
+            outputs=[model_status],
+        )
+
+        unload_btn.click(
+            fn=unload_model_handler,
+            outputs=[model_status],
+        )
+
+        refresh_btn.click(
+            fn=get_memory_handler,
+            outputs=[memory_info],
+        )
+
+        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, tp, tk, rep, vid_frames, auto_unl):
+            if not msg.strip() and img is None and vid is None:
+                return history, "", None, None, gr.update()
+
+            new_history, status = chat_handler(
+                msg, history, sys_prompt, img, vid,
+                max_tok, temp, tp, tk, rep, vid_frames, auto_unl
+            )
+            # Update status only if auto-unload happened
+            if status:
+                return new_history, "", None, None, status
+            return new_history, "", None, None, gr.update()
+
+        send_btn.click(
+            fn=send_message,
+            inputs=[
+                msg_input, chatbot, system_prompt, image_input, video_input,
+                max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames, auto_unload
+            ],
+            outputs=[chatbot, msg_input, image_input, video_input, model_status],
+        )
+
+        msg_input.submit(
+            fn=send_message,
+            inputs=[
+                msg_input, chatbot, system_prompt, image_input, video_input,
+                max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames, auto_unload
+            ],
+            outputs=[chatbot, msg_input, image_input, video_input, model_status],
+        )
+
+        clear_btn.click(
+            fn=clear_chat_handler,
+            outputs=[chatbot],
+        )
+
+    return demo
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Chromaforge VLM Chat Interface")
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Create a public Gradio link",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=7862,
+        help="Port to run the server on (default: 7862)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--lowvram",
+        action="store_true",
+        help="Enable low VRAM mode for smaller GPUs",
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("Chromaforge VLM Chat Interface")
+    print("=" * 60)
+    print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
+    print(f"Server: http://{args.host}:{args.port}")
+    print("=" * 60)
+
+    # Initialize the manager
+    initialize_manager(low_vram=args.lowvram)
+
+    # Create and launch the UI
+    demo = create_ui()
+    demo.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+    )
+
+
+if __name__ == "__main__":
+    main()

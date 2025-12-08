@@ -233,20 +233,11 @@ class VLMManager:
 
                     print("Using 8-bit quantization...")
 
-                    # 8-bit quantization must happen on GPU (bitsandbytes requirement)
-                    # But we can control memory by loading weights incrementally
                     load_kwargs["quantization_config"] = BitsAndBytesConfig(
                         load_in_8bit=True,
-                        # Skip quantizing certain modules to save memory during loading
-                        llm_int8_skip_modules=["lm_head", "embed_tokens"],
                     )
-                    load_kwargs["device_map"] = "sequential"  # Load layers one by one
-                    load_kwargs["max_memory"] = {0: "45GiB", "cpu": "100GiB"}
-
-                    # Offload folder for overflow
-                    offload_dir = Path(tempfile.gettempdir()) / "vlm_offload"
-                    offload_dir.mkdir(exist_ok=True)
-                    load_kwargs["offload_folder"] = str(offload_dir)
+                    # Load entirely to GPU
+                    load_kwargs["device_map"] = {"": 0}
 
                 except ImportError as e:
                     print(f"Warning: bitsandbytes not installed, falling back to bfloat16")

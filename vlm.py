@@ -793,6 +793,11 @@ def main():
         help="Host to bind to (default: 127.0.0.1)",
     )
     parser.add_argument(
+        "--listen",
+        action="store_true",
+        help="Listen on 0.0.0.0 to enable LAN access",
+    )
+    parser.add_argument(
         "--lowvram",
         action="store_true",
         help="Enable low VRAM mode for smaller GPUs",
@@ -800,11 +805,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Override host if --listen is specified
+    host = "0.0.0.0" if args.listen else args.host
+
     print("=" * 60)
     print("Chromaforge VLM Chat Interface")
     print("=" * 60)
     print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
-    print(f"Server: http://{args.host}:{args.port}")
+    print(f"Server: http://{host}:{args.port}")
+    if args.listen:
+        print("LAN access: enabled (listening on 0.0.0.0)")
     print("=" * 60)
 
     # Initialize the manager
@@ -813,7 +823,7 @@ def main():
     # Create and launch the UI
     demo = create_ui()
     demo.launch(
-        server_name=args.host,
+        server_name=host,
         server_port=args.port,
         share=args.share,
     )

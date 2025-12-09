@@ -34,7 +34,7 @@ safetensors
 
 # Gradio UI - pinned for Forge compatibility
 gradio==4.44.1
-gradio-client
+gradio-client==1.3.0
 
 # Image/Video processing (let qwen-vl-utils control these)
 opencv-python

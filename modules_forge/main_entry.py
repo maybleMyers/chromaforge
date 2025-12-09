@@ -28,6 +28,9 @@ ui_z_transformer_dtype: gr.Dropdown = None
 ui_z_vae_dtype: gr.Dropdown = None
 ui_z_text_encoder_dtype: gr.Dropdown = None
 
+# ChromaDCT/Radiance specific options
+ui_chromadct_fp8_mode: gr.Dropdown = None
+
 # Z-Image shift UI components (set from ui.py)
 ui_txt2img_zimage_shift: gr.Slider = None
 ui_img2img_zimage_shift: gr.Slider = None
@@ -50,6 +53,9 @@ forge_unet_storage_dtype_options = {
 # Z-Image precision options
 z_precision_options = ['Automatic', 'bfloat16', 'float16', 'float32']
 
+# ChromaDCT/Radiance FP8 options
+chromadct_fp8_options = ['Automatic', 'Convert to FP8', 'Disabled']
+
 module_list = {}
 
 
@@ -67,7 +73,7 @@ def bind_to_opts(comp, k, save=False, callback=None):
 
 
 def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype, ui_chromadct_fp8_mode
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -143,6 +149,10 @@ def make_checkpoint_manager_ui():
 
     ui_z_text_encoder_dtype = gr.Dropdown(label="Z-Image Text Encoder Precision", value=lambda: shared.opts.z_text_encoder_dtype, choices=z_precision_options)
     bind_to_opts(ui_z_text_encoder_dtype, 'z_text_encoder_dtype', save=True, callback=refresh_model_loading_parameters)
+
+    # ChromaDCT/Radiance FP8 options
+    ui_chromadct_fp8_mode = gr.Dropdown(label="Chroma Radiance FP8 Mode", value=lambda: shared.opts.chromadct_fp8_mode, choices=chromadct_fp8_options)
+    bind_to_opts(ui_chromadct_fp8_mode, 'chromadct_fp8_mode', save=True, callback=refresh_model_loading_parameters)
 
     ui_checkpoint.change(checkpoint_change, inputs=[ui_checkpoint], show_progress=False)
     ui_vae.change(modules_change, inputs=[ui_vae], queue=False, show_progress=False)
@@ -360,6 +370,7 @@ def forge_main_entry():
         ui_z_text_encoder_dtype,
         ui_txt2img_zimage_shift,
         ui_img2img_zimage_shift,
+        ui_chromadct_fp8_mode,
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
@@ -406,6 +417,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
             gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
             gr.update(visible=False),                                                   # ui_img2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_chromadct_fp8_mode
         ]
 
     if shared.opts.forge_preset == 'xl':
@@ -442,6 +454,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
             gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
             gr.update(visible=False),                                                   # ui_img2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_chromadct_fp8_mode
         ]
 
     if shared.opts.forge_preset == 'flux':
@@ -478,6 +491,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
             gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
             gr.update(visible=False),                                                   # ui_img2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_chromadct_fp8_mode
         ]
 
     if shared.opts.forge_preset == 'chroma':
@@ -511,6 +525,7 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
             gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
             gr.update(visible=False),                                                   # ui_img2img_zimage_shift
+            gr.update(visible=True, value=getattr(shared.opts, "chromadct_fp8_mode", 'Automatic')),  # ui_chromadct_fp8_mode
         ]
 
     if shared.opts.forge_preset == 'z':
@@ -547,6 +562,7 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
             gr.update(visible=True),                                                    # ui_txt2img_zimage_shift
             gr.update(visible=True),                                                    # ui_img2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_chromadct_fp8_mode
         ]
 
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
@@ -580,6 +596,7 @@ def on_preset_change(preset=None):
         gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
         gr.update(visible=True),                                                        # ui_txt2img_zimage_shift
         gr.update(visible=True),                                                        # ui_img2img_zimage_shift
+        gr.update(visible=True, value=getattr(shared.opts, "chromadct_fp8_mode", 'Automatic')),  # ui_chromadct_fp8_mode
     ]
 
 shared.options_templates.update(shared.options_section(('ui_sd', "UI defaults 'sd'", "ui"), {
@@ -649,4 +666,8 @@ shared.options_templates.update(shared.options_section(('ui_z', "UI defaults 'z'
     "z_transformer_dtype": shared.OptionInfo('Automatic', "Transformer Precision", gr.Dropdown, {"choices": z_precision_options}),
     "z_vae_dtype":         shared.OptionInfo('Automatic', "VAE Precision",         gr.Dropdown, {"choices": z_precision_options}),
     "z_text_encoder_dtype": shared.OptionInfo('Automatic', "Text Encoder Precision", gr.Dropdown, {"choices": z_precision_options}),
+}))
+
+shared.options_templates.update(shared.options_section(('ui_chroma', "UI defaults 'chroma'", "ui"), {
+    "chromadct_fp8_mode": shared.OptionInfo('Automatic', "Radiance FP8 Mode", gr.Dropdown, {"choices": chromadct_fp8_options}),
 }))

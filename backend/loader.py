@@ -450,6 +450,27 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if cls_name == 'ZImageTransformer2DModel':
                 patch_zimage_for_fp16(model)
 
+            # Enable FP8 optimizations for ChromaDCT if weights are FP8
+            if cls_name == 'ChromaDCTTransformer2DModel':
+                from backend.nn.fp8_optimization import detect_fp8_scaled_weights, enable_fp8_for_chromadct, convert_chromadct_to_fp8
+                has_fp8, has_scales = detect_fp8_scaled_weights(state_dict)
+
+                chromadct_fp8_mode = 'Automatic'
+                try:
+                    from modules import shared
+                    chromadct_fp8_mode = getattr(shared.opts, 'chromadct_fp8_mode', 'Automatic')
+                except Exception:
+                    pass
+
+                if has_fp8:
+                    print(f'[ChromaDCT] Detected FP8 weights (has_scales={has_scales}), enabling FP8 optimizations')
+                    enable_fp8_for_chromadct(model, computation_dtype)
+                elif chromadct_fp8_mode == 'Convert to FP8':
+                    print(f'[ChromaDCT] Converting model to FP8 scaled format (user setting)')
+                    convert_chromadct_to_fp8(model, computation_dtype)
+                elif chromadct_fp8_mode == 'Automatic':
+                    pass
+
             if hasattr(model, '_internal_dict'):
                 model._internal_dict = unet_config
             else:

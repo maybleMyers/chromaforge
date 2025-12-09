@@ -45,20 +45,33 @@ try:
     )
     LLAMA_CPP_AVAILABLE = True
 
-    # Try to import Qwen25VLChatHandler (may not exist in older versions)
+    # Try to import Qwen3VLChatHandler first (for Qwen3-VL models), then fall back to Qwen25VLChatHandler
+    Qwen3VLChatHandler = None
+    Qwen25VLChatHandler = None
+    QWEN3_VL_AVAILABLE = False
+    QWEN_VL_AVAILABLE = False
+
+    try:
+        from llama_cpp.llama_chat_format import Qwen3VLChatHandler
+        QWEN3_VL_AVAILABLE = True
+        print("Qwen3VLChatHandler: available")
+    except ImportError:
+        print("Note: Qwen3VLChatHandler not available. Install JamePeng's fork for Qwen3-VL support.")
+
     try:
         from llama_cpp.llama_chat_format import Qwen25VLChatHandler
         QWEN_VL_AVAILABLE = True
+        print("Qwen25VLChatHandler: available")
     except ImportError:
-        Qwen25VLChatHandler = None
-        QWEN_VL_AVAILABLE = False
-        print("Note: Qwen25VLChatHandler not available. Update llama-cpp-python for Qwen-VL support.")
+        print("Note: Qwen25VLChatHandler not available.")
 
 except ImportError:
     LLAMA_CPP_AVAILABLE = False
     QWEN_VL_AVAILABLE = False
+    QWEN3_VL_AVAILABLE = False
     Llama = None
     Qwen25VLChatHandler = None
+    Qwen3VLChatHandler = None
     print("Error: llama-cpp-python not installed.")
     print("Install with CUDA: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
 
@@ -240,8 +253,18 @@ class LlamaCppVLM:
                 print(f"[llama.cpp] Loading mmproj from: {mmproj_path}")
 
                 # Select chat handler based on model type
-                if is_qwen_vl and QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
-                    print("[llama.cpp] Using Qwen25VLChatHandler")
+                # Check for Qwen3-VL first (uses Qwen3VLChatHandler)
+                is_qwen3_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen3-vl", "qwen3vl"])
+
+                if is_qwen3_vl and QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
+                    print("[llama.cpp] Using Qwen3VLChatHandler (for Qwen3-VL)")
+                    try:
+                        self.chat_handler = Qwen3VLChatHandler(clip_model_path=mmproj_path, verbose=False)
+                    except Exception as e:
+                        print(f"Warning: Qwen3VLChatHandler failed: {e}")
+                        self.chat_handler = None
+                elif is_qwen_vl and QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
+                    print("[llama.cpp] Using Qwen25VLChatHandler (for Qwen2.5-VL)")
                     try:
                         self.chat_handler = Qwen25VLChatHandler(clip_model_path=mmproj_path, verbose=False)
                     except Exception as e:
@@ -261,6 +284,8 @@ class LlamaCppVLM:
                     # Try handlers in order of likelihood
                     print("[llama.cpp] Trying chat handlers in order...")
                     handlers_to_try = []
+                    if QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
+                        handlers_to_try.append(("Qwen3VL", Qwen3VLChatHandler))
                     if QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
                         handlers_to_try.append(("Qwen25VL", Qwen25VLChatHandler))
                     handlers_to_try.extend([

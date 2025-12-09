@@ -192,7 +192,7 @@ class VLMManager:
 
         return "qwen2_5_vl"  # Default fallback
 
-    def _load_with_vllm(self, model_name: str, quantization: str = "none", progress=gr.Progress()) -> str:
+    def _load_with_vllm(self, model_name: str, quantization: str = "none", cpu_offload: int = 0, progress=gr.Progress()) -> str:
         """Load model using vLLM backend for high-performance inference."""
         if not VLLM_AVAILABLE:
             return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
@@ -232,6 +232,16 @@ class VLMManager:
                 "gpu_memory_utilization": 0.9,
             }
 
+            # Handle CPU offloading (from slider or low_vram mode)
+            # Note: cpu_offload_gb only works with V0 engine
+            offload_gb = cpu_offload if cpu_offload > 0 else (16 if self.low_vram else 0)
+            if offload_gb > 0:
+                import os
+                os.environ["VLLM_USE_V1"] = "0"  # Force V0 engine for CPU offload
+                vllm_kwargs["cpu_offload_gb"] = offload_gb
+                vllm_kwargs["gpu_memory_utilization"] = 0.85
+                print(f"CPU Offload: Using V0 engine with {offload_gb}GB offload to CPU")
+
             # Handle quantization
             if quantization == "4bit":
                 vllm_kwargs["quantization"] = "awq"  # or "gptq" depending on model
@@ -263,7 +273,7 @@ class VLMManager:
             traceback.print_exc()
             return f"Failed to load model with vLLM: {str(e)}"
 
-    def load_model(self, model_name: str, quantization: str = "none", use_flash_attn: bool = False, vram_buffer: int = 0, progress=gr.Progress()) -> str:
+    def load_model(self, model_name: str, quantization: str = "none", use_flash_attn: bool = False, vram_buffer: int = 0, cpu_offload: int = 0, progress=gr.Progress()) -> str:
         """Load a Qwen VL model.
 
         Args:
@@ -271,6 +281,7 @@ class VLMManager:
             quantization: "none", "4bit", or "8bit"
             use_flash_attn: Whether to use Flash Attention 2
             vram_buffer: GB of VRAM to reserve (for loading large models)
+            cpu_offload: GB of model weights to offload to CPU (vLLM only)
             progress: Gradio progress callback
         """
         if model_name == "No models found":
@@ -278,7 +289,7 @@ class VLMManager:
 
         # Use vLLM backend if selected
         if self.backend == "vllm":
-            return self._load_with_vllm(model_name, quantization, progress)
+            return self._load_with_vllm(model_name, quantization, cpu_offload, progress)
 
         # Check if already loaded
         if self.model is not None and self.model_name == model_name:
@@ -719,11 +730,11 @@ def switch_backend_handler(backend: str):
     return f"Switched to {vlm_manager.backend} backend"
 
 
-def load_model_handler(model_name: str, quantization: str, use_flash_attn: bool, vram_buffer: int, progress=gr.Progress()):
+def load_model_handler(model_name: str, quantization: str, use_flash_attn: bool, vram_buffer: int, cpu_offload: int, progress=gr.Progress()):
     """Handle model loading from UI."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.load_model(model_name, quantization, use_flash_attn, int(vram_buffer), progress)
+    return vlm_manager.load_model(model_name, quantization, use_flash_attn, int(vram_buffer), int(cpu_offload), progress)
 
 
 def unload_model_handler():
@@ -1105,6 +1116,14 @@ def create_ui():
                     label="VRAM Buffer (GB)",
                     info="Reserve GPU memory during loading. Useful for large models with 8-bit quantization.",
                 )
+                cpu_offload = gr.Slider(
+                    minimum=0,
+                    maximum=64,
+                    value=0,
+                    step=4,
+                    label="CPU Offload (GB)",
+                    info="Offload model weights to CPU RAM (vLLM only, uses V0 engine). Set >0 for large models.",
+                )
                 auto_unload = gr.Checkbox(
                     label="Auto-unload after generation",
                     value=False,
@@ -1192,7 +1211,7 @@ def create_ui():
 
         load_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, quantization_dropdown, use_flash_attn, vram_buffer],
+            inputs=[model_dropdown, quantization_dropdown, use_flash_attn, vram_buffer, cpu_offload],
             outputs=[model_status],
         )
 

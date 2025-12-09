@@ -43,7 +43,9 @@ https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
 
 ## Radiance Model
 
-Download a checkpoint from here https://huggingface.co/lodestones/chroma-debug-development-only/tree/main/radiance then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
+This supports the latest x0 model.
+
+Download https://huggingface.co/lodestones/Chroma1-Radiance/blob/main/latest_x0.pth then convert it with convertpth.py. Put it in your stable diffusion subfolder. Use the radiance model in the chroma tab of the gui without a vae. It will be automatically detected. Use the same T5 you normally use.  
 The memory management is currently derped. It will run fast with a 24GB card when setting the gpu weights to about 19,200, but if you need to offload expect 2x slowdown. You can dick with the gpu weights setting and it might run good if you set it to like half your vram or 3/4, I am working on improving the speeds with it.   
 
 Training: https://github.com/lodestone-rock/flow/  https://github.com/kohya-ss/sd-scripts/tree/sd3  
@@ -51,6 +53,7 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+12/8/2025 support x0 radiance model.  
 12/5/2025  
     Better prompt expansion support, supports expanding negative as well.  
 12/4/2025  

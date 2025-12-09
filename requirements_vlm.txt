@@ -1,0 +1,49 @@
+# Requirements for vlm.py - Qwen3-VL Chat Interface
+#
+# PLATFORM NOTES:
+#   - Windows: Use transformers backend only (vLLM is Linux-only)
+#   - Linux: Can use vLLM for high-performance inference
+#
+# WINDOWS SETUP:
+#   1. Install PyTorch with CUDA first:
+#      pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   2. Then install requirements:
+#      pip install -r requirements_vlm.txt
+#   3. Run:
+#      python vlm.py --backend transformers
+#
+# LINUX SETUP (with vLLM):
+#   1. Install PyTorch with CUDA first:
+#      pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   2. Install requirements:
+#      pip install -r requirements_vlm.txt
+#   3. Install vLLM separately:
+#      pip install vllm==0.11.0
+#   4. Run:
+#      python vlm.py --backend vllm
+
+# NOTE: Install torch/torchvision separately with CUDA index first!
+
+# Qwen VL utilities (has deps: av, packaging, pillow, requests)
+qwen-vl-utils>=0.0.14
+
+# Transformers backend
+transformers>=4.51.0
+accelerate
+safetensors
+
+# Gradio UI - use 5.x for vLLM compatibility
+gradio>=5.0.0
+gradio-client>=1.5.0
+
+# Image/Video processing (let qwen-vl-utils control these)
+opencv-python
+
+# Other dependencies
+numpy<2.0.0
+tqdm
+pydantic>=2.0.0
+huggingface-hub>=0.20.0
+
+# vLLM (Linux only - install separately if needed):
+# pip install vllm==0.11.0

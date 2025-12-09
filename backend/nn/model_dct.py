@@ -47,6 +47,7 @@ class ChromaParams:
     nerf_depth: int
     nerf_max_freqs: int
     _use_compiled: bool
+    use_x0: bool = False  # x0 prediction mode for newer Chroma Radiance models
 
 
 chroma_params = ChromaParams(
@@ -70,6 +71,7 @@ chroma_params = ChromaParams(
     nerf_depth=4,
     nerf_max_freqs=8,
     _use_compiled=False,
+    use_x0=False,
 )
 
 
@@ -227,6 +229,32 @@ class Chroma(nn.Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
+        # x0 prediction mode for newer Chroma Radiance models
+        # When enabled, the model outputs x0 predictions which are converted to v-predictions
+        if params.use_x0:
+            print("[ChromaDCT] Model is using x0 prediction mode")
+            self.register_buffer("__x0__", torch.tensor([]))
+
+    def _apply_x0_residual(self, predicted, noisy, timesteps):
+        """
+        Convert x0 predictions to v-predictions.
+
+        For x0 prediction mode, the model predicts the clean image (x0) directly.
+        This function converts x0 to velocity predictions: v = (noisy - x0) / t
+
+        Args:
+            predicted: The model's x0 prediction [B, C, H, W]
+            noisy: The noisy input image [B, C, H, W]
+            timesteps: The timestep values [B]
+
+        Returns:
+            v-prediction tensor [B, C, H, W]
+        """
+        # eps=0.0 during inference (non-zero during training to prevent div by 0)
+        eps = 0.0
+        # Reshape timesteps for broadcasting: [B] -> [B, 1, 1, 1]
+        t = timesteps.view(-1, 1, 1, 1)
+        return (noisy - predicted) / (t + eps)
 
     @property
     def device(self):
@@ -440,7 +468,7 @@ class Chroma(nn.Module):
         # Call the inner forward method
         result = self.inner_forward(
             img=x,
-            img_ids=img_ids, 
+            img_ids=img_ids,
             txt=context,
             txt_ids=txt_ids,
             txt_mask=txt_mask,
@@ -448,7 +476,11 @@ class Chroma(nn.Module):
             guidance=guidance,
             attn_padding=1
         )
-        
+
+        # If x0 prediction mode is enabled, convert x0 to v-prediction
+        if hasattr(self, "__x0__"):
+            result = self._apply_x0_residual(result, x, timestep)
+
         return result
 
 
@@ -463,7 +495,37 @@ class IntegratedChromaDCTTransformer2DModel(Chroma):
     def __init__(self, **config):
         # Use default ChromaDCT params (defined at the top of this file)
         # The config passed from Flux config doesn't have the right parameters
-        params = chroma_params  # Use the predefined ChromaDCT parameters
+        # but we extract use_x0 from config if available
+        use_x0 = config.get('use_x0', False)
+        print(f"[ChromaDCT Model] __init__ called with use_x0={use_x0}")
+        print(f"[ChromaDCT Model] Config keys: {list(config.keys())}")
+        if 'use_x0' in config:
+            print(f"[ChromaDCT Model] use_x0 value from config: {config['use_x0']}")
+
+        # Create params with x0 mode setting from config
+        params = ChromaParams(
+            in_channels=chroma_params.in_channels,
+            context_in_dim=chroma_params.context_in_dim,
+            hidden_size=chroma_params.hidden_size,
+            mlp_ratio=chroma_params.mlp_ratio,
+            num_heads=chroma_params.num_heads,
+            depth=chroma_params.depth,
+            depth_single_blocks=chroma_params.depth_single_blocks,
+            axes_dim=chroma_params.axes_dim,
+            theta=chroma_params.theta,
+            qkv_bias=chroma_params.qkv_bias,
+            guidance_embed=chroma_params.guidance_embed,
+            approximator_in_dim=chroma_params.approximator_in_dim,
+            approximator_depth=chroma_params.approximator_depth,
+            approximator_hidden_size=chroma_params.approximator_hidden_size,
+            patch_size=chroma_params.patch_size,
+            nerf_hidden_size=chroma_params.nerf_hidden_size,
+            nerf_mlp_ratio=chroma_params.nerf_mlp_ratio,
+            nerf_depth=chroma_params.nerf_depth,
+            nerf_max_freqs=chroma_params.nerf_max_freqs,
+            _use_compiled=chroma_params._use_compiled,
+            use_x0=use_x0,
+        )
 
         # Call parent Chroma init directly
         super().__init__(params)

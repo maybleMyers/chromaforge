@@ -28,6 +28,10 @@ ui_z_transformer_dtype: gr.Dropdown = None
 ui_z_vae_dtype: gr.Dropdown = None
 ui_z_text_encoder_dtype: gr.Dropdown = None
 
+# Z-Image shift UI components (set from ui.py)
+ui_txt2img_zimage_shift: gr.Slider = None
+ui_img2img_zimage_shift: gr.Slider = None
+
 
 
 forge_unet_storage_dtype_options = {
@@ -354,6 +358,8 @@ def forge_main_entry():
         ui_z_transformer_dtype,
         ui_z_vae_dtype,
         ui_z_text_encoder_dtype,
+        ui_txt2img_zimage_shift,
+        ui_img2img_zimage_shift,
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
@@ -398,6 +404,8 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_transformer_dtype
             gr.update(visible=False),                                                   # ui_z_vae_dtype
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
+            gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_img2img_zimage_shift
         ]
 
     if shared.opts.forge_preset == 'xl':
@@ -432,6 +440,8 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_transformer_dtype
             gr.update(visible=False),                                                   # ui_z_vae_dtype
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
+            gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_img2img_zimage_shift
         ]
 
     if shared.opts.forge_preset == 'flux':
@@ -466,6 +476,8 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_transformer_dtype
             gr.update(visible=False),                                                   # ui_z_vae_dtype
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
+            gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_img2img_zimage_shift
         ]
 
     if shared.opts.forge_preset == 'chroma':
@@ -497,6 +509,8 @@ def on_preset_change(preset=None):
             gr.update(visible=False),                                                   # ui_z_transformer_dtype
             gr.update(visible=False),                                                   # ui_z_vae_dtype
             gr.update(visible=False),                                                   # ui_z_text_encoder_dtype
+            gr.update(visible=False),                                                   # ui_txt2img_zimage_shift
+            gr.update(visible=False),                                                   # ui_img2img_zimage_shift
         ]
 
     if shared.opts.forge_preset == 'z':
@@ -531,6 +545,8 @@ def on_preset_change(preset=None):
             gr.update(visible=True, value=getattr(shared.opts, "z_transformer_dtype", 'Automatic')),  # ui_z_transformer_dtype
             gr.update(visible=True, value=getattr(shared.opts, "z_vae_dtype", 'Automatic')),          # ui_z_vae_dtype
             gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
+            gr.update(visible=True),                                                    # ui_txt2img_zimage_shift
+            gr.update(visible=True),                                                    # ui_img2img_zimage_shift
         ]
 
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
@@ -562,6 +578,8 @@ def on_preset_change(preset=None):
         gr.update(visible=True, value=getattr(shared.opts, "z_transformer_dtype", 'Automatic')),  # ui_z_transformer_dtype
         gr.update(visible=True, value=getattr(shared.opts, "z_vae_dtype", 'Automatic')),          # ui_z_vae_dtype
         gr.update(visible=True, value=getattr(shared.opts, "z_text_encoder_dtype", 'Automatic')), # ui_z_text_encoder_dtype
+        gr.update(visible=True),                                                        # ui_txt2img_zimage_shift
+        gr.update(visible=True),                                                        # ui_img2img_zimage_shift
     ]
 
 shared.options_templates.update(shared.options_section(('ui_sd', "UI defaults 'sd'", "ui"), {

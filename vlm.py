@@ -5,6 +5,13 @@ A standalone GUI for interacting with Qwen VL models using images, videos, and t
 
 import os
 import sys
+
+# Check for CPU offload flag BEFORE any other imports
+# vLLM's V0 engine (required for cpu_offload_gb) must be set before vLLM is imported
+if "--cpu-offload" in sys.argv or "--lowvram" in sys.argv:
+    os.environ["VLLM_USE_V1"] = "0"
+    print("CPU offload requested: Forcing vLLM V0 engine")
+
 import gc
 import argparse
 import tempfile
@@ -40,13 +47,9 @@ def _check_vllm_available():
     except Exception:
         return False
 
-def _import_vllm(use_v0: bool = False):
-    """Import vLLM with optional V0 engine setting."""
+def _import_vllm():
+    """Import vLLM (V0/V1 engine is determined by env var set at startup)."""
     global VLLM_AVAILABLE, LLM, SamplingParams
-
-    if use_v0:
-        os.environ["VLLM_USE_V1"] = "0"
-        print("Setting VLLM_USE_V1=0 for CPU offloading support")
 
     try:
         from vllm import LLM as _LLM, SamplingParams as _SamplingParams
@@ -231,13 +234,16 @@ class VLMManager:
 
         # Determine if we need CPU offloading (requires V0 engine)
         offload_gb = cpu_offload if cpu_offload > 0 else (16 if self.low_vram else 0)
-        use_v0 = offload_gb > 0
 
-        # Import vLLM with appropriate engine version
+        # Check if CPU offload is requested but V0 engine not enabled
+        if offload_gb > 0 and os.environ.get("VLLM_USE_V1") != "0":
+            return "CPU offloading requires V0 engine. Restart with --cpu-offload flag."
+
+        # Import vLLM if not already imported
         if not VLLM_AVAILABLE:
             if not _VLLM_CAN_IMPORT:
                 return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
-            if not _import_vllm(use_v0=use_v0):
+            if not _import_vllm():
                 return "Failed to import vLLM. Check console for errors."
 
         # Check if already loaded
@@ -1349,6 +1355,11 @@ def main():
         help="Enable low VRAM mode for smaller GPUs",
     )
     parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Enable CPU offloading for large models (forces vLLM V0 engine)",
+    )
+    parser.add_argument(
         "--backend",
         type=str,
         choices=["auto", "vllm", "transformers"],
@@ -1361,10 +1372,14 @@ def main():
     # Override host if --listen is specified
     host = "0.0.0.0" if args.listen else args.host
 
+    # Check if V0 engine is being used
+    using_v0 = os.environ.get("VLLM_USE_V1") == "0"
+
     print("=" * 60)
     print("Chromaforge VLM Chat Interface")
     print("=" * 60)
     print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
+    print(f"CPU Offload: {'enabled (V0 engine)' if using_v0 else 'disabled (use --cpu-offload to enable)'}")
     print(f"Backend: {args.backend}" + (" (vLLM available)" if _VLLM_CAN_IMPORT else " (vLLM not available)"))
     print(f"Server: http://{host}:{args.port}")
     if args.listen:

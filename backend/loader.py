@@ -361,7 +361,11 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
             elif cls_name == 'ChromaDCTTransformer2DModel':
                 from backend.nn.model_dct import IntegratedChromaDCTTransformer2DModel
-                model_loader = lambda c: IntegratedChromaDCTTransformer2DModel(**c)
+                def chromadct_loader(c):
+                    print(f"[ChromaDCT load_huggingface_component] Creating model with config keys: {list(c.keys())}")
+                    print(f"[ChromaDCT load_huggingface_component] use_x0 in config: {'use_x0' in c}, value: {c.get('use_x0', 'NOT FOUND')}")
+                    return IntegratedChromaDCTTransformer2DModel(**c)
+                model_loader = chromadct_loader
             elif cls_name == 'ZImageTransformer2DModel':
                 # Load ZImageTransformer2DModel directly from diffusers
                 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
@@ -921,12 +925,22 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
         })
         # Detect x0 prediction mode (new Chroma Radiance models)
         # If __x0__ buffer is in state dict, the model uses x0 prediction
-        use_x0_detected = '__x0__' in state_dicts["transformer"]
+        transformer_keys = list(state_dicts["transformer"].keys())
+        use_x0_detected = '__x0__' in transformer_keys
+        print(f"[ChromaDCT] x0 detection: '__x0__' in keys = {use_x0_detected}")
+        if use_x0_detected:
+            print(f"[ChromaDCT] Found __x0__ key in state dict")
+        else:
+            # Check for key with different prefix
+            x0_keys = [k for k in transformer_keys if 'x0' in k.lower()]
+            if x0_keys:
+                print(f"[ChromaDCT] Found x0-related keys: {x0_keys}")
 
         # Check for user override setting
         try:
             from modules import shared
             chromadct_x0_mode = getattr(shared.opts, 'chromadct_x0_mode', 'Automatic')
+            print(f"[ChromaDCT] User setting chromadct_x0_mode = {chromadct_x0_mode}")
             if chromadct_x0_mode == 'Enabled':
                 use_x0 = True
                 print("[ChromaDCT] x0 prediction mode ENABLED (user override)")
@@ -939,11 +953,13 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
                     print("[ChromaDCT] Detected x0 prediction mode (Chroma Radiance x0)")
                 else:
                     print("[ChromaDCT] Using standard prediction mode (no x0 detected)")
-        except Exception:
+        except Exception as e:
+            print(f"[ChromaDCT] Exception reading settings: {e}")
             use_x0 = use_x0_detected
             if use_x0:
                 print("[ChromaDCT] Detected x0 prediction mode (Chroma Radiance x0)")
 
+        print(f"[ChromaDCT] Final use_x0 = {use_x0}")
         estimated_config.unet_config['use_x0'] = use_x0
         # ChromaDCT uses same text encoder setup as regular Chroma
         if 'text_encoder_2' in state_dicts:
@@ -982,6 +998,10 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
         if isinstance(v, list) and len(v) == 2:
             lib_name, cls_name = v
             component_sd = state_dicts.get(component_name, None)
+            # Debug: Check if use_x0 is in config when loading transformer
+            if cls_name == 'ChromaDCTTransformer2DModel':
+                print(f"[ChromaDCT] About to load transformer with unet_config keys: {list(estimated_config.unet_config.keys())}")
+                print(f"[ChromaDCT] unet_config['use_x0'] = {estimated_config.unet_config.get('use_x0', 'NOT FOUND')}")
             component = load_huggingface_component(estimated_config, component_name, lib_name, cls_name, local_path, component_sd)
             if component_sd is not None:
                 del state_dicts[component_name]

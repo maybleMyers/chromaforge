@@ -497,6 +497,10 @@ class IntegratedChromaDCTTransformer2DModel(Chroma):
         # The config passed from Flux config doesn't have the right parameters
         # but we extract use_x0 from config if available
         use_x0 = config.get('use_x0', False)
+        print(f"[ChromaDCT Model] __init__ called with use_x0={use_x0}")
+        print(f"[ChromaDCT Model] Config keys: {list(config.keys())}")
+        if 'use_x0' in config:
+            print(f"[ChromaDCT Model] use_x0 value from config: {config['use_x0']}")
 
         # Create params with x0 mode setting from config
         params = ChromaParams(

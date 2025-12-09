@@ -26,6 +26,27 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: opencv-python not installed. Video support will be limited.")
 
+# Try to import vLLM for high-performance inference
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+    print("vLLM loaded successfully")
+except ImportError as e:
+    VLLM_AVAILABLE = False
+    print(f"Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
+    print(f"  Import error: {e}")
+except Exception as e:
+    VLLM_AVAILABLE = False
+    print(f"Warning: vLLM import failed: {e}")
+
+# Try to import qwen-vl-utils for image processing
+try:
+    from qwen_vl_utils import process_vision_info
+    QWEN_VL_UTILS_AVAILABLE = True
+except ImportError:
+    QWEN_VL_UTILS_AVAILABLE = False
+    print("Warning: qwen-vl-utils not installed. Install with: pip install qwen-vl-utils")
+
 # Default model paths (relative to models/LLM)
 DEFAULT_MODELS = {
     "Qwen3-VL-8B-Caption-V4.5": "models/LLM/Qwen3-VL-8B-Caption-V4.5",
@@ -82,12 +103,35 @@ def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tupl
 class VLMManager:
     """Manages Qwen VL model loading, inference, and memory."""
 
-    def __init__(self, low_vram: bool = False):
+    def __init__(self, low_vram: bool = False, backend: str = "auto"):
+        """
+        Initialize VLM Manager.
+
+        Args:
+            low_vram: Enable low VRAM mode for transformers backend
+            backend: "vllm", "transformers", or "auto" (vLLM if available, else transformers)
+        """
         self.model = None
         self.processor = None
         self.model_name = None
         self.low_vram = low_vram
         self.device = self._get_device()
+
+        # vLLM specific attributes
+        self.vllm_model = None
+        self.model_path = None
+
+        # Determine backend
+        if backend == "auto":
+            self.backend = "vllm" if VLLM_AVAILABLE else "transformers"
+        else:
+            self.backend = backend
+
+        if self.backend == "vllm" and not VLLM_AVAILABLE:
+            print("Warning: vLLM requested but not available. Falling back to transformers.")
+            self.backend = "transformers"
+
+        print(f"VLM Backend: {self.backend}")
 
     def _get_device(self) -> torch.device:
         """Get the best available device."""
@@ -148,6 +192,77 @@ class VLMManager:
 
         return "qwen2_5_vl"  # Default fallback
 
+    def _load_with_vllm(self, model_name: str, quantization: str = "none", progress=gr.Progress()) -> str:
+        """Load model using vLLM backend for high-performance inference."""
+        if not VLLM_AVAILABLE:
+            return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
+
+        # Check if already loaded
+        if self.vllm_model is not None and self.model_name == model_name:
+            return f"Model '{model_name}' is already loaded (vLLM)."
+
+        # Unload existing model first
+        if self.vllm_model is not None:
+            self.unload_model()
+
+        progress(0.1, desc="Loading model with vLLM...")
+
+        # Determine model path
+        if model_name in DEFAULT_MODELS:
+            model_path = DEFAULT_MODELS[model_name]
+        else:
+            model_path = f"models/LLM/{model_name}"
+
+        if not Path(model_path).exists():
+            return f"Model path not found: {model_path}"
+
+        try:
+            # Detect model type
+            model_type = self._detect_model_type(model_path)
+            print(f"Detected model type: {model_type}")
+
+            progress(0.3, desc="Initializing vLLM engine...")
+
+            # Configure vLLM loading options
+            vllm_kwargs = {
+                "model": model_path,
+                "trust_remote_code": True,
+                "dtype": "bfloat16",
+                "max_model_len": 4096,  # Adjust based on your VRAM
+                "gpu_memory_utilization": 0.9,
+            }
+
+            # Handle quantization
+            if quantization == "4bit":
+                vllm_kwargs["quantization"] = "awq"  # or "gptq" depending on model
+                print("Using AWQ 4-bit quantization with vLLM")
+            elif quantization == "8bit":
+                vllm_kwargs["quantization"] = "fp8"
+                print("Using FP8 quantization with vLLM")
+
+            # Enable multimodal for VL models
+            vllm_kwargs["limit_mm_per_prompt"] = {"image": 10, "video": 2}
+
+            progress(0.5, desc=f"Loading {model_type} with vLLM...")
+
+            self.vllm_model = LLM(**vllm_kwargs)
+            self.model_path = model_path
+            self.model_name = model_name
+
+            # Also load processor for chat template
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_path)
+
+            progress(1.0, desc="Model loaded with vLLM!")
+
+            quant_info = f", {quantization}" if quantization != "none" else ""
+            return f"Successfully loaded '{model_name}' with vLLM ({model_type}{quant_info})"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Failed to load model with vLLM: {str(e)}"
+
     def load_model(self, model_name: str, quantization: str = "none", use_flash_attn: bool = False, vram_buffer: int = 0, progress=gr.Progress()) -> str:
         """Load a Qwen VL model.
 
@@ -160,6 +275,10 @@ class VLMManager:
         """
         if model_name == "No models found":
             return "No models available. Please download a model first."
+
+        # Use vLLM backend if selected
+        if self.backend == "vllm":
+            return self._load_with_vllm(model_name, quantization, progress)
 
         # Check if already loaded
         if self.model is not None and self.model_name == model_name:
@@ -287,22 +406,36 @@ class VLMManager:
 
     def unload_model(self) -> str:
         """Unload the current model to free memory."""
-        if self.model is None:
+        # Check if any model is loaded (either vLLM or transformers)
+        if self.model is None and self.vllm_model is None:
             return "No model is currently loaded."
 
         model_name = self.model_name
+        backend_used = "vLLM" if self.vllm_model is not None else "transformers"
 
-        del self.model
-        del self.processor
-        self.model = None
-        self.processor = None
+        # Unload vLLM model
+        if self.vllm_model is not None:
+            del self.vllm_model
+            self.vllm_model = None
+            self.model_path = None
+
+        # Unload transformers model
+        if self.model is not None:
+            del self.model
+            self.model = None
+
+        # Clean up processor
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+
         self.model_name = None
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return f"Unloaded '{model_name}' and freed memory."
+        return f"Unloaded '{model_name}' ({backend_used}) and freed memory."
 
     def get_memory_info(self) -> str:
         """Get current GPU memory usage."""
@@ -314,6 +447,117 @@ class VLMManager:
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
         return f"GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {total:.1f}GB total"
+
+    def _generate_with_vllm(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        repetition_penalty: float = 1.1,
+        video_max_frames: int = 8,
+    ) -> str:
+        """Generate a response using vLLM backend."""
+        if self.vllm_model is None:
+            return "Error: No vLLM model loaded."
+
+        try:
+            # Process messages to extract images and prepare for vLLM
+            images = []
+            processed_messages = []
+
+            for msg in messages:
+                if isinstance(msg.get("content"), list):
+                    new_content = []
+                    for item in msg["content"]:
+                        if item.get("type") == "image" and "image" in item:
+                            img = item["image"]
+                            images.append(img)
+                            # For vLLM, use placeholder in text
+                            new_content.append({"type": "image"})
+                        elif item.get("type") == "video" and "video" in item:
+                            # Process video into frames
+                            video_path = item["video"]
+                            if isinstance(video_path, str) and os.path.exists(video_path):
+                                try:
+                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                    for frame in frames:
+                                        images.append(frame)
+                                        new_content.append({"type": "image"})
+                                    if frames:
+                                        new_content.append({"type": "text", "text": f"[The above {len(frames)} images are frames extracted from a video]"})
+                                except Exception as e:
+                                    new_content.append({"type": "text", "text": f"[Video processing error: {str(e)}]"})
+                        elif item.get("type") == "text":
+                            new_content.append(item)
+                        else:
+                            new_content.append(item)
+                    processed_messages.append({"role": msg["role"], "content": new_content})
+                else:
+                    processed_messages.append(msg)
+
+            # Apply chat template using processor
+            text_input = self.processor.apply_chat_template(
+                processed_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            print(f"[vLLM Debug] Prompt preview: {text_input[:500]}...")
+            print(f"[vLLM Debug] Number of images: {len(images)}")
+
+            # Configure sampling parameters
+            sampling_params = SamplingParams(
+                max_tokens=max_new_tokens,
+                temperature=temperature if temperature > 0 else 0.001,
+                top_p=top_p,
+                top_k=top_k if top_k > 0 else -1,
+                repetition_penalty=repetition_penalty,
+            )
+
+            # Prepare multimodal inputs for vLLM
+            if images:
+                # Convert PIL images to format vLLM expects
+                mm_data = {"image": images}
+                inputs = {
+                    "prompt": text_input,
+                    "multi_modal_data": mm_data,
+                }
+            else:
+                inputs = {"prompt": text_input}
+
+            # Generate with timing
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            outputs = self.vllm_model.generate([inputs], sampling_params=sampling_params)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+
+            # Extract response
+            response = outputs[0].outputs[0].text
+
+            # Calculate throughput
+            num_generated_tokens = len(outputs[0].outputs[0].token_ids)
+            generation_time = end_time - start_time
+            tokens_per_sec = num_generated_tokens / generation_time if generation_time > 0 else 0
+
+            print(f"[vLLM Inference] Generated {num_generated_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
+
+            # Clean up thinking tags if present
+            if "</think>" in response:
+                response = response.split("</think>")[-1].strip()
+
+            return response
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Error during vLLM generation: {str(e)}"
 
     @torch.inference_mode()
     def generate(
@@ -327,6 +571,18 @@ class VLMManager:
         video_max_frames: int = 8,
     ) -> str:
         """Generate a response from the model."""
+        # Use vLLM backend if loaded
+        if self.vllm_model is not None:
+            return self._generate_with_vllm(
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                video_max_frames=video_max_frames,
+            )
+
         if self.model is None:
             return "Error: No model loaded. Please load a model first."
 
@@ -442,10 +698,25 @@ class VLMManager:
 vlm_manager: Optional[VLMManager] = None
 
 
-def initialize_manager(low_vram: bool = False):
+def initialize_manager(low_vram: bool = False, backend: str = "auto"):
     """Initialize the global VLM manager."""
     global vlm_manager
-    vlm_manager = VLMManager(low_vram=low_vram)
+    vlm_manager = VLMManager(low_vram=low_vram, backend=backend)
+
+
+def switch_backend_handler(backend: str):
+    """Handle backend switching from UI."""
+    global vlm_manager
+    if vlm_manager is not None:
+        # Unload current model first
+        vlm_manager.unload_model()
+
+    # Get current low_vram setting
+    low_vram = vlm_manager.low_vram if vlm_manager else False
+
+    # Reinitialize with new backend
+    vlm_manager = VLMManager(low_vram=low_vram, backend=backend)
+    return f"Switched to {vlm_manager.backend} backend"
 
 
 def load_model_handler(model_name: str, quantization: str, use_flash_attn: bool, vram_buffer: int, progress=gr.Progress()):
@@ -484,7 +755,8 @@ def chat_handler(
     auto_unload: bool = False,
 ):
     """Handle chat messages from UI."""
-    if vlm_manager is None or vlm_manager.model is None:
+    # Check if any model is loaded (either transformers or vLLM)
+    if vlm_manager is None or (vlm_manager.model is None and vlm_manager.vllm_model is None):
         return history + [(message, "Error: No model loaded. Please load a model first.")], ""
 
     # Build messages list for the model
@@ -657,56 +929,57 @@ def create_ui():
     """Create the Gradio interface."""
     available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
 
-    with gr.Blocks(
-        title="Chromaforge VLM",
-        theme=themes.Default(
-            primary_hue=colors.Color(
-                name="custom",
-                c50="#E6F0FF",
-                c100="#CCE0FF",
-                c200="#99C1FF",
-                c300="#66A3FF",
-                c400="#3384FF",
-                c500="#0060df",
-                c600="#0052C2",
-                c700="#003D91",
-                c800="#002961",
-                c900="#001430",
-                c950="#000A18"
-            )
-        ),
-        css="""
-        .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
-        .gallery-item:first-child:hover { border-color: #45a049 !important; }
-        .green-btn {
-            background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
-            color: white !important;
-            border: none !important;
-        }
-        .green-btn:hover {
-            background: linear-gradient(to bottom right, #27ae60, #219651) !important;
-        }
-        .refresh-btn {
-            max-width: 40px !important;
-            min-width: 40px !important;
-            height: 40px !important;
-            border-radius: 50% !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        .light-blue-btn {
-            background: linear-gradient(to bottom right, #AEC6CF, #9AB8C4) !important;
-            color: #333 !important;
-            border: 1px solid #9AB8C4 !important;
-        }
-        .light-blue-btn:hover {
-            background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important;
-            border-color: #8AA9B5 !important;
-        }
-        """,
-    ) as demo:
+    # Theme for Gradio 6.x (passed to launch() instead of Blocks())
+    global vlm_theme, vlm_css
+    vlm_theme = themes.Default(
+        primary_hue=colors.Color(
+            name="custom",
+            c50="#E6F0FF",
+            c100="#CCE0FF",
+            c200="#99C1FF",
+            c300="#66A3FF",
+            c400="#3384FF",
+            c500="#0060df",
+            c600="#0052C2",
+            c700="#003D91",
+            c800="#002961",
+            c900="#001430",
+            c950="#000A18"
+        )
+    )
+    vlm_css = """
+    .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
+    .gallery-item:first-child:hover { border-color: #45a049 !important; }
+    .green-btn {
+        background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
+        color: white !important;
+        border: none !important;
+    }
+    .green-btn:hover {
+        background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+    }
+    .refresh-btn {
+        max-width: 40px !important;
+        min-width: 40px !important;
+        height: 40px !important;
+        border-radius: 50% !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    .light-blue-btn {
+        background: linear-gradient(to bottom right, #AEC6CF, #9AB8C4) !important;
+        color: #333 !important;
+        border: 1px solid #9AB8C4 !important;
+    }
+    .light-blue-btn:hover {
+        background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important;
+        border-color: #8AA9B5 !important;
+    }
+    """
+
+    with gr.Blocks(title="Chromaforge VLM") as demo:
         with gr.Row():
             # Left column - Settings (shared across tabs)
             with gr.Column(scale=1):
@@ -720,6 +993,21 @@ def create_ui():
                 )
 
                 refresh_models_btn = gr.Button("Refresh Model List", size="sm")
+
+                # Backend selection (vLLM or transformers)
+                backend_choices = ["auto", "vllm", "transformers"] if VLLM_AVAILABLE else ["transformers"]
+                backend_dropdown = gr.Dropdown(
+                    choices=backend_choices,
+                    value="auto" if VLLM_AVAILABLE else "transformers",
+                    label="Backend",
+                    info="vLLM: faster inference, transformers: more compatible",
+                    interactive=True,
+                )
+                backend_status = gr.Textbox(
+                    label="Backend Status",
+                    value=f"Current: {vlm_manager.backend if vlm_manager else 'not initialized'}",
+                    interactive=False,
+                )
 
                 quantization_dropdown = gr.Dropdown(
                     choices=["none", "4bit", "8bit"],
@@ -830,7 +1118,6 @@ def create_ui():
                         chatbot = gr.Chatbot(
                             label="Conversation",
                             height=400,
-                            show_copy_button=True,
                         )
 
                         with gr.Row():
@@ -906,6 +1193,13 @@ def create_ui():
             fn=load_model_handler,
             inputs=[model_dropdown, quantization_dropdown, use_flash_attn, vram_buffer],
             outputs=[model_status],
+        )
+
+        # Backend switching handler
+        backend_dropdown.change(
+            fn=switch_backend_handler,
+            inputs=[backend_dropdown],
+            outputs=[backend_status],
         )
 
         unload_btn.click(
@@ -995,6 +1289,13 @@ def main():
         action="store_true",
         help="Enable low VRAM mode for smaller GPUs",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["auto", "vllm", "transformers"],
+        default="auto",
+        help="Backend for model inference (default: auto - uses vLLM if available)",
+    )
 
     args = parser.parse_args()
 
@@ -1005,13 +1306,14 @@ def main():
     print("Chromaforge VLM Chat Interface")
     print("=" * 60)
     print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
+    print(f"Backend: {args.backend}" + (" (vLLM available)" if VLLM_AVAILABLE else " (vLLM not available)"))
     print(f"Server: http://{host}:{args.port}")
     if args.listen:
         print("LAN access: enabled (listening on 0.0.0.0)")
     print("=" * 60)
 
     # Initialize the manager
-    initialize_manager(low_vram=args.lowvram)
+    initialize_manager(low_vram=args.lowvram, backend=args.backend)
 
     # Create and launch the UI
     demo = create_ui()
@@ -1019,6 +1321,8 @@ def main():
         server_name=host,
         server_port=args.port,
         share=args.share,
+        theme=vlm_theme,
+        css=vlm_css,
     )
 
 

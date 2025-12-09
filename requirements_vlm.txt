@@ -1,0 +1,47 @@
+# Requirements for vlm.py - Qwen3-VL Chat Interface
+# Use a separate virtual environment to avoid conflicts with main Forge app
+#
+# Setup:
+#   python -m venv venv_vlm
+#   venv_vlm\Scripts\activate  (Windows)
+#   source venv_vlm/bin/activate  (Linux/Mac)
+#   pip install -r requirements_vlm.txt
+#
+# Run:
+#   python vlm.py
+
+# PyTorch - install first with CUDA support
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.4.0
+torchvision
+
+# vLLM for high-performance inference
+vllm>=0.11.0
+
+# Qwen VL utilities
+qwen-vl-utils>=0.0.14
+
+# Transformers (fallback backend)
+transformers>=4.51.0
+accelerate
+safetensors
+
+# Gradio UI
+gradio>=5.0.0
+gradio-client
+
+# Image/Video processing
+Pillow>=10.0.0
+opencv-python
+
+# Other dependencies
+numpy
+tqdm
+pydantic>=2.0.0
+huggingface-hub>=0.20.0
+
+# Optional: Flash Attention 2 (for faster inference)
+# pip install flash-attn --no-build-isolation
+
+# Optional: bitsandbytes for quantization (transformers backend)
+# pip install bitsandbytes

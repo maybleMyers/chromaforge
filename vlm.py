@@ -757,7 +757,10 @@ def chat_handler(
     """Handle chat messages from UI."""
     # Check if any model is loaded (either transformers or vLLM)
     if vlm_manager is None or (vlm_manager.model is None and vlm_manager.vllm_model is None):
-        return history + [(message, "Error: No model loaded. Please load a model first.")], ""
+        error_history = list(history)
+        error_history.append({"role": "user", "content": message})
+        error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
+        return error_history, ""
 
     # Build messages list for the model
     messages = []
@@ -766,24 +769,21 @@ def chat_handler(
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
 
-    # Add chat history (convert from Gradio tuple format to model format)
-    for user_msg, assistant_msg in history:
-        # Skip image-only entries (where assistant_msg is None)
-        if assistant_msg is None:
-            continue
-
-        # Extract text from user message (may contain tuples for files)
-        if isinstance(user_msg, tuple):
-            # Tuple format is (filepath,) for images - skip these in history
-            continue
-        elif isinstance(user_msg, str):
-            user_text = user_msg
-        else:
-            user_text = str(user_msg)
-
-        if user_text:  # Only add non-empty messages
-            messages.append({"role": "user", "content": user_text})
-            messages.append({"role": "assistant", "content": assistant_msg})
+    # Add chat history (already in messages format for Gradio 5.x)
+    for msg in history:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            # Extract text content for model
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                messages.append({"role": msg["role"], "content": content})
+            elif isinstance(content, dict) and "path" in content:
+                # Skip file-only messages in history for model
+                continue
+            elif isinstance(content, list):
+                # Handle mixed content - extract text parts
+                text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                if text_parts:
+                    messages.append({"role": msg["role"], "content": " ".join(text_parts)})
 
     # Build current message content for the model
     model_content = []
@@ -809,8 +809,8 @@ def chat_handler(
         video_max_frames=video_max_frames,
     )
 
-    # Build display content for chatbot (classic tuple format)
-    # Format: [(user_msg, bot_msg), ...] where user_msg can be (filepath,) for files
+    # Build display content for chatbot (Gradio 5.x messages format)
+    # Format: [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]
     new_history = list(history)
 
     if image is not None:
@@ -818,21 +818,22 @@ def chat_handler(
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"vlm_chat_{id(image)}.png")
         image.save(temp_path)
-        # Add image as separate message, then text+response
-        new_history.append(((temp_path,), None))
+        # Add user message with image and text
         if message:
-            new_history.append((message, response))
+            new_history.append({"role": "user", "content": [{"type": "text", "text": message}, {"type": "image", "path": temp_path}]})
         else:
-            # If no text, attach response to a placeholder
-            new_history.append(("[Describe this image]", response))
+            new_history.append({"role": "user", "content": [{"type": "text", "text": "[Describe this image]"}, {"type": "image", "path": temp_path}]})
+        new_history.append({"role": "assistant", "content": response})
     elif video is not None:
-        new_history.append(((video,), None))
+        # Add user message with video and text
         if message:
-            new_history.append((message, response))
+            new_history.append({"role": "user", "content": [{"type": "text", "text": message}, {"type": "video", "path": video}]})
         else:
-            new_history.append(("[Describe this video]", response))
+            new_history.append({"role": "user", "content": [{"type": "text", "text": "[Describe this video]"}, {"type": "video", "path": video}]})
+        new_history.append({"role": "assistant", "content": response})
     else:
-        new_history.append((message, response))
+        new_history.append({"role": "user", "content": message})
+        new_history.append({"role": "assistant", "content": response})
 
     # Auto-unload if requested
     status_msg = ""
@@ -1118,7 +1119,6 @@ def create_ui():
                         chatbot = gr.Chatbot(
                             label="Conversation",
                             height=400,
-                            type="tuples",
                         )
 
                         with gr.Row():

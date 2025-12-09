@@ -929,7 +929,7 @@ def create_ui():
     """Create the Gradio interface."""
     available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
 
-    # Theme for Gradio 4.x (passed to Blocks())
+    # Theme for Gradio 5.x
     global vlm_theme, vlm_css
     vlm_theme = themes.Default(
         primary_hue=colors.Color(
@@ -979,7 +979,7 @@ def create_ui():
     }
     """
 
-    with gr.Blocks(title="Chromaforge VLM", theme=vlm_theme, css=vlm_css) as demo:
+    with gr.Blocks(title="Chromaforge VLM") as demo:
         with gr.Row():
             # Left column - Settings (shared across tabs)
             with gr.Column(scale=1):
@@ -1322,6 +1322,7 @@ def main():
         server_name=host,
         server_port=args.port,
         share=args.share,
+        pwa=False,
     )
 
 

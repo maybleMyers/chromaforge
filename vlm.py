@@ -1118,6 +1118,7 @@ def create_ui():
                         chatbot = gr.Chatbot(
                             label="Conversation",
                             height=400,
+                            type="tuples",
                         )
 
                         with gr.Row():

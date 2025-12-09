@@ -427,7 +427,12 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
     for m in model.modules():
         if hasattr(m, "parameters_manual_cast"):
             m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
-            all_modules.append(m)
+            # Only add to offloadable modules if parameters_manual_cast is True
+            # Modules with parameters_manual_cast=False should stay on GPU (like NeRF components)
+            if m.parameters_manual_cast:
+                all_modules.append(m)
+            else:
+                legacy_modules.append(m)
         elif hasattr(m, "weight"):
             m.total_mem, m.weight_mem, m.extra_mem = module_size(m, return_split=True)
             legacy_modules.append(m)

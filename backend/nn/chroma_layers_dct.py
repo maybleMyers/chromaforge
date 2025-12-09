@@ -207,15 +207,18 @@ class NerfEmbedder(nn.Module):
         super().__init__()
         self.max_freqs = max_freqs
         self.hidden_size_input = hidden_size_input
-        
+
         # A linear layer to project the concatenated input features and
         # positional encodings to the final output dimension.
         # Use forge operations for memory management compatibility
-        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+        # Note: manual_cast_enabled=False to keep NeRF components on GPU
+        # NeRF embedder is small and always needed - avoid CPU-GPU transfer overhead
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=False):
             self.embedder = nn.Sequential(
                 nn.Linear(in_channels + max_freqs**2, hidden_size_input)
             )
-        # Small embedding layer - give GPU priority by removing parameters_manual_cast
+        # NeRF components should stay on GPU - they're small and always needed
+        self.parameters_manual_cast = False
 
     @lru_cache(maxsize=4)
     def fetch_pos(self, patch_size, device, dtype):
@@ -315,11 +318,15 @@ class NerfGLUBlock(nn.Module):
         # We now need to generate parameters for 3 matrices.
         total_params = 3 * hidden_size_x**2 * mlp_ratio
         # Use forge operations for memory management compatibility
-        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+        # Note: manual_cast_enabled=False to keep NeRF blocks on GPU
+        # NeRF blocks are small (~0.5GB total) and always needed at the end of each
+        # inference step. Keeping them on GPU avoids CPU-GPU transfer bottleneck.
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=False):
             self.param_generator = nn.Linear(hidden_size_s, total_params)
         self.norm = RMSNorm(hidden_size_x, use_compiled)
         self.mlp_ratio = mlp_ratio
-        self.parameters_manual_cast = True
+        # NeRF components should stay on GPU - they're small and always needed
+        self.parameters_manual_cast = False
         # nn.init.zeros_(self.param_generator.weight)
         # nn.init.zeros_(self.param_generator.bias)
 
@@ -356,11 +363,13 @@ class NerfFinalLayer(nn.Module):
         super().__init__()
         self.norm = RMSNorm(hidden_size, use_compiled=use_compiled)
         # Use forge operations for memory management compatibility
-        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+        # Note: manual_cast_enabled=False to keep NeRF components on GPU
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=False):
             self.linear = nn.Linear(hidden_size, out_channels)
             nn.init.zeros_(self.linear.weight)
             nn.init.zeros_(self.linear.bias)
-        # Small final layer - give GPU priority by removing parameters_manual_cast
+        # NeRF components should stay on GPU - they're small and always needed
+        self.parameters_manual_cast = False
 
     def forward(self, x):
         x = self.norm(x)
@@ -375,7 +384,8 @@ class NerfFinalLayerConv(nn.Module):
 
         # replace nn.Linear with nn.Conv2d since linear is just pointwise conv
         # Use forge operations for memory management compatibility
-        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=True):
+        # Note: manual_cast_enabled=False to keep NeRF components on GPU
+        with using_forge_operations(device=memory_management.cpu, dtype=memory_management.unet_dtype(), manual_cast_enabled=False):
             self.conv = nn.Conv2d(
                 in_channels=hidden_size,
                 out_channels=out_channels,
@@ -384,7 +394,8 @@ class NerfFinalLayerConv(nn.Module):
             )
             nn.init.zeros_(self.conv.weight)
             nn.init.zeros_(self.conv.bias)
-        # Small final layer - give GPU priority by removing parameters_manual_cast
+        # NeRF components should stay on GPU - they're small and always needed
+        self.parameters_manual_cast = False
 
     def forward(self, x):
         # shape: [N, C, H, W] !

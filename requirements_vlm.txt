@@ -1,47 +1,57 @@
 # Requirements for vlm.py - Qwen3-VL Chat Interface
-# Use a separate virtual environment to avoid conflicts with main Forge app
 #
-# Setup:
-#   python -m venv venv_vlm
-#   venv_vlm\Scripts\activate  (Windows)
-#   source venv_vlm/bin/activate  (Linux/Mac)
-#   pip install -r requirements_vlm.txt
+# PLATFORM NOTES:
+#   - Windows: Use transformers backend only (vLLM is Linux-only)
+#   - Linux: Can use vLLM for high-performance inference
 #
-# Run:
-#   python vlm.py
+# WINDOWS SETUP:
+#   1. Install PyTorch with CUDA first:
+#      pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   2. Then install requirements:
+#      pip install -r requirements_vlm.txt
+#   3. Run:
+#      python vlm.py --backend transformers
+#
+# LINUX SETUP (with vLLM):
+#   1. Install PyTorch with CUDA first:
+#      pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   2. Install requirements:
+#      pip install -r requirements_vlm.txt
+#   3. Install vLLM separately:
+#      pip install vllm==0.11.0
+#   4. Run:
+#      python vlm.py --backend vllm
 
-# PyTorch - install first with CUDA support
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-torch>=2.4.0
-torchvision
-
-# vLLM for high-performance inference
-vllm>=0.11.0
+# Core dependencies (pinned for stability)
+# NOTE: Do NOT include torch/torchvision here - install separately with CUDA index
 
 # Qwen VL utilities
-qwen-vl-utils>=0.0.14
+qwen-vl-utils==0.0.14
 
-# Transformers (fallback backend)
-transformers>=4.51.0
-accelerate
-safetensors
+# Transformers backend (works on Windows and Linux)
+transformers==4.51.3
+accelerate==1.2.1
+safetensors==0.5.3
 
-# Gradio UI
-gradio>=5.0.0
-gradio-client
+# Gradio UI - pinned to 4.x for compatibility with main Forge
+gradio==4.44.1
+gradio-client==1.4.0
 
 # Image/Video processing
-Pillow>=10.0.0
-opencv-python
+Pillow==11.0.0
+opencv-python==4.10.0.84
 
 # Other dependencies
-numpy
-tqdm
-pydantic>=2.0.0
-huggingface-hub>=0.20.0
+numpy==1.26.4
+tqdm==4.67.1
+pydantic==2.10.3
+huggingface-hub==0.27.1
 
-# Optional: Flash Attention 2 (for faster inference)
+# Optional: Flash Attention 2 (for faster inference on Linux)
 # pip install flash-attn --no-build-isolation
 
 # Optional: bitsandbytes for quantization (transformers backend)
 # pip install bitsandbytes
+
+# vLLM (Linux only - install separately if needed):
+# pip install vllm==0.11.0

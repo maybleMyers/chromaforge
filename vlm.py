@@ -26,18 +26,51 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: opencv-python not installed. Video support will be limited.")
 
-# Try to import vLLM for high-performance inference
-try:
-    from vllm import LLM, SamplingParams
-    VLLM_AVAILABLE = True
-    print("vLLM loaded successfully")
-except ImportError as e:
-    VLLM_AVAILABLE = False
-    print(f"Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
-    print(f"  Import error: {e}")
-except Exception as e:
-    VLLM_AVAILABLE = False
-    print(f"Warning: vLLM import failed: {e}")
+# vLLM will be imported lazily to allow setting VLLM_USE_V1 before import
+VLLM_AVAILABLE = False
+LLM = None
+SamplingParams = None
+
+def _check_vllm_available():
+    """Check if vLLM can be imported (without actually importing it)."""
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("vllm")
+        return spec is not None
+    except Exception:
+        return False
+
+def _import_vllm(use_v0: bool = False):
+    """Import vLLM with optional V0 engine setting."""
+    global VLLM_AVAILABLE, LLM, SamplingParams
+
+    if use_v0:
+        os.environ["VLLM_USE_V1"] = "0"
+        print("Setting VLLM_USE_V1=0 for CPU offloading support")
+
+    try:
+        from vllm import LLM as _LLM, SamplingParams as _SamplingParams
+        LLM = _LLM
+        SamplingParams = _SamplingParams
+        VLLM_AVAILABLE = True
+        print("vLLM loaded successfully")
+        return True
+    except ImportError as e:
+        VLLM_AVAILABLE = False
+        print(f"Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
+        print(f"  Import error: {e}")
+        return False
+    except Exception as e:
+        VLLM_AVAILABLE = False
+        print(f"Warning: vLLM import failed: {e}")
+        return False
+
+# Check if vLLM is available (but don't import yet)
+_VLLM_CAN_IMPORT = _check_vllm_available()
+if _VLLM_CAN_IMPORT:
+    print("vLLM detected, will be loaded when needed")
+else:
+    print("Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
 
 # Try to import qwen-vl-utils for image processing
 try:
@@ -121,13 +154,13 @@ class VLMManager:
         self.vllm_model = None
         self.model_path = None
 
-        # Determine backend
+        # Determine backend (use _VLLM_CAN_IMPORT since vLLM is lazily imported)
         if backend == "auto":
-            self.backend = "vllm" if VLLM_AVAILABLE else "transformers"
+            self.backend = "vllm" if _VLLM_CAN_IMPORT else "transformers"
         else:
             self.backend = backend
 
-        if self.backend == "vllm" and not VLLM_AVAILABLE:
+        if self.backend == "vllm" and not _VLLM_CAN_IMPORT:
             print("Warning: vLLM requested but not available. Falling back to transformers.")
             self.backend = "transformers"
 
@@ -194,8 +227,18 @@ class VLMManager:
 
     def _load_with_vllm(self, model_name: str, quantization: str = "none", cpu_offload: int = 0, progress=gr.Progress()) -> str:
         """Load model using vLLM backend for high-performance inference."""
+        global VLLM_AVAILABLE, LLM, SamplingParams
+
+        # Determine if we need CPU offloading (requires V0 engine)
+        offload_gb = cpu_offload if cpu_offload > 0 else (16 if self.low_vram else 0)
+        use_v0 = offload_gb > 0
+
+        # Import vLLM with appropriate engine version
         if not VLLM_AVAILABLE:
-            return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
+            if not _VLLM_CAN_IMPORT:
+                return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
+            if not _import_vllm(use_v0=use_v0):
+                return "Failed to import vLLM. Check console for errors."
 
         # Check if already loaded
         if self.vllm_model is not None and self.model_name == model_name:
@@ -233,14 +276,10 @@ class VLMManager:
             }
 
             # Handle CPU offloading (from slider or low_vram mode)
-            # Note: cpu_offload_gb only works with V0 engine
-            offload_gb = cpu_offload if cpu_offload > 0 else (16 if self.low_vram else 0)
             if offload_gb > 0:
-                import os
-                os.environ["VLLM_USE_V1"] = "0"  # Force V0 engine for CPU offload
                 vllm_kwargs["cpu_offload_gb"] = offload_gb
                 vllm_kwargs["gpu_memory_utilization"] = 0.85
-                print(f"CPU Offload: Using V0 engine with {offload_gb}GB offload to CPU")
+                print(f"CPU Offload: {offload_gb}GB will be offloaded to CPU")
 
             # Handle quantization
             if quantization == "4bit":
@@ -1007,10 +1046,10 @@ def create_ui():
                 refresh_models_btn = gr.Button("Refresh Model List", size="sm")
 
                 # Backend selection (vLLM or transformers)
-                backend_choices = ["auto", "vllm", "transformers"] if VLLM_AVAILABLE else ["transformers"]
+                backend_choices = ["auto", "vllm", "transformers"] if _VLLM_CAN_IMPORT else ["transformers"]
                 backend_dropdown = gr.Dropdown(
                     choices=backend_choices,
-                    value="auto" if VLLM_AVAILABLE else "transformers",
+                    value="auto" if _VLLM_CAN_IMPORT else "transformers",
                     label="Backend",
                     info="vLLM: faster inference, transformers: more compatible",
                     interactive=True,
@@ -1326,7 +1365,7 @@ def main():
     print("Chromaforge VLM Chat Interface")
     print("=" * 60)
     print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
-    print(f"Backend: {args.backend}" + (" (vLLM available)" if VLLM_AVAILABLE else " (vLLM not available)"))
+    print(f"Backend: {args.backend}" + (" (vLLM available)" if _VLLM_CAN_IMPORT else " (vLLM not available)"))
     print(f"Server: http://{host}:{args.port}")
     if args.listen:
         print("LAN access: enabled (listening on 0.0.0.0)")

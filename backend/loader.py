@@ -919,6 +919,32 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
             'nerf_max_freqs': 8,
             '_use_compiled': False
         })
+        # Detect x0 prediction mode (new Chroma Radiance models)
+        # If __x0__ buffer is in state dict, the model uses x0 prediction
+        use_x0_detected = '__x0__' in state_dicts["transformer"]
+
+        # Check for user override setting
+        try:
+            from modules import shared
+            chromadct_x0_mode = getattr(shared.opts, 'chromadct_x0_mode', 'Automatic')
+            if chromadct_x0_mode == 'Enabled':
+                use_x0 = True
+                print("[ChromaDCT] x0 prediction mode ENABLED (user override)")
+            elif chromadct_x0_mode == 'Disabled':
+                use_x0 = False
+                print("[ChromaDCT] x0 prediction mode DISABLED (user override)")
+            else:  # Automatic
+                use_x0 = use_x0_detected
+                if use_x0:
+                    print("[ChromaDCT] Detected x0 prediction mode (Chroma Radiance x0)")
+                else:
+                    print("[ChromaDCT] Using standard prediction mode (no x0 detected)")
+        except Exception:
+            use_x0 = use_x0_detected
+            if use_x0:
+                print("[ChromaDCT] Detected x0 prediction mode (Chroma Radiance x0)")
+
+        estimated_config.unet_config['use_x0'] = use_x0
         # ChromaDCT uses same text encoder setup as regular Chroma
         if 'text_encoder_2' in state_dicts:
             state_dicts['text_encoder'] = state_dicts['text_encoder_2']

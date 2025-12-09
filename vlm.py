@@ -6,11 +6,8 @@ A standalone GUI for interacting with Qwen VL models using images, videos, and t
 import os
 import sys
 
-# Check for CPU offload flag BEFORE any other imports
-# vLLM's V0 engine (required for cpu_offload_gb) must be set before vLLM is imported
-if "--cpu-offload" in sys.argv or "--lowvram" in sys.argv:
-    os.environ["VLLM_USE_V1"] = "0"
-    print("CPU offload requested: Forcing vLLM V0 engine")
+# NOTE: cpu_offload_gb was removed in vLLM 0.11.0 (V0 engine deprecated)
+# For large models, use: quantization (AWQ/GPTQ), tensor parallelism, or transformers backend
 
 import gc
 import argparse
@@ -232,12 +229,11 @@ class VLMManager:
         """Load model using vLLM backend for high-performance inference."""
         global VLLM_AVAILABLE, LLM, SamplingParams
 
-        # Determine if we need CPU offloading (requires V0 engine)
-        offload_gb = cpu_offload if cpu_offload > 0 else (16 if self.low_vram else 0)
-
-        # Check if CPU offload is requested but V0 engine not enabled
-        if offload_gb > 0 and os.environ.get("VLLM_USE_V1") != "0":
-            return "CPU offloading requires V0 engine. Restart with --cpu-offload flag."
+        # NOTE: cpu_offload_gb was removed in vLLM 0.11.0 (V0 engine deprecated)
+        # For large models, use quantization or transformers backend
+        if cpu_offload > 0:
+            print(f"Warning: CPU offload requested ({cpu_offload}GB) but not supported in vLLM 0.11.0+")
+            print("  Options: 1) pip install vllm==0.9.0  2) Use quantization  3) Use transformers backend")
 
         # Import vLLM if not already imported
         if not VLLM_AVAILABLE:
@@ -281,11 +277,8 @@ class VLMManager:
                 "gpu_memory_utilization": 0.9,
             }
 
-            # Handle CPU offloading (from slider or low_vram mode)
-            if offload_gb > 0:
-                vllm_kwargs["cpu_offload_gb"] = offload_gb
-                vllm_kwargs["gpu_memory_utilization"] = 0.85
-                print(f"CPU Offload: {offload_gb}GB will be offloaded to CPU")
+            # NOTE: cpu_offload_gb removed in vLLM 0.11.0 - V0 engine deprecated
+            # To use CPU offload, downgrade: pip install vllm==0.9.0
 
             # Handle quantization
             if quantization == "4bit":
@@ -1166,8 +1159,8 @@ def create_ui():
                     maximum=64,
                     value=0,
                     step=4,
-                    label="CPU Offload (GB)",
-                    info="Offload model weights to CPU RAM (vLLM only, uses V0 engine). Set >0 for large models.",
+                    label="CPU Offload (GB) [Requires vLLM 0.9.x]",
+                    info="Not supported in vLLM 0.11.0+. Downgrade with: pip install vllm==0.9.0",
                 )
                 auto_unload = gr.Checkbox(
                     label="Auto-unload after generation",
@@ -1357,7 +1350,7 @@ def main():
     parser.add_argument(
         "--cpu-offload",
         action="store_true",
-        help="Enable CPU offloading for large models (forces vLLM V0 engine)",
+        help="[DEPRECATED] CPU offload removed in vLLM 0.11.0. Use vllm==0.9.0 or quantization instead.",
     )
     parser.add_argument(
         "--backend",
@@ -1372,14 +1365,10 @@ def main():
     # Override host if --listen is specified
     host = "0.0.0.0" if args.listen else args.host
 
-    # Check if V0 engine is being used
-    using_v0 = os.environ.get("VLLM_USE_V1") == "0"
-
     print("=" * 60)
     print("Chromaforge VLM Chat Interface")
     print("=" * 60)
     print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
-    print(f"CPU Offload: {'enabled (V0 engine)' if using_v0 else 'disabled (use --cpu-offload to enable)'}")
     print(f"Backend: {args.backend}" + (" (vLLM available)" if _VLLM_CAN_IMPORT else " (vLLM not available)"))
     print(f"Server: http://{host}:{args.port}")
     if args.listen:

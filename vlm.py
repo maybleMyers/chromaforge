@@ -934,7 +934,6 @@ def main():
         server_name=host,
         server_port=args.port,
         share=args.share,
-        pwa=False,
     )
 
 

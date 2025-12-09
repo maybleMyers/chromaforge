@@ -39,11 +39,26 @@ except ImportError:
 # Import llama-cpp-python
 try:
     from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler, Llava16ChatHandler
+    from llama_cpp.llama_chat_format import (
+        Llava15ChatHandler,
+        Llava16ChatHandler,
+    )
     LLAMA_CPP_AVAILABLE = True
+
+    # Try to import Qwen25VLChatHandler (may not exist in older versions)
+    try:
+        from llama_cpp.llama_chat_format import Qwen25VLChatHandler
+        QWEN_VL_AVAILABLE = True
+    except ImportError:
+        Qwen25VLChatHandler = None
+        QWEN_VL_AVAILABLE = False
+        print("Note: Qwen25VLChatHandler not available. Update llama-cpp-python for Qwen-VL support.")
+
 except ImportError:
     LLAMA_CPP_AVAILABLE = False
+    QWEN_VL_AVAILABLE = False
     Llama = None
+    Qwen25VLChatHandler = None
     print("Error: llama-cpp-python not installed.")
     print("Install with CUDA: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
 
@@ -210,21 +225,58 @@ class LlamaCppVLM:
         try:
             progress(0.1, desc="Initializing...")
 
+            # Detect model type from name/path
+            model_name_lower = model_name.lower()
+            model_path_lower = model_path.lower()
+            is_qwen_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen", "qwen2-vl", "qwen3-vl", "qwen2.5-vl"])
+            is_llava = any(x in model_name_lower or x in model_path_lower for x in ["llava", "llava-v1"])
+
+            print(f"[llama.cpp] Model type detection: Qwen-VL={is_qwen_vl}, LLaVA={is_llava}")
+
             # Set up chat handler for vision models
             self.chat_handler = None
             if mmproj_path and os.path.exists(mmproj_path):
                 progress(0.2, desc="Loading vision encoder...")
                 print(f"[llama.cpp] Loading mmproj from: {mmproj_path}")
 
-                # Try different chat handlers
-                try:
-                    self.chat_handler = Llava16ChatHandler(clip_model_path=mmproj_path, verbose=False)
-                except Exception:
+                # Select chat handler based on model type
+                if is_qwen_vl and QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
+                    print("[llama.cpp] Using Qwen25VLChatHandler")
                     try:
-                        self.chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                        self.chat_handler = Qwen25VLChatHandler(clip_model_path=mmproj_path, verbose=False)
                     except Exception as e:
-                        print(f"Warning: Could not load vision encoder: {e}")
+                        print(f"Warning: Qwen25VLChatHandler failed: {e}")
                         self.chat_handler = None
+                elif is_llava:
+                    print("[llama.cpp] Using LLaVA chat handler")
+                    try:
+                        self.chat_handler = Llava16ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                    except Exception:
+                        try:
+                            self.chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                        except Exception as e:
+                            print(f"Warning: LLaVA handler failed: {e}")
+                            self.chat_handler = None
+                else:
+                    # Try handlers in order of likelihood
+                    print("[llama.cpp] Trying chat handlers in order...")
+                    handlers_to_try = []
+                    if QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
+                        handlers_to_try.append(("Qwen25VL", Qwen25VLChatHandler))
+                    handlers_to_try.extend([
+                        ("Llava16", Llava16ChatHandler),
+                        ("Llava15", Llava15ChatHandler),
+                    ])
+
+                    for handler_name, handler_class in handlers_to_try:
+                        try:
+                            print(f"[llama.cpp] Trying {handler_name}ChatHandler...")
+                            self.chat_handler = handler_class(clip_model_path=mmproj_path, verbose=False)
+                            print(f"[llama.cpp] {handler_name}ChatHandler loaded successfully")
+                            break
+                        except Exception as e:
+                            print(f"[llama.cpp] {handler_name}ChatHandler failed: {e}")
+                            continue
 
             progress(0.3, desc=f"Loading {model_name}...")
             print(f"[llama.cpp] Loading model from: {model_path}")
@@ -236,7 +288,7 @@ class LlamaCppVLM:
                 chat_handler=self.chat_handler,
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers,
-                verbose=False,
+                verbose=True,  # Enable verbose to see any loading issues
             )
 
             self.current_model_path = model_path

@@ -129,8 +129,14 @@ class KModel(torch.nn.Module):
             if attention.get_attn_precision() == torch.float32:
                 dtype_size = 4
 
-        # Removed ChromaDCT-specific detection and memory estimation
-        # ChromaDCT now uses the same estimation as regular models
-        # This prevents excessive CPU offloading that was causing 2x slower performance
+        is_chromadct = hasattr(self.diffusion_model, 'nerf_blocks')
+        if is_chromadct:
+            patch_size = getattr(self.diffusion_model, 'patch_size', 16)
+            h_patches = input_shape[2] // patch_size
+            w_patches = input_shape[3] // patch_size
+            seq_len = h_patches * w_patches + 512
+            scaler = 1.1
+            nerf_overhead = seq_len * 49152 * dtype_size * input_shape[0]
+            return scaler * area * dtype_size * 16384 + nerf_overhead
 
         return scaler * area * dtype_size * 16384

@@ -329,12 +329,8 @@ class Chroma(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
-        # compute mask
-        # assume max seq length from the batched input
-
         max_len = txt.shape[1]
 
-        # mask
         with torch.no_grad():
             txt_mask_w_padding = modify_mask_to_attend_padding(
                 txt_mask, max_len, attn_padding
@@ -342,18 +338,12 @@ class Chroma(nn.Module):
             txt_img_mask = torch.cat(
                 [
                     txt_mask_w_padding,
-                    torch.ones([img.shape[0], img.shape[1]], device=txt_mask.device),
+                    torch.ones([img.shape[0], img.shape[1]], device=txt_mask.device, dtype=torch.bool),
                 ],
                 dim=1,
             )
-            txt_img_mask = txt_img_mask.float().T @ txt_img_mask.float()
-            txt_img_mask = (
-                txt_img_mask[None, None, ...]
-                .repeat(txt.shape[0], self.num_heads, 1, 1)
-                .int()
-                .bool()
-            )
-            # txt_mask_w_padding[txt_mask_w_padding==False] = True
+            txt_img_mask_2d = txt_img_mask.unsqueeze(2) & txt_img_mask.unsqueeze(1)
+            txt_img_mask = txt_img_mask_2d.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
 
         for i, block in enumerate(self.double_blocks):
             # the guidance replaced by FFN output

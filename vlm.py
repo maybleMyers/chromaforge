@@ -1,22 +1,28 @@
 """
-VLM Chat Interface for Qwen Vision-Language Models
-A standalone GUI for interacting with Qwen VL models using images, videos, and text.
+VLM Chat Interface using llama-cpp-python Backend
+A standalone GUI for interacting with Vision-Language Models via llama.cpp.
+
+Requirements:
+- pip install llama-cpp-python (with CUDA support)
+- GGUF vision model + mmproj (clip) model
+
+Installation with CUDA (Linux):
+    CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+
+Installation with CUDA (Windows prebuilt):
+    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 """
 
 import os
-import sys
-
-# NOTE: cpu_offload_gb was removed in vLLM 0.11.0 (V0 engine deprecated)
-# For large models, use: quantization (AWQ/GPTQ), tensor parallelism, or transformers backend
-
 import gc
+import base64
 import argparse
 import tempfile
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 
-import torch
 import gradio as gr
 from gradio import themes
 from gradio.themes.utils import colors
@@ -30,62 +36,25 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: opencv-python not installed. Video support will be limited.")
 
-# vLLM will be imported lazily to allow setting VLLM_USE_V1 before import
-VLLM_AVAILABLE = False
-LLM = None
-SamplingParams = None
-
-def _check_vllm_available():
-    """Check if vLLM can be imported (without actually importing it)."""
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("vllm")
-        return spec is not None
-    except Exception:
-        return False
-
-def _import_vllm():
-    """Import vLLM (V0/V1 engine is determined by env var set at startup)."""
-    global VLLM_AVAILABLE, LLM, SamplingParams
-
-    try:
-        from vllm import LLM as _LLM, SamplingParams as _SamplingParams
-        LLM = _LLM
-        SamplingParams = _SamplingParams
-        VLLM_AVAILABLE = True
-        print("vLLM loaded successfully")
-        return True
-    except ImportError as e:
-        VLLM_AVAILABLE = False
-        print(f"Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
-        print(f"  Import error: {e}")
-        return False
-    except Exception as e:
-        VLLM_AVAILABLE = False
-        print(f"Warning: vLLM import failed: {e}")
-        return False
-
-# Check if vLLM is available (but don't import yet)
-_VLLM_CAN_IMPORT = _check_vllm_available()
-if _VLLM_CAN_IMPORT:
-    print("vLLM detected, will be loaded when needed")
-else:
-    print("Warning: vLLM not available. Install with: pip install vllm>=0.11.0")
-
-# Try to import qwen-vl-utils for image processing
+# Import llama-cpp-python
 try:
-    from qwen_vl_utils import process_vision_info
-    QWEN_VL_UTILS_AVAILABLE = True
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Llava15ChatHandler, Llava16ChatHandler
+    LLAMA_CPP_AVAILABLE = True
 except ImportError:
-    QWEN_VL_UTILS_AVAILABLE = False
-    print("Warning: qwen-vl-utils not installed. Install with: pip install qwen-vl-utils")
+    LLAMA_CPP_AVAILABLE = False
+    Llama = None
+    print("Error: llama-cpp-python not installed.")
+    print("Install with CUDA: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
 
-# Default model paths (relative to models/LLM)
-DEFAULT_MODELS = {
-    "Qwen3-VL-8B-Caption-V4.5": "models/LLM/Qwen3-VL-8B-Caption-V4.5",
-    "Qwen3-VL-4B-Instruct": "models/LLM/Qwen3-VL-4B-Instruct",
-    "Qwen3-VL-30B-A3B-Instruct": "models/LLM/Qwen3-VL-30B-A3B-Instruct",
-}
+
+def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
+    """Convert PIL Image to base64 data URL."""
+    buffer = BytesIO()
+    image.save(buffer, format=format)
+    b64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    mime_type = f"image/{format.lower()}"
+    return f"data:{mime_type};base64,{b64_data}"
 
 
 def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448)) -> List[Image.Image]:
@@ -133,609 +102,315 @@ def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tupl
     return frames
 
 
-class VLMManager:
-    """Manages Qwen VL model loading, inference, and memory."""
+def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
+    """
+    Find GGUF models in a directory.
+    Returns list of dicts with 'name', 'model_path', and optional 'mmproj_path'.
+    """
+    models = []
+    models_path = Path(models_dir)
 
-    def __init__(self, low_vram: bool = False, backend: str = "auto"):
+    if not models_path.exists():
+        return models
+
+    # Look for .gguf files
+    for gguf_file in models_path.rglob("*.gguf"):
+        name = gguf_file.stem
+        model_path = str(gguf_file)
+
+        # Skip mmproj/clip files as main models
+        if any(x in name.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
+            continue
+
+        # Try to find matching mmproj file for vision models
+        mmproj_path = None
+        parent = gguf_file.parent
+
+        # Common mmproj naming patterns
+        mmproj_patterns = [
+            "*mmproj*.gguf",
+            "*clip*.gguf",
+            "*vision*.gguf",
+            "*image-encoder*.gguf",
+        ]
+
+        for pattern in mmproj_patterns:
+            mmproj_files = list(parent.glob(pattern))
+            if mmproj_files:
+                mmproj_path = str(mmproj_files[0])
+                break
+
+        models.append({
+            "name": name,
+            "model_path": model_path,
+            "mmproj_path": mmproj_path,
+        })
+
+    return sorted(models, key=lambda x: x["name"])
+
+
+class LlamaCppVLM:
+    """Manages VLM inference via llama-cpp-python."""
+
+    def __init__(self, models_dir: str = "models/LLM"):
+        """Initialize llama.cpp VLM Manager."""
+        self.models_dir = models_dir
+        self.model: Optional[Llama] = None
+        self.current_model_path: Optional[str] = None
+        self.current_mmproj_path: Optional[str] = None
+        self.chat_handler = None
+
+    def get_available_models(self) -> List[Dict[str, str]]:
+        """Get list of available GGUF models."""
+        return find_gguf_models(self.models_dir)
+
+    def get_model_names(self) -> List[str]:
+        """Get list of model names for dropdown."""
+        models = self.get_available_models()
+        if not models:
+            return ["No GGUF models found"]
+        return [m["name"] for m in models]
+
+    def load_model(
+        self,
+        model_name: str,
+        n_gpu_layers: int = -1,
+        n_ctx: int = 4096,
+        progress=gr.Progress(),
+    ) -> str:
         """
-        Initialize VLM Manager.
-
-        Args:
-            low_vram: Enable low VRAM mode for transformers backend
-            backend: "vllm", "transformers", or "auto" (vLLM if available, else transformers)
-        """
-        self.model = None
-        self.processor = None
-        self.model_name = None
-        self.low_vram = low_vram
-        self.device = self._get_device()
-
-        # vLLM specific attributes
-        self.vllm_model = None
-        self.model_path = None
-
-        # Determine backend (use _VLLM_CAN_IMPORT since vLLM is lazily imported)
-        if backend == "auto":
-            self.backend = "vllm" if _VLLM_CAN_IMPORT else "transformers"
-        else:
-            self.backend = backend
-
-        if self.backend == "vllm" and not _VLLM_CAN_IMPORT:
-            print("Warning: vLLM requested but not available. Falling back to transformers.")
-            self.backend = "transformers"
-
-        print(f"VLM Backend: {self.backend}")
-
-    def _get_device(self) -> torch.device:
-        """Get the best available device."""
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    def get_available_models(self) -> List[str]:
-        """Scan for available models in the models/LLM directory."""
-        models = []
-        llm_dir = Path("models/LLM")
-
-        if llm_dir.exists():
-            for item in llm_dir.iterdir():
-                if item.is_dir():
-                    # Check if it looks like a valid model directory
-                    if (item / "config.json").exists() or (item / "model.safetensors").exists():
-                        models.append(item.name)
-
-        # Also check default paths
-        for name, path in DEFAULT_MODELS.items():
-            if Path(path).exists() and name not in models:
-                models.append(name)
-
-        return sorted(models) if models else ["No models found"]
-
-    def _detect_model_type(self, model_path: str) -> str:
-        """Detect the model type from config.json."""
-        import json
-        config_path = Path(model_path) / "config.json"
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                model_type = config.get("model_type", "").lower()
-                # Check for MoE models first
-                if "moe" in model_type:
-                    if "qwen3" in model_type:
-                        return "qwen3_vl_moe"
-                # Then standard models
-                if "qwen3" in model_type:
-                    return "qwen3_vl"
-                elif "qwen2_5" in model_type or "qwen2.5" in model_type:
-                    return "qwen2_5_vl"
-                elif "qwen2" in model_type:
-                    return "qwen2_vl"
-            except Exception as e:
-                print(f"Warning: Could not read config.json: {e}")
-
-        # Fallback to name-based detection
-        model_name_lower = Path(model_path).name.lower()
-        if "qwen3" in model_name_lower:
-            return "qwen3_vl"
-        elif "qwen2.5" in model_name_lower or "qwen2_5" in model_name_lower:
-            return "qwen2_5_vl"
-
-        return "qwen2_5_vl"  # Default fallback
-
-    def _load_with_vllm(self, model_name: str, quantization: str = "none", cpu_offload: int = 0, progress=gr.Progress()) -> str:
-        """Load model using vLLM backend for high-performance inference."""
-        global VLLM_AVAILABLE, LLM, SamplingParams
-
-        # NOTE: cpu_offload_gb was removed in vLLM 0.11.0 (V0 engine deprecated)
-        # For large models, use quantization or transformers backend
-        if cpu_offload > 0:
-            print(f"Warning: CPU offload requested ({cpu_offload}GB) but not supported in vLLM 0.11.0+")
-            print("  Options: 1) pip install vllm==0.9.0  2) Use quantization  3) Use transformers backend")
-
-        # Import vLLM if not already imported
-        if not VLLM_AVAILABLE:
-            if not _VLLM_CAN_IMPORT:
-                return "vLLM is not available. Please install with: pip install vllm>=0.11.0"
-            if not _import_vllm():
-                return "Failed to import vLLM. Check console for errors."
-
-        # Check if already loaded
-        if self.vllm_model is not None and self.model_name == model_name:
-            return f"Model '{model_name}' is already loaded (vLLM)."
-
-        # Unload existing model first
-        if self.vllm_model is not None:
-            self.unload_model()
-
-        progress(0.1, desc="Loading model with vLLM...")
-
-        # Determine model path
-        if model_name in DEFAULT_MODELS:
-            model_path = DEFAULT_MODELS[model_name]
-        else:
-            model_path = f"models/LLM/{model_name}"
-
-        if not Path(model_path).exists():
-            return f"Model path not found: {model_path}"
-
-        try:
-            # Detect model type
-            model_type = self._detect_model_type(model_path)
-            print(f"Detected model type: {model_type}")
-
-            progress(0.3, desc="Initializing vLLM engine...")
-
-            # Configure vLLM loading options
-            vllm_kwargs = {
-                "model": model_path,
-                "trust_remote_code": True,
-                "dtype": "bfloat16",
-                "max_model_len": 4096,  # Adjust based on your VRAM
-                "gpu_memory_utilization": 0.9,
-            }
-
-            # NOTE: cpu_offload_gb removed in vLLM 0.11.0 - V0 engine deprecated
-            # To use CPU offload, downgrade: pip install vllm==0.9.0
-
-            # Handle quantization
-            if quantization == "4bit":
-                vllm_kwargs["quantization"] = "awq"  # or "gptq" depending on model
-                print("Using AWQ 4-bit quantization with vLLM")
-            elif quantization == "8bit":
-                vllm_kwargs["quantization"] = "fp8"
-                print("Using FP8 quantization with vLLM")
-
-            # Enable multimodal for VL models
-            vllm_kwargs["limit_mm_per_prompt"] = {"image": 10, "video": 2}
-
-            progress(0.5, desc=f"Loading {model_type} with vLLM...")
-
-            self.vllm_model = LLM(**vllm_kwargs)
-            self.model_path = model_path
-            self.model_name = model_name
-
-            # Also load processor for chat template
-            from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_path)
-
-            progress(1.0, desc="Model loaded with vLLM!")
-
-            quant_info = f", {quantization}" if quantization != "none" else ""
-            return f"Successfully loaded '{model_name}' with vLLM ({model_type}{quant_info})"
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return f"Failed to load model with vLLM: {str(e)}"
-
-    def load_model(self, model_name: str, quantization: str = "none", use_flash_attn: bool = False, vram_buffer: int = 0, cpu_offload: int = 0, progress=gr.Progress()) -> str:
-        """Load a Qwen VL model.
+        Load a GGUF model.
 
         Args:
             model_name: Name of the model to load
-            quantization: "none", "4bit", or "8bit"
-            use_flash_attn: Whether to use Flash Attention 2
-            vram_buffer: GB of VRAM to reserve (for loading large models)
-            cpu_offload: GB of model weights to offload to CPU (vLLM only)
+            n_gpu_layers: Number of layers to offload to GPU (-1 = all)
+            n_ctx: Context length
             progress: Gradio progress callback
+
+        Returns:
+            Status message
         """
-        if model_name == "No models found":
-            return "No models available. Please download a model first."
+        if not LLAMA_CPP_AVAILABLE:
+            return "Error: llama-cpp-python not installed"
 
-        # Use vLLM backend if selected
-        if self.backend == "vllm":
-            return self._load_with_vllm(model_name, quantization, cpu_offload, progress)
+        # Find the model
+        models = self.get_available_models()
+        model_info = next((m for m in models if m["name"] == model_name), None)
 
-        # Check if already loaded
-        if self.model is not None and self.model_name == model_name:
-            return f"Model '{model_name}' is already loaded."
+        if model_info is None:
+            return f"Error: Model '{model_name}' not found"
 
-        # Unload existing model first
+        model_path = model_info["model_path"]
+        mmproj_path = model_info.get("mmproj_path")
+
+        # Unload current model if any
         if self.model is not None:
             self.unload_model()
 
-        progress(0.1, desc="Loading model...")
-
-        # Determine model path
-        if model_name in DEFAULT_MODELS:
-            model_path = DEFAULT_MODELS[model_name]
-        else:
-            model_path = f"models/LLM/{model_name}"
-
-        if not Path(model_path).exists():
-            return f"Model path not found: {model_path}"
-
         try:
-            # Detect model type from config
-            model_type = self._detect_model_type(model_path)
-            print(f"Detected model type: {model_type}")
+            progress(0.1, desc="Initializing...")
 
-            from transformers import AutoProcessor
+            # Set up chat handler for vision models
+            self.chat_handler = None
+            if mmproj_path and os.path.exists(mmproj_path):
+                progress(0.2, desc="Loading vision encoder...")
+                print(f"[llama.cpp] Loading mmproj from: {mmproj_path}")
 
-            progress(0.3, desc="Loading processor...")
-            self.processor = AutoProcessor.from_pretrained(model_path)
-
-            progress(0.5, desc=f"Loading model weights ({model_type})...")
-
-            # Select the correct model class based on detected type
-            if model_type == "qwen3_vl_moe":
-                from transformers import Qwen3VLMoeForConditionalGeneration as ModelClass
-            elif model_type == "qwen3_vl":
-                from transformers import Qwen3VLForConditionalGeneration as ModelClass
-            else:
-                from transformers import Qwen2_5_VLForConditionalGeneration as ModelClass
-
-            # Build loading kwargs
-            load_kwargs = {
-                "low_cpu_mem_usage": True,
-            }
-
-            # Configure quantization for faster inference with less VRAM
-            if quantization == "4bit":
+                # Try different chat handlers
                 try:
-                    from transformers import BitsAndBytesConfig
-                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.bfloat16,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                    )
-                    # 4-bit models must use device_map for proper loading
-                    load_kwargs["device_map"] = "auto"
-                    print("Using 4-bit quantization (NF4)")
-                except ImportError:
-                    print("Warning: bitsandbytes not installed, falling back to bfloat16")
-                    load_kwargs["torch_dtype"] = torch.bfloat16
-                    load_kwargs["device_map"] = "auto"
-            elif quantization == "8bit":
-                try:
-                    from transformers import BitsAndBytesConfig
+                    self.chat_handler = Llava16ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                except Exception:
+                    try:
+                        self.chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                    except Exception as e:
+                        print(f"Warning: Could not load vision encoder: {e}")
+                        self.chat_handler = None
 
-                    # Clear GPU memory before loading
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+            progress(0.3, desc=f"Loading {model_name}...")
+            print(f"[llama.cpp] Loading model from: {model_path}")
+            print(f"[llama.cpp] GPU layers: {n_gpu_layers}, Context: {n_ctx}")
 
-                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_8bit=True,
-                    )
+            # Load the model
+            self.model = Llama(
+                model_path=model_path,
+                chat_handler=self.chat_handler,
+                n_ctx=n_ctx,
+                n_gpu_layers=n_gpu_layers,
+                verbose=False,
+            )
 
-                    # Apply VRAM buffer if specified
-                    if vram_buffer > 0 and torch.cuda.is_available():
-                        total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                        max_gpu = int(total_mem_gb - vram_buffer)
-                        if max_gpu > 0:
-                            load_kwargs["device_map"] = "auto"
-                            load_kwargs["max_memory"] = {0: f"{max_gpu}GiB", "cpu": "100GiB"}
-                            offload_dir = Path(tempfile.gettempdir()) / "vlm_offload"
-                            offload_dir.mkdir(exist_ok=True)
-                            load_kwargs["offload_folder"] = str(offload_dir)
-                            print(f"Using 8-bit quantization (max GPU: {max_gpu}GB, buffer: {vram_buffer}GB)")
-                        else:
-                            load_kwargs["device_map"] = "auto"
-                            print("Using 8-bit quantization...")
-                    else:
-                        load_kwargs["device_map"] = "auto"
-                        print("Using 8-bit quantization...")
+            self.current_model_path = model_path
+            self.current_mmproj_path = mmproj_path
 
-                except ImportError as e:
-                    print(f"Warning: bitsandbytes not installed, falling back to bfloat16")
-                    load_kwargs["torch_dtype"] = torch.bfloat16
-                    load_kwargs["device_map"] = "auto"
-            else:
-                load_kwargs["torch_dtype"] = torch.bfloat16
-                # Set device map based on low_vram setting
-                if self.low_vram:
-                    load_kwargs["device_map"] = {"": self.device}
-                else:
-                    load_kwargs["device_map"] = "auto"
-
-            # Use Flash Attention 2 if requested
-            if use_flash_attn:
-                load_kwargs["attn_implementation"] = "flash_attention_2"
-                print("Using Flash Attention 2")
-
-            self.model = ModelClass.from_pretrained(model_path, **load_kwargs)
-
-            self.model_name = model_name
             progress(1.0, desc="Model loaded!")
 
-            quant_info = f", {quantization}" if quantization != "none" else ""
-            flash_info = ", flash_attn" if use_flash_attn else ""
-            return f"Successfully loaded '{model_name}' ({model_type}{quant_info}{flash_info})"
+            vision_status = "with vision" if self.chat_handler else "text-only"
+            return f"Loaded: {model_name} ({vision_status})"
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return f"Failed to load model: {str(e)}"
+            self.model = None
+            self.chat_handler = None
+            return f"Error loading model: {str(e)}"
 
     def unload_model(self) -> str:
-        """Unload the current model to free memory."""
-        # Check if any model is loaded (either vLLM or transformers)
-        if self.model is None and self.vllm_model is None:
-            return "No model is currently loaded."
+        """Unload the current model."""
+        if self.model is None:
+            return "No model loaded"
 
-        model_name = self.model_name
-        backend_used = "vLLM" if self.vllm_model is not None else "transformers"
-
-        # Unload vLLM model
-        if self.vllm_model is not None:
-            del self.vllm_model
-            self.vllm_model = None
-            self.model_path = None
-
-        # Unload transformers model
-        if self.model is not None:
-            del self.model
-            self.model = None
-
-        # Clean up processor
-        if self.processor is not None:
-            del self.processor
-            self.processor = None
-
-        self.model_name = None
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return f"Unloaded '{model_name}' ({backend_used}) and freed memory."
-
-    def get_memory_info(self) -> str:
-        """Get current GPU memory usage."""
-        if not torch.cuda.is_available():
-            return "CUDA not available"
-
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-
-        return f"GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {total:.1f}GB total"
-
-    def _generate_with_vllm(
-        self,
-        messages: List[Dict[str, Any]],
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        top_k: int = 50,
-        repetition_penalty: float = 1.1,
-        video_max_frames: int = 8,
-    ) -> str:
-        """Generate a response using vLLM backend."""
-        if self.vllm_model is None:
-            return "Error: No vLLM model loaded."
+        model_name = Path(self.current_model_path).stem if self.current_model_path else "model"
 
         try:
-            # Process messages to extract images and prepare for vLLM
-            images = []
-            processed_messages = []
+            del self.model
+            del self.chat_handler
+            self.model = None
+            self.chat_handler = None
+            self.current_model_path = None
+            self.current_mmproj_path = None
 
-            for msg in messages:
-                if isinstance(msg.get("content"), list):
-                    new_content = []
-                    for item in msg["content"]:
-                        if item.get("type") == "image" and "image" in item:
-                            img = item["image"]
-                            images.append(img)
-                            # For vLLM, use placeholder in text
-                            new_content.append({"type": "image"})
-                        elif item.get("type") == "video" and "video" in item:
-                            # Process video into frames
-                            video_path = item["video"]
-                            if isinstance(video_path, str) and os.path.exists(video_path):
-                                try:
-                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
-                                    for frame in frames:
-                                        images.append(frame)
-                                        new_content.append({"type": "image"})
-                                    if frames:
-                                        new_content.append({"type": "text", "text": f"[The above {len(frames)} images are frames extracted from a video]"})
-                                except Exception as e:
-                                    new_content.append({"type": "text", "text": f"[Video processing error: {str(e)}]"})
-                        elif item.get("type") == "text":
-                            new_content.append(item)
-                        else:
-                            new_content.append(item)
-                    processed_messages.append({"role": msg["role"], "content": new_content})
-                else:
-                    processed_messages.append(msg)
+            # Force garbage collection
+            gc.collect()
 
-            # Apply chat template using processor
-            text_input = self.processor.apply_chat_template(
-                processed_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            # Try to clear CUDA cache if available
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
 
-            print(f"[vLLM Debug] Prompt preview: {text_input[:500]}...")
-            print(f"[vLLM Debug] Number of images: {len(images)}")
-
-            # Configure sampling parameters
-            sampling_params = SamplingParams(
-                max_tokens=max_new_tokens,
-                temperature=temperature if temperature > 0 else 0.001,
-                top_p=top_p,
-                top_k=top_k if top_k > 0 else -1,
-                repetition_penalty=repetition_penalty,
-            )
-
-            # Prepare multimodal inputs for vLLM
-            if images:
-                # Convert PIL images to format vLLM expects
-                mm_data = {"image": images}
-                inputs = {
-                    "prompt": text_input,
-                    "multi_modal_data": mm_data,
-                }
-            else:
-                inputs = {"prompt": text_input}
-
-            # Generate with timing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            start_time = time.perf_counter()
-
-            outputs = self.vllm_model.generate([inputs], sampling_params=sampling_params)
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            end_time = time.perf_counter()
-
-            # Extract response
-            response = outputs[0].outputs[0].text
-
-            # Calculate throughput
-            num_generated_tokens = len(outputs[0].outputs[0].token_ids)
-            generation_time = end_time - start_time
-            tokens_per_sec = num_generated_tokens / generation_time if generation_time > 0 else 0
-
-            print(f"[vLLM Inference] Generated {num_generated_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
-
-            # Clean up thinking tags if present
-            if "</think>" in response:
-                response = response.split("</think>")[-1].strip()
-
-            return response
-
+            return f"Unloaded: {model_name}"
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return f"Error during vLLM generation: {str(e)}"
+            return f"Error unloading: {str(e)}"
 
-    @torch.inference_mode()
+    def get_status(self) -> str:
+        """Get current status."""
+        if self.model is None:
+            return "No model loaded"
+
+        model_name = Path(self.current_model_path).stem if self.current_model_path else "Unknown"
+        vision_status = "vision" if self.chat_handler else "text-only"
+        return f"Loaded: {model_name} ({vision_status})"
+
     def generate(
         self,
         messages: List[Dict[str, Any]],
+        images: Optional[List[Image.Image]] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
-        top_p: float = 0.9,
-        top_k: int = 50,
-        repetition_penalty: float = 1.1,
         video_max_frames: int = 8,
     ) -> str:
-        """Generate a response from the model."""
-        # Use vLLM backend if loaded
-        if self.vllm_model is not None:
-            return self._generate_with_vllm(
-                messages=messages,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                video_max_frames=video_max_frames,
-            )
+        """
+        Generate a response.
 
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            images: Optional list of PIL Images
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            video_max_frames: Max frames for video processing
+
+        Returns:
+            Generated response string
+        """
         if self.model is None:
             return "Error: No model loaded. Please load a model first."
 
         try:
-            # Extract images and videos from messages, process videos into frames
-            images = []
-            processed_messages = []
+            # Build messages in llama.cpp format
+            llama_messages = []
 
             for msg in messages:
-                if isinstance(msg.get("content"), list):
-                    new_content = []
-                    for item in msg["content"]:
-                        if item.get("type") == "image" and "image" in item:
-                            images.append(item["image"])
-                            new_content.append({"type": "image", "image": item["image"]})
-                        elif item.get("type") == "video" and "video" in item:
-                            # Process video into frames
-                            video_path = item["video"]
-                            if isinstance(video_path, str) and os.path.exists(video_path):
-                                try:
-                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
-                                    # Add each frame as an image
-                                    for frame in frames:
-                                        images.append(frame)
-                                        new_content.append({"type": "image", "image": frame})
-                                    # Add a note about video frames
-                                    if frames:
-                                        new_content.append({"type": "text", "text": f"[The above {len(frames)} images are frames extracted from a video]"})
-                                except Exception as e:
-                                    new_content.append({"type": "text", "text": f"[Video processing error: {str(e)}]"})
-                            else:
-                                new_content.append({"type": "text", "text": "[Video file not found]"})
-                        else:
-                            new_content.append(item)
-                    processed_messages.append({"role": msg["role"], "content": new_content})
-                else:
-                    processed_messages.append(msg)
-
-            # Apply chat template
-            print(f"[Debug] Messages being sent to model: {len(processed_messages)} messages")
-            for i, msg in enumerate(processed_messages):
-                role = msg.get("role", "unknown")
+                role = msg.get("role", "user")
                 content = msg.get("content", "")
-                if isinstance(content, str):
-                    preview = content[:100] + "..." if len(content) > 100 else content
-                else:
-                    preview = f"[{len(content)} content items]"
-                print(f"  [{i}] {role}: {preview}")
 
-            text_input = self.processor.apply_chat_template(
-                processed_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            print(f"[Debug] Formatted prompt preview: {text_input[:500]}...")
+                if role == "system":
+                    llama_messages.append({"role": "system", "content": content})
 
-            # Process inputs
-            process_kwargs = {"text": [text_input], "padding": True, "return_tensors": "pt"}
+                elif role == "user":
+                    if isinstance(content, list):
+                        # Handle multimodal content
+                        parts = []
+                        for item in content:
+                            if isinstance(item, dict):
+                                if item.get("type") == "text":
+                                    parts.append({
+                                        "type": "text",
+                                        "text": item.get("text", "")
+                                    })
+                                elif item.get("type") == "image" and "image" in item:
+                                    img = item["image"]
+                                    if isinstance(img, Image.Image):
+                                        b64_url = image_to_base64(img)
+                                        parts.append({
+                                            "type": "image_url",
+                                            "image_url": {"url": b64_url}
+                                        })
+                                elif item.get("type") == "video" and "video" in item:
+                                    video_path = item["video"]
+                                    if isinstance(video_path, str) and os.path.exists(video_path):
+                                        try:
+                                            frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                            for frame in frames:
+                                                b64_url = image_to_base64(frame)
+                                                parts.append({
+                                                    "type": "image_url",
+                                                    "image_url": {"url": b64_url}
+                                                })
+                                            parts.append({
+                                                "type": "text",
+                                                "text": f"[Video with {len(frames)} frames]"
+                                            })
+                                        except Exception as e:
+                                            parts.append({
+                                                "type": "text",
+                                                "text": f"[Video error: {e}]"
+                                            })
 
+                        if parts:
+                            llama_messages.append({"role": "user", "content": parts})
+                        else:
+                            llama_messages.append({"role": "user", "content": "Describe this."})
+                    else:
+                        llama_messages.append({"role": "user", "content": str(content)})
+
+                elif role == "assistant":
+                    llama_messages.append({"role": "assistant", "content": str(content)})
+
+            # Add any direct images
             if images:
-                process_kwargs["images"] = images
+                image_parts = []
+                for img in images:
+                    b64_url = image_to_base64(img)
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": b64_url}
+                    })
+                image_parts.append({"type": "text", "text": "Describe this image."})
+                llama_messages.append({"role": "user", "content": image_parts})
 
-            inputs = self.processor(**process_kwargs)
-
-            # Move to device
-            device = next(self.model.parameters()).device
-            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-
-            # Generate with timing
-            input_len = inputs['input_ids'].shape[1]
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            # Generate response
             start_time = time.perf_counter()
 
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=temperature if temperature > 0 else 1.0,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
+            response = self.model.create_chat_completion(
+                messages=llama_messages,
+                max_tokens=max_new_tokens,
+                temperature=temperature if temperature > 0 else 0.001,
             )
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             end_time = time.perf_counter()
-
-            # Calculate throughput
-            generated_ids = outputs[0][input_len:]
-            num_generated_tokens = len(generated_ids)
             generation_time = end_time - start_time
-            tokens_per_sec = num_generated_tokens / generation_time if generation_time > 0 else 0
+            print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
 
-            print(f"[Inference] Generated {num_generated_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
-
-            response = self.processor.decode(generated_ids, skip_special_tokens=True)
+            # Extract response content
+            result = response["choices"][0]["message"]["content"]
 
             # Clean up thinking tags if present
-            if "</think>" in response:
-                response = response.split("</think>")[-1].strip()
+            if "</think>" in result:
+                result = result.split("</think>")[-1].strip()
 
-            return response
+            return result
 
         except Exception as e:
             import traceback
@@ -744,68 +419,56 @@ class VLMManager:
 
 
 # Global manager instance
-vlm_manager: Optional[VLMManager] = None
+vlm_manager: Optional[LlamaCppVLM] = None
 
 
-def initialize_manager(low_vram: bool = False, backend: str = "auto"):
+def initialize_manager(models_dir: str = "models/LLM"):
     """Initialize the global VLM manager."""
     global vlm_manager
-    vlm_manager = VLMManager(low_vram=low_vram, backend=backend)
+    vlm_manager = LlamaCppVLM(models_dir)
 
 
-def switch_backend_handler(backend: str):
-    """Handle backend switching from UI."""
-    global vlm_manager
-    if vlm_manager is not None:
-        # Unload current model first
-        vlm_manager.unload_model()
-
-    # Get current low_vram setting
-    low_vram = vlm_manager.low_vram if vlm_manager else False
-
-    # Reinitialize with new backend
-    vlm_manager = VLMManager(low_vram=low_vram, backend=backend)
-    return f"Switched to {vlm_manager.backend} backend"
+def refresh_models_handler():
+    """Refresh the list of available models."""
+    if vlm_manager is None:
+        return gr.update(choices=["Manager not initialized"])
+    models = vlm_manager.get_model_names()
+    return gr.update(choices=models, value=models[0] if models else None)
 
 
-def load_model_handler(model_name: str, quantization: str, use_flash_attn: bool, vram_buffer: int, cpu_offload: int, progress=gr.Progress()):
-    """Handle model loading from UI."""
+def load_model_handler(model_name: str, n_gpu_layers: int, n_ctx: int, progress=gr.Progress()):
+    """Handle model loading."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.load_model(model_name, quantization, use_flash_attn, int(vram_buffer), int(cpu_offload), progress)
+    return vlm_manager.load_model(model_name, n_gpu_layers, n_ctx, progress)
 
 
 def unload_model_handler():
-    """Handle model unloading from UI."""
+    """Handle model unloading."""
     if vlm_manager is None:
         return "Manager not initialized"
     return vlm_manager.unload_model()
 
 
-def get_memory_handler():
-    """Handle memory info request from UI."""
+def status_handler():
+    """Handle status request."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.get_memory_info()
+    return vlm_manager.get_status()
 
 
 def chat_handler(
     message: str,
-    history: List[Tuple[str, str]],
+    history: List[Dict[str, Any]],
     system_prompt: str,
     image,
     video,
     max_tokens: int,
     temperature: float,
-    top_p: float,
-    top_k: int,
-    repetition_penalty: float,
     video_max_frames: int = 8,
-    auto_unload: bool = False,
 ):
     """Handle chat messages from UI."""
-    # Check if any model is loaded (either transformers or vLLM)
-    if vlm_manager is None or (vlm_manager.model is None and vlm_manager.vllm_model is None):
+    if vlm_manager is None or vlm_manager.model is None:
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
@@ -818,23 +481,19 @@ def chat_handler(
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
 
-    # Add chat history (already in messages format for Gradio 5.x)
+    # Add chat history
     for msg in history:
         if isinstance(msg, dict) and "role" in msg and "content" in msg:
-            # Extract text content for model
             content = msg.get("content", "")
             if isinstance(content, str):
                 messages.append({"role": msg["role"], "content": content})
-            elif isinstance(content, dict) and "path" in content:
-                # Skip file-only messages in history for model
-                continue
             elif isinstance(content, list):
                 # Handle mixed content - extract text parts
                 text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
                 if text_parts:
                     messages.append({"role": msg["role"], "content": " ".join(text_parts)})
 
-    # Build current message content for the model
+    # Build current message content
     model_content = []
 
     if image is not None:
@@ -843,7 +502,10 @@ def chat_handler(
     if video is not None:
         model_content.append({"type": "video", "video": video})
 
-    model_content.append({"type": "text", "text": message})
+    if message.strip():
+        model_content.append({"type": "text", "text": message})
+    elif not model_content:
+        model_content.append({"type": "text", "text": "Describe this image."})
 
     messages.append({"role": "user", "content": model_content})
 
@@ -852,14 +514,10 @@ def chat_handler(
         messages=messages,
         max_new_tokens=max_tokens,
         temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
         video_max_frames=video_max_frames,
     )
 
-    # Build display content for chatbot (Gradio 5.x messages format)
-    # Format: [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]
+    # Build display content for chatbot
     new_history = list(history)
 
     if image is not None:
@@ -867,29 +525,18 @@ def chat_handler(
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"vlm_chat_{id(image)}.png")
         image.save(temp_path)
-        # Add user message with image and text
-        if message:
-            new_history.append({"role": "user", "content": [{"type": "text", "text": message}, {"type": "image", "path": temp_path}]})
-        else:
-            new_history.append({"role": "user", "content": [{"type": "text", "text": "[Describe this image]"}, {"type": "image", "path": temp_path}]})
+        display_text = message if message else "[Describe this image]"
+        new_history.append({"role": "user", "content": [{"type": "text", "text": display_text}, {"type": "image", "path": temp_path}]})
         new_history.append({"role": "assistant", "content": response})
     elif video is not None:
-        # Add user message with video and text
-        if message:
-            new_history.append({"role": "user", "content": [{"type": "text", "text": message}, {"type": "video", "path": video}]})
-        else:
-            new_history.append({"role": "user", "content": [{"type": "text", "text": "[Describe this video]"}, {"type": "video", "path": video}]})
+        display_text = message if message else "[Describe this video]"
+        new_history.append({"role": "user", "content": [{"type": "text", "text": display_text}, {"type": "video", "path": video}]})
         new_history.append({"role": "assistant", "content": response})
     else:
         new_history.append({"role": "user", "content": message})
         new_history.append({"role": "assistant", "content": response})
 
-    # Auto-unload if requested
-    status_msg = ""
-    if auto_unload and vlm_manager.model is not None:
-        status_msg = vlm_manager.unload_model()
-
-    return new_history, status_msg
+    return new_history, ""
 
 
 def clear_chat_handler():
@@ -903,9 +550,6 @@ def batch_caption_handler(
     system_prompt: str,
     max_tokens: int,
     temperature: float,
-    top_p: float,
-    top_k: int,
-    repetition_penalty: float,
     progress=gr.Progress(),
 ):
     """Process a folder of images and generate captions."""
@@ -955,9 +599,6 @@ def batch_caption_handler(
                 messages=messages,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
             )
 
             # Save caption to .txt file
@@ -977,10 +618,7 @@ def batch_caption_handler(
 
 def create_ui():
     """Create the Gradio interface."""
-    available_models = vlm_manager.get_available_models() if vlm_manager else ["Manager not initialized"]
-
-    # Theme for Gradio 5.x
-    global vlm_theme, vlm_css
+    # Theme
     vlm_theme = themes.Default(
         primary_hue=colors.Color(
             name="custom",
@@ -997,9 +635,8 @@ def create_ui():
             c950="#000A18"
         )
     )
+
     vlm_css = """
-    .gallery-item:first-child { border: 2px solid #4CAF50 !important; }
-    .gallery-item:first-child:hover { border-color: #45a049 !important; }
     .green-btn {
         background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
         color: white !important;
@@ -1008,85 +645,54 @@ def create_ui():
     .green-btn:hover {
         background: linear-gradient(to bottom right, #27ae60, #219651) !important;
     }
-    .refresh-btn {
-        max-width: 40px !important;
-        min-width: 40px !important;
-        height: 40px !important;
-        border-radius: 50% !important;
-        padding: 0 !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-    }
-    .light-blue-btn {
-        background: linear-gradient(to bottom right, #AEC6CF, #9AB8C4) !important;
-        color: #333 !important;
-        border: 1px solid #9AB8C4 !important;
-    }
-    .light-blue-btn:hover {
-        background: linear-gradient(to bottom right, #9AB8C4, #8AA9B5) !important;
-        border-color: #8AA9B5 !important;
-    }
     """
 
-    with gr.Blocks(title="Chromaforge VLM") as demo:
+    # Get initial model list
+    initial_models = vlm_manager.get_model_names() if vlm_manager else ["Initialize manager first"]
+
+    with gr.Blocks(title="Chromaforge VLM (llama.cpp)", theme=vlm_theme, css=vlm_css) as demo:
+        gr.Markdown("# Chromaforge VLM Chat (llama.cpp Backend)")
+        gr.Markdown("Load GGUF vision models and chat with images/video. Fully local, GPU accelerated.")
+
         with gr.Row():
-            # Left column - Settings (shared across tabs)
+            # Left column - Settings
             with gr.Column(scale=1):
-                gr.Markdown("### Model Settings")
+                gr.Markdown("### Model Selection")
 
-                model_dropdown = gr.Dropdown(
-                    choices=available_models,
-                    value=available_models[0] if available_models else None,
-                    label="Select Model",
-                    interactive=True,
+                with gr.Row():
+                    model_dropdown = gr.Dropdown(
+                        label="Select Model",
+                        choices=initial_models,
+                        value=initial_models[0] if initial_models else None,
+                        interactive=True,
+                        scale=4,
+                    )
+                    refresh_models_btn = gr.Button("🔄", scale=1, min_width=40)
+
+                gr.Markdown("### GPU Settings")
+                n_gpu_layers = gr.Slider(
+                    minimum=-1,
+                    maximum=100,
+                    value=-1,
+                    step=1,
+                    label="GPU Layers (-1 = all)",
+                    info="Number of layers to offload to GPU",
                 )
-
-                refresh_models_btn = gr.Button("Refresh Model List", size="sm")
-
-                # Backend selection (vLLM or transformers)
-                backend_choices = ["auto", "vllm", "transformers"] if _VLLM_CAN_IMPORT else ["transformers"]
-                backend_dropdown = gr.Dropdown(
-                    choices=backend_choices,
-                    value="auto" if _VLLM_CAN_IMPORT else "transformers",
-                    label="Backend",
-                    info="vLLM: faster inference, transformers: more compatible",
-                    interactive=True,
-                )
-                backend_status = gr.Textbox(
-                    label="Backend Status",
-                    value=f"Current: {vlm_manager.backend if vlm_manager else 'not initialized'}",
-                    interactive=False,
-                )
-
-                quantization_dropdown = gr.Dropdown(
-                    choices=["none", "4bit", "8bit"],
-                    value="none",
-                    label="Quantization",
-                    info="4-bit: ~4GB VRAM, 8-bit: ~8GB VRAM, none: ~16GB for 8B model",
-                    interactive=True,
-                )
-
-                use_flash_attn = gr.Checkbox(
-                    label="Use Flash Attention 2",
-                    value=False,
-                    info="Faster attention, requires flash-attn package",
+                n_ctx = gr.Slider(
+                    minimum=512,
+                    maximum=32768,
+                    value=4096,
+                    step=512,
+                    label="Context Length",
                 )
 
                 with gr.Row():
-                    load_btn = gr.Button("Load Model", variant="primary")
-                    unload_btn = gr.Button("Unload Model", variant="secondary")
+                    load_model_btn = gr.Button("Load Model", variant="primary")
+                    unload_model_btn = gr.Button("Unload", variant="secondary")
 
-                model_status = gr.Textbox(
-                    label="Model Status",
+                status_display = gr.Textbox(
+                    label="Status",
                     value="No model loaded",
-                    interactive=False,
-                )
-
-                refresh_btn = gr.Button("Refresh Memory Info")
-                memory_info = gr.Textbox(
-                    label="Memory Info",
-                    value=vlm_manager.get_memory_info() if vlm_manager else "N/A",
                     interactive=False,
                 )
 
@@ -1113,27 +719,6 @@ def create_ui():
                     step=0.1,
                     label="Temperature",
                 )
-                top_p = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    value=0.9,
-                    step=0.05,
-                    label="Top P",
-                )
-                top_k = gr.Slider(
-                    minimum=1,
-                    maximum=100,
-                    value=50,
-                    step=1,
-                    label="Top K",
-                )
-                repetition_penalty = gr.Slider(
-                    minimum=1.0,
-                    maximum=2.0,
-                    value=1.1,
-                    step=0.05,
-                    label="Repetition Penalty",
-                )
 
                 gr.Markdown("### Video Settings")
                 video_max_frames = gr.Slider(
@@ -1145,30 +730,7 @@ def create_ui():
                     info="Number of frames to extract from videos",
                 )
 
-                gr.Markdown("### Memory Settings")
-                vram_buffer = gr.Slider(
-                    minimum=0,
-                    maximum=32,
-                    value=0,
-                    step=1,
-                    label="VRAM Buffer (GB)",
-                    info="Reserve GPU memory during loading. Useful for large models with 8-bit quantization.",
-                )
-                cpu_offload = gr.Slider(
-                    minimum=0,
-                    maximum=64,
-                    value=0,
-                    step=4,
-                    label="CPU Offload (GB) [Requires vLLM 0.9.x]",
-                    info="Not supported in vLLM 0.11.0+. Downgrade with: pip install vllm==0.9.0",
-                )
-                auto_unload = gr.Checkbox(
-                    label="Auto-unload after generation",
-                    value=False,
-                    info="Unload model after each response (saves VRAM but slower)",
-                )
-
-            # Right column - Tabs
+            # Right column - Chat/Batch tabs
             with gr.Column(scale=2):
                 with gr.Tabs():
                     # Chat Tab
@@ -1176,6 +738,7 @@ def create_ui():
                         chatbot = gr.Chatbot(
                             label="Conversation",
                             height=400,
+                            type="messages",
                         )
 
                         with gr.Row():
@@ -1235,70 +798,48 @@ def create_ui():
                         )
 
         # Event handlers
-        def refresh_models():
-            """Refresh the list of available models."""
-            if vlm_manager is None:
-                return gr.update(choices=["Manager not initialized"])
-            models = vlm_manager.get_available_models()
-            return gr.update(choices=models, value=models[0] if models else None)
-
         refresh_models_btn.click(
-            fn=refresh_models,
+            fn=refresh_models_handler,
             outputs=[model_dropdown],
         )
 
-        load_btn.click(
+        load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, quantization_dropdown, use_flash_attn, vram_buffer, cpu_offload],
-            outputs=[model_status],
+            inputs=[model_dropdown, n_gpu_layers, n_ctx],
+            outputs=[status_display],
         )
 
-        # Backend switching handler
-        backend_dropdown.change(
-            fn=switch_backend_handler,
-            inputs=[backend_dropdown],
-            outputs=[backend_status],
-        )
-
-        unload_btn.click(
+        unload_model_btn.click(
             fn=unload_model_handler,
-            outputs=[model_status],
+            outputs=[status_display],
         )
 
-        refresh_btn.click(
-            fn=get_memory_handler,
-            outputs=[memory_info],
-        )
-
-        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, tp, tk, rep, vid_frames, auto_unl):
+        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, vid_frames):
             if not msg.strip() and img is None and vid is None:
-                return history, "", None, None, gr.update()
+                return history, "", None, None
 
-            new_history, status = chat_handler(
+            new_history, _ = chat_handler(
                 msg, history, sys_prompt, img, vid,
-                max_tok, temp, tp, tk, rep, vid_frames, auto_unl
+                max_tok, temp, vid_frames
             )
-            # Update status only if auto-unload happened
-            if status:
-                return new_history, "", None, None, status
-            return new_history, "", None, None, gr.update()
+            return new_history, "", None, None
 
         send_btn.click(
             fn=send_message,
             inputs=[
                 msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames, auto_unload
+                max_tokens, temperature, video_max_frames
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, model_status],
+            outputs=[chatbot, msg_input, image_input, video_input],
         )
 
         msg_input.submit(
             fn=send_message,
             inputs=[
                 msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames, auto_unload
+                max_tokens, temperature, video_max_frames
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, model_status],
+            outputs=[chatbot, msg_input, image_input, video_input],
         )
 
         clear_btn.click(
@@ -1310,7 +851,7 @@ def create_ui():
             fn=batch_caption_handler,
             inputs=[
                 batch_folder, batch_prompt, batch_system_prompt,
-                max_tokens, temperature, top_p, top_k, repetition_penalty
+                max_tokens, temperature
             ],
             outputs=[batch_output],
         )
@@ -1319,7 +860,13 @@ def create_ui():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chromaforge VLM Chat Interface")
+    parser = argparse.ArgumentParser(description="Chromaforge VLM Chat Interface (llama.cpp Backend)")
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models/LLM",
+        help="Directory containing GGUF models (default: models/LLM)",
+    )
     parser.add_argument(
         "--share",
         action="store_true",
@@ -1342,23 +889,6 @@ def main():
         action="store_true",
         help="Listen on 0.0.0.0 to enable LAN access",
     )
-    parser.add_argument(
-        "--lowvram",
-        action="store_true",
-        help="Enable low VRAM mode for smaller GPUs",
-    )
-    parser.add_argument(
-        "--cpu-offload",
-        action="store_true",
-        help="[DEPRECATED] CPU offload removed in vLLM 0.11.0. Use vllm==0.9.0 or quantization instead.",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["auto", "vllm", "transformers"],
-        default="auto",
-        help="Backend for model inference (default: auto - uses vLLM if available)",
-    )
 
     args = parser.parse_args()
 
@@ -1366,17 +896,37 @@ def main():
     host = "0.0.0.0" if args.listen else args.host
 
     print("=" * 60)
-    print("Chromaforge VLM Chat Interface")
+    print("Chromaforge VLM Chat Interface (llama.cpp Backend)")
     print("=" * 60)
-    print(f"Low VRAM mode: {'enabled' if args.lowvram else 'disabled'}")
-    print(f"Backend: {args.backend}" + (" (vLLM available)" if _VLLM_CAN_IMPORT else " (vLLM not available)"))
+    print(f"llama-cpp-python: {'available' if LLAMA_CPP_AVAILABLE else 'NOT INSTALLED'}")
+    print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")
     if args.listen:
         print("LAN access: enabled (listening on 0.0.0.0)")
     print("=" * 60)
 
+    if not LLAMA_CPP_AVAILABLE:
+        print("\nERROR: llama-cpp-python not installed!")
+        print("\nInstall with CUDA support:")
+        print("  Linux: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
+        print("  Windows: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121")
+        return
+
     # Initialize the manager
-    initialize_manager(low_vram=args.lowvram, backend=args.backend)
+    initialize_manager(args.models_dir)
+
+    # List found models
+    models = vlm_manager.get_available_models()
+    if models:
+        print(f"\nFound {len(models)} GGUF model(s):")
+        for m in models:
+            vision = " [+vision]" if m.get("mmproj_path") else ""
+            print(f"  - {m['name']}{vision}")
+    else:
+        print(f"\nNo GGUF models found in {args.models_dir}")
+        print("Download GGUF vision models and place them in this directory.")
+
+    print("=" * 60)
 
     # Create and launch the UI
     demo = create_ui()

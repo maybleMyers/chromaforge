@@ -26,6 +26,14 @@ from gradio import themes
 from gradio.themes.utils import colors
 from PIL import Image
 
+# Try to import psutil for memory detection
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not installed. CPU offload memory detection will use defaults.")
+
 # Try to import video processing utilities
 try:
     import cv2
@@ -256,6 +264,8 @@ class Qwen3VLMBackend:
         dtype: str = "bfloat16",
         num_gpus: int = 2,
         max_memory_per_gpu: Optional[int] = None,
+        cpu_offload: bool = False,
+        cpu_offload_ram: Optional[int] = None,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -266,6 +276,8 @@ class Qwen3VLMBackend:
             dtype: Data type (bfloat16, float16, float32)
             num_gpus: Number of GPUs to use
             max_memory_per_gpu: Max memory per GPU in GB (None = auto)
+            cpu_offload: Enable CPU offloading for large models
+            cpu_offload_ram: Max CPU RAM to use for offloading in GB
             progress: Gradio progress callback
 
         Returns:
@@ -299,23 +311,40 @@ class Qwen3VLMBackend:
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
-            # Create device map for multi-GPU
+            # Create device map for multi-GPU or CPU offloading
             actual_gpus = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 0
+            max_memory = None
 
-            if actual_gpus > 1:
+            # Use device_map="auto" when:
+            # 1. Multiple GPUs, OR
+            # 2. CPU offloading enabled, OR
+            # 3. max_memory_per_gpu is set (to respect the limit)
+            use_auto_device_map = (actual_gpus > 1) or cpu_offload or (max_memory_per_gpu is not None and max_memory_per_gpu > 0)
+
+            if use_auto_device_map and self.num_gpus > 0:
                 device_map = "auto"
 
-                # Configure max memory per GPU if specified
-                if max_memory_per_gpu is not None:
+                # Configure max memory constraints
+                if max_memory_per_gpu is not None and max_memory_per_gpu > 0:
                     max_memory = {i: f"{max_memory_per_gpu}GiB" for i in range(actual_gpus)}
-                    max_memory["cpu"] = "32GiB"  # Allow CPU offload as fallback
                 else:
+                    max_memory = {}
+
+                # Add CPU memory allowance for offloading
+                if cpu_offload and cpu_offload_ram and cpu_offload_ram > 0:
+                    max_memory["cpu"] = f"{cpu_offload_ram}GiB"
+                    print(f"CPU offloading enabled: allowing up to {max_memory['cpu']} CPU RAM")
+                elif max_memory:
+                    # Even without explicit offload, allow some CPU as fallback
+                    max_memory["cpu"] = "16GiB"
+
+                if not max_memory:
                     max_memory = None
 
-                print(f"Using device_map='auto' for {actual_gpus} GPUs")
+                offload_str = " (CPU offload enabled)" if cpu_offload else ""
+                print(f"Using device_map='auto' for {actual_gpus} GPU(s){offload_str}")
             else:
                 device_map = {"": 0} if self.num_gpus > 0 else "cpu"
-                max_memory = None
                 print(f"Using single device: {device_map}")
 
             progress(0.2, desc="Loading processor/tokenizer...")
@@ -799,20 +828,25 @@ def load_model_handler(
     dtype: str,
     num_gpus: int,
     max_memory_per_gpu: Optional[int],
+    cpu_offload: bool = False,
+    cpu_offload_ram: Optional[int] = None,
     progress=gr.Progress()
 ):
     """Handle model loading."""
     if vlm_backend is None:
         return "Backend not initialized"
 
-    # Convert "Auto" to None
+    # Convert 0 to None for auto
     max_mem = None if max_memory_per_gpu == 0 else max_memory_per_gpu
+    cpu_ram = None if cpu_offload_ram == 0 else cpu_offload_ram
 
     return vlm_backend.load_model(
         model_name=model_name,
         dtype=dtype,
         num_gpus=num_gpus,
         max_memory_per_gpu=max_mem,
+        cpu_offload=cpu_offload,
+        cpu_offload_ram=cpu_ram,
         progress=progress,
     )
 
@@ -1166,6 +1200,21 @@ def create_ui():
                         info="0 = Auto",
                     )
 
+                with gr.Column(scale=1):
+                    cpu_offload_checkbox = gr.Checkbox(
+                        label="CPU Offload",
+                        value=False,
+                        info="Offload layers to CPU RAM",
+                    )
+                    cpu_ram_slider = gr.Slider(
+                        minimum=0,
+                        maximum=256,
+                        value=64,
+                        step=8,
+                        label="CPU RAM (GB)",
+                        info="Max RAM for offloading",
+                    )
+
             with gr.Row():
                 load_model_btn = gr.Button("Load Model", variant="primary")
                 unload_model_btn = gr.Button("Unload", variant="secondary")
@@ -1231,7 +1280,7 @@ def create_ui():
 
         load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider],
+            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider],
             outputs=[model_status],
         )
 

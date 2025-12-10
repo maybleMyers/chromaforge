@@ -796,8 +796,8 @@ def create_ui():
                 )
                 n_ctx = gr.Slider(
                     minimum=512,
-                    maximum=32768,
-                    value=4096,
+                    maximum=200000,
+                    value=32768,
                     step=512,
                     label="Context Length",
                 )
@@ -839,7 +839,7 @@ def create_ui():
                 gr.Markdown("### Video Settings")
                 video_max_frames = gr.Slider(
                     minimum=1,
-                    maximum=32,
+                    maximum=201,
                     value=8,
                     step=1,
                     label="Max Video Frames",

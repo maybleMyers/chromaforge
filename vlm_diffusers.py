@@ -323,12 +323,22 @@ class Qwen3VLMBackend:
 
             if use_auto_device_map and self.num_gpus > 0:
                 device_map = "auto"
+                max_memory = {}
 
-                # Configure max memory constraints
+                # Configure GPU memory constraints
                 if max_memory_per_gpu is not None and max_memory_per_gpu > 0:
-                    max_memory = {i: f"{max_memory_per_gpu}GiB" for i in range(actual_gpus)}
-                else:
-                    max_memory = {}
+                    # User specified a limit
+                    for i in range(actual_gpus):
+                        max_memory[i] = f"{max_memory_per_gpu}GiB"
+                elif cpu_offload:
+                    # CPU offload enabled but no GPU limit set - auto-detect and use most of available VRAM
+                    for i in range(actual_gpus):
+                        if torch.cuda.is_available():
+                            free_mem, total_mem = torch.cuda.mem_get_info(i)
+                            # Use 90% of free VRAM to leave headroom
+                            gpu_mem_gb = int((free_mem / (1024**3)) * 0.9)
+                            max_memory[i] = f"{gpu_mem_gb}GiB"
+                            print(f"GPU {i}: auto-detected {gpu_mem_gb}GB available for model")
 
                 # Add CPU memory allowance for offloading
                 if cpu_offload and cpu_offload_ram and cpu_offload_ram > 0:

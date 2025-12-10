@@ -69,6 +69,11 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
             if original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 continue
 
+            # Skip meta tensors (shouldn't happen after CPU load, but be safe)
+            if weight.device.type == 'meta':
+                skipped_count += 1
+                continue
+
             # Skip patterns that shouldn't be converted
             if any(pattern in name.lower() for pattern in skip_patterns):
                 skipped_count += 1
@@ -76,8 +81,10 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
 
             # Check if layer can be safely converted to FP8
             # FP8 E4M3 has range ~[-448, 448] with limited precision
-            abs_max = weight.abs().max().float()
-            abs_min = weight[weight != 0].abs().min().float() if (weight != 0).any() else torch.tensor(0.0)
+            weight_float = weight.float()
+            abs_max = weight_float.abs().max()
+            non_zero = weight_float[weight_float != 0]
+            abs_min = non_zero.abs().min() if non_zero.numel() > 0 else torch.tensor(1.0)
 
             # Skip if dynamic range is too large (would lose small values)
             if abs_max > 0 and abs_min > 0:
@@ -501,17 +508,22 @@ class Qwen3VLMBackend:
             # Load the model
             model_kwargs = {
                 "pretrained_model_name_or_path": model_path,
-                "device_map": device_map,
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,
             }
 
+            # For FP8: load to CPU first, convert, then dispatch to GPU
+            if use_fp8:
+                model_kwargs["device_map"] = "cpu"
+                print("[FP8] Loading model to CPU for FP8 conversion...")
+            else:
+                model_kwargs["device_map"] = device_map
+                if max_memory is not None:
+                    model_kwargs["max_memory"] = max_memory
+
             # Only set dtype if not using FP8 (FP8 loads native dtype first)
             if torch_dtype is not None:
                 model_kwargs["dtype"] = torch_dtype
-
-            if max_memory is not None:
-                model_kwargs["max_memory"] = max_memory
 
             # Use appropriate model class based on type
             if model_type == "qwen-vl":
@@ -556,9 +568,35 @@ class Qwen3VLMBackend:
 
             # Apply FP8 conversion if requested
             if use_fp8:
-                progress(0.9, desc="Converting to FP8 scaled...")
+                progress(0.7, desc="Converting to FP8 scaled...")
                 print("[FP8] Converting model to FP8 scaled format...")
                 self.model = convert_model_to_fp8_scaled(self.model)
+
+                # Now dispatch to GPU with accelerate
+                progress(0.9, desc="Moving FP8 model to GPU...")
+                print("[FP8] Dispatching model to GPU...")
+                from accelerate import dispatch_model, infer_auto_device_map
+                from accelerate.utils import get_balanced_memory
+
+                # Calculate device map for the FP8 model
+                if max_memory is not None:
+                    fp8_max_memory = max_memory
+                else:
+                    fp8_max_memory = get_balanced_memory(
+                        self.model,
+                        max_memory={i: f"{int(torch.cuda.mem_get_info(i)[0] / (1024**3) * 0.9)}GiB" for i in range(actual_gpus)},
+                        no_split_module_classes=getattr(self.model, "_no_split_modules", None),
+                    )
+
+                fp8_device_map = infer_auto_device_map(
+                    self.model,
+                    max_memory=fp8_max_memory,
+                    no_split_module_classes=getattr(self.model, "_no_split_modules", None),
+                )
+
+                self.model = dispatch_model(self.model, device_map=fp8_device_map)
+                self.device_map = fp8_device_map
+                print(f"[FP8] Model dispatched to devices: {set(fp8_device_map.values())}")
 
             progress(1.0, desc="Model loaded!")
 

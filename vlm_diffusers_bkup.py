@@ -48,17 +48,8 @@ try:
     )
     TRANSFORMERS_AVAILABLE = True
     print(f"Transformers version: {transformers.__version__}")
-
-    # Try to import Qwen3 VL MoE class (requires newer transformers)
-    try:
-        from transformers import Qwen3VLMoeForConditionalGeneration
-        QWEN3_VL_AVAILABLE = True
-    except ImportError:
-        QWEN3_VL_AVAILABLE = False
-        print("Note: Qwen3VLMoeForConditionalGeneration not available, will use fallback classes")
 except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
-    QWEN3_VL_AVAILABLE = False
     print(f"Error: transformers not installed or incompatible version: {e}")
 
 try:
@@ -341,10 +332,9 @@ class Qwen3VLMBackend:
             # Load the model
             model_kwargs = {
                 "pretrained_model_name_or_path": model_path,
-                "dtype": torch_dtype,
+                "torch_dtype": torch_dtype,
                 "device_map": device_map,
                 "trust_remote_code": True,
-                "low_cpu_mem_usage": True,
             }
 
             if max_memory is not None:
@@ -352,36 +342,17 @@ class Qwen3VLMBackend:
 
             # Use appropriate model class based on type
             if model_type == "qwen-vl":
-                # Try Qwen3-VL MoE first (for newer models), then Qwen2.5-VL, then Qwen2-VL
-                loaded = False
-
-                if QWEN3_VL_AVAILABLE:
-                    try:
-                        self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(**model_kwargs)
-                        print("Loaded as Qwen3-VL MoE model")
-                        loaded = True
-                    except Exception as e:
-                        print(f"Qwen3-VL MoE load failed: {e}, trying fallback...")
-
-                if not loaded:
-                    try:
-                        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(**model_kwargs)
-                        print("Loaded as Qwen2.5-VL model")
-                        loaded = True
-                    except Exception:
-                        pass
-
-                if not loaded:
+                # Try Qwen2.5-VL first, then Qwen2-VL
+                try:
+                    self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(**model_kwargs)
+                    print("Loaded as Qwen2.5-VL model")
+                except Exception:
                     try:
                         self.model = Qwen2VLForConditionalGeneration.from_pretrained(**model_kwargs)
                         print("Loaded as Qwen2-VL model")
-                        loaded = True
                     except Exception:
-                        pass
-
-                if not loaded:
-                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
-                    print("Loaded as generic Vision2Seq model")
+                        self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                        print("Loaded as generic Vision2Seq model")
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
                 print("Loaded as CausalLM model")
@@ -474,7 +445,7 @@ class Qwen3VLMBackend:
         top_p: float = 0.9,
         top_k: int = 50,
         video_max_frames: int = 8,
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> str:
         """
         Generate a response from the VLM.
 
@@ -489,12 +460,10 @@ class Qwen3VLMBackend:
             video_max_frames: Max frames for video processing
 
         Returns:
-            Tuple of (response string, stats dict)
+            Generated response string
         """
-        empty_stats = {"tokens": 0, "time": 0.0, "tokens_per_sec": 0.0}
-
         if self.model is None:
-            return "Error: No model loaded. Please load a model first.", empty_stats
+            return "Error: No model loaded. Please load a model first."
 
         try:
             # Handle vision-language model
@@ -509,12 +478,12 @@ class Qwen3VLMBackend:
                     messages, max_new_tokens, temperature, top_p, top_k
                 )
             else:
-                return "Error: No processor or tokenizer available", empty_stats
+                return "Error: No processor or tokenizer available"
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return f"Error during generation: {str(e)}", empty_stats
+            return f"Error during generation: {str(e)}"
 
     def _generate_vl(
         self,
@@ -526,7 +495,7 @@ class Qwen3VLMBackend:
         top_p: float,
         top_k: int,
         video_max_frames: int,
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> str:
         """Generate response from vision-language model."""
         start_time = time.perf_counter()
 
@@ -678,18 +647,9 @@ class Qwen3VLMBackend:
         )[0]
 
         end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        num_tokens = len(generated_ids_trimmed[0])
-        tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
+        print(f"Generated response in {end_time - start_time:.2f}s")
 
-        stats = {
-            "tokens": num_tokens,
-            "time": elapsed_time,
-            "tokens_per_sec": tokens_per_sec,
-        }
-        print(f"Generated {num_tokens} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
-
-        return output_text, stats
+        return output_text
 
     def _generate_text(
         self,
@@ -698,7 +658,7 @@ class Qwen3VLMBackend:
         temperature: float,
         top_p: float,
         top_k: int,
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> str:
         """Generate response from text-only model."""
         start_time = time.perf_counter()
 
@@ -755,18 +715,9 @@ class Qwen3VLMBackend:
         )
 
         end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        num_tokens = len(generated_ids_trimmed)
-        tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
+        print(f"Generated response in {end_time - start_time:.2f}s")
 
-        stats = {
-            "tokens": num_tokens,
-            "time": elapsed_time,
-            "tokens_per_sec": tokens_per_sec,
-        }
-        print(f"Generated {num_tokens} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
-
-        return output_text, stats
+        return output_text
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path."""
@@ -844,13 +795,11 @@ def chat_handler(
     video_max_frames: int,
 ):
     """Handle chat messages from UI."""
-    empty_stats = "Tokens: 0 | Time: 0.00s | Speed: 0.00 tok/s"
-
     if vlm_backend is None or vlm_backend.model is None:
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded."})
-        return error_history, "", empty_stats
+        return error_history, ""
 
     # Build messages list
     messages = []
@@ -892,7 +841,7 @@ def chat_handler(
     messages.append({"role": "user", "content": model_content})
 
     # Generate response
-    response, stats = vlm_backend.generate(
+    response = vlm_backend.generate(
         messages=messages,
         max_new_tokens=max_tokens,
         temperature=temperature,
@@ -900,9 +849,6 @@ def chat_handler(
         top_k=top_k,
         video_max_frames=video_max_frames,
     )
-
-    # Format stats string
-    stats_str = f"Tokens: {stats['tokens']} | Time: {stats['time']:.2f}s | Speed: {stats['tokens_per_sec']:.2f} tok/s"
 
     # Build display content
     new_history = list(history)
@@ -924,7 +870,7 @@ def chat_handler(
         new_history.append({"role": "user", "content": message})
         new_history.append({"role": "assistant", "content": response})
 
-    return new_history, "", stats_str
+    return new_history, ""
 
 
 def clear_chat_handler():
@@ -978,7 +924,7 @@ def batch_caption_handler(
             ]
             messages.append({"role": "user", "content": content})
 
-            caption, stats = vlm_backend.generate(
+            caption = vlm_backend.generate(
                 messages=messages,
                 images=[img],
                 max_new_tokens=max_tokens,
@@ -990,7 +936,7 @@ def batch_caption_handler(
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(caption)
 
-            results.append(f"[OK] {filename} -> {base_name}.txt ({stats['tokens']} tokens, {stats['tokens_per_sec']:.1f} tok/s)")
+            results.append(f"[OK] {filename} -> {base_name}.txt")
 
         except Exception as e:
             results.append(f"[ERROR] {filename}: {str(e)}")
@@ -1028,13 +974,12 @@ def create_ui():
     .green-btn:hover {
         background: linear-gradient(to bottom right, #27ae60, #219651) !important;
     }
-    .stats-display {
+    .gpu-info {
         font-family: monospace;
-        font-size: 14px;
-        padding: 8px 12px;
         background: #1a1a2e;
+        padding: 10px;
         border-radius: 5px;
-        color: #4ade80;
+        color: #eee;
     }
     """
 
@@ -1044,149 +989,69 @@ def create_ui():
 
     with gr.Blocks(title="Chromaforge VLM (Diffusers)", theme=vlm_theme, css=vlm_css) as demo:
         gr.Markdown("# Chromaforge VLM Chat (Diffusers/Transformers Backend)")
+        gr.Markdown("Load unquantized Qwen3-VL models across multiple GPUs. Full precision, maximum quality.")
 
-        with gr.Tabs():
-            # Chat Tab
-            with gr.TabItem("Chat"):
-                # Chat interface at top - full width
-                chatbot = gr.Chatbot(
-                    label="Conversation",
-                    height=500,
-                    type="messages",
-                )
+        with gr.Row():
+            # Left column - Settings
+            with gr.Column(scale=1):
+                gr.Markdown("### Model Selection")
 
-                # Media inputs row - max 300px
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        image_input = gr.Image(
-                            label="Upload Image (optional)",
-                            type="pil",
-                            height=300,
-                        )
-                    with gr.Column(scale=1):
-                        video_input = gr.Video(
-                            label="Upload Video (optional)",
-                            height=300,
-                        )
+                    model_dropdown = gr.Dropdown(
+                        label="Select Model",
+                        choices=initial_models,
+                        value=initial_models[0] if initial_models else None,
+                        interactive=True,
+                        scale=4,
+                    )
+                    refresh_models_btn = gr.Button("🔄", scale=1, min_width=40)
 
-                # Message input row
+                gr.Markdown("### GPU Settings")
+
+                dtype_dropdown = gr.Dropdown(
+                    label="Precision",
+                    choices=["bfloat16", "float16", "float32"],
+                    value="bfloat16",
+                    info="bfloat16 recommended for Qwen models",
+                )
+
+                num_gpus_slider = gr.Slider(
+                    minimum=1,
+                    maximum=max(8, num_gpus),
+                    value=min(2, num_gpus) if num_gpus > 0 else 1,
+                    step=1,
+                    label="Number of GPUs",
+                    info=f"Detected {num_gpus} GPU(s)",
+                )
+
+                max_memory_slider = gr.Slider(
+                    minimum=0,
+                    maximum=48,
+                    value=0,
+                    step=1,
+                    label="Max Memory per GPU (GB, 0=Auto)",
+                    info="Limit VRAM usage per GPU",
+                )
+
                 with gr.Row():
-                    msg_input = gr.Textbox(
-                        label="Message",
-                        placeholder="Type your message here...",
-                        lines=2,
-                        scale=5,
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1)
+                    load_model_btn = gr.Button("Load Model", variant="primary")
+                    unload_model_btn = gr.Button("Unload", variant="secondary")
 
-                # Clear and stats row
-                with gr.Row():
-                    clear_btn = gr.Button("Clear Chat", scale=1)
-                    stats_display = gr.Textbox(
-                        label="Generation Stats",
-                        value="Tokens: 0 | Time: 0.00s | Speed: 0.00 tok/s",
-                        interactive=False,
-                        scale=3,
-                        elem_classes=["stats-display"],
-                    )
-
-            # Batch Caption Tab
-            with gr.TabItem("Batch Caption"):
-                gr.Markdown("Generate captions for all images in a folder.")
-
-                batch_folder = gr.Textbox(
-                    label="Folder Path",
-                    placeholder="Enter path to folder...",
-                    lines=1,
-                )
-
-                batch_system_prompt = gr.Textbox(
-                    label="System Prompt",
-                    lines=3,
-                    value="You are an image captioning assistant. Provide detailed, accurate descriptions.",
-                )
-
-                batch_prompt = gr.Textbox(
-                    label="Caption Prompt",
-                    lines=2,
-                    value="Describe this image in detail.",
-                )
-
-                batch_start_btn = gr.Button(
-                    "Start Batch Captioning",
-                    variant="primary",
-                    elem_classes=["green-btn"],
-                )
-
-                batch_output = gr.Textbox(
-                    label="Output",
-                    lines=15,
-                    interactive=False,
-                )
-
-        # Settings section below chat - in accordions
-        with gr.Accordion("Model Settings", open=True):
-            with gr.Row():
-                with gr.Column(scale=2):
-                    with gr.Row():
-                        model_dropdown = gr.Dropdown(
-                            label="Select Model",
-                            choices=initial_models,
-                            value=initial_models[0] if initial_models else None,
-                            interactive=True,
-                            scale=4,
-                        )
-                        refresh_models_btn = gr.Button("Refresh", scale=1, min_width=80)
-
-                with gr.Column(scale=1):
-                    dtype_dropdown = gr.Dropdown(
-                        label="Precision",
-                        choices=["bfloat16", "float16", "float32"],
-                        value="bfloat16",
-                        info="bfloat16 recommended for Qwen models",
-                    )
-
-                with gr.Column(scale=1):
-                    num_gpus_slider = gr.Slider(
-                        minimum=1,
-                        maximum=max(8, num_gpus),
-                        value=min(2, num_gpus) if num_gpus > 0 else 1,
-                        step=1,
-                        label="Number of GPUs",
-                        info=f"Detected {num_gpus} GPU(s)",
-                    )
-
-                with gr.Column(scale=1):
-                    max_memory_slider = gr.Slider(
-                        minimum=0,
-                        maximum=48,
-                        value=0,
-                        step=1,
-                        label="Max Memory/GPU (GB)",
-                        info="0 = Auto",
-                    )
-
-            with gr.Row():
-                load_model_btn = gr.Button("Load Model", variant="primary")
-                unload_model_btn = gr.Button("Unload", variant="secondary")
-                model_status = gr.Textbox(
+                status_display = gr.Textbox(
                     label="Status",
                     value="No model loaded",
                     interactive=False,
-                    scale=3,
                 )
 
-        with gr.Accordion("Generation Settings", open=False):
-            with gr.Row():
+                gr.Markdown("### System Prompt")
                 system_prompt = gr.Textbox(
                     label="System Prompt",
                     placeholder="Enter a system prompt...",
-                    lines=2,
+                    lines=4,
                     value="You are a helpful AI assistant that can understand and describe images and videos in detail.",
-                    scale=3,
                 )
 
-            with gr.Row():
+                gr.Markdown("### Generation Settings")
                 max_tokens = gr.Slider(
                     minimum=64,
                     maximum=4096,
@@ -1215,13 +1080,85 @@ def create_ui():
                     step=1,
                     label="Top-K",
                 )
+
+                gr.Markdown("### Video Settings")
                 video_max_frames = gr.Slider(
                     minimum=1,
                     maximum=64,
                     value=16,
                     step=1,
                     label="Max Video Frames",
+                    info="Number of frames to extract",
                 )
+
+            # Right column - Chat/Batch tabs
+            with gr.Column(scale=2):
+                with gr.Tabs():
+                    # Chat Tab
+                    with gr.TabItem("Chat"):
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=400,
+                            type="messages",
+                        )
+
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                image_input = gr.Image(
+                                    label="Upload Image (optional)",
+                                    type="pil",
+                                    height=150,
+                                )
+                            with gr.Column(scale=1):
+                                video_input = gr.Video(
+                                    label="Upload Video (optional)",
+                                    height=150,
+                                )
+
+                        with gr.Row():
+                            msg_input = gr.Textbox(
+                                label="Message",
+                                placeholder="Type your message here...",
+                                lines=2,
+                                scale=4,
+                            )
+                            send_btn = gr.Button("Send", variant="primary", scale=1)
+
+                        clear_btn = gr.Button("Clear Chat")
+
+                    # Batch Caption Tab
+                    with gr.TabItem("Batch Caption"):
+                        gr.Markdown("Generate captions for all images in a folder.")
+
+                        batch_folder = gr.Textbox(
+                            label="Folder Path",
+                            placeholder="Enter path to folder...",
+                            lines=1,
+                        )
+
+                        batch_system_prompt = gr.Textbox(
+                            label="System Prompt",
+                            lines=3,
+                            value="You are an image captioning assistant. Provide detailed, accurate descriptions.",
+                        )
+
+                        batch_prompt = gr.Textbox(
+                            label="Caption Prompt",
+                            lines=2,
+                            value="Describe this image in detail.",
+                        )
+
+                        batch_start_btn = gr.Button(
+                            "Start Batch Captioning",
+                            variant="primary",
+                            elem_classes=["green-btn"],
+                        )
+
+                        batch_output = gr.Textbox(
+                            label="Output",
+                            lines=15,
+                            interactive=False,
+                        )
 
         # Event handlers
         refresh_models_btn.click(
@@ -1232,23 +1169,23 @@ def create_ui():
         load_model_btn.click(
             fn=load_model_handler,
             inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider],
-            outputs=[model_status],
+            outputs=[status_display],
         )
 
         unload_model_btn.click(
             fn=unload_model_handler,
-            outputs=[model_status],
+            outputs=[status_display],
         )
 
         def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, tp, tk, vid_frames):
             if not msg.strip() and img is None and vid is None:
-                return history, "", None, None, "Tokens: 0 | Time: 0.00s | Speed: 0.00 tok/s"
+                return history, "", None, None
 
-            new_history, _, stats_str = chat_handler(
+            new_history, _ = chat_handler(
                 msg, history, sys_prompt, img, vid,
                 max_tok, temp, tp, tk, vid_frames
             )
-            return new_history, "", None, None, stats_str
+            return new_history, "", None, None
 
         send_btn.click(
             fn=send_message,
@@ -1256,7 +1193,7 @@ def create_ui():
                 msg_input, chatbot, system_prompt, image_input, video_input,
                 max_tokens, temperature, top_p, top_k, video_max_frames
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input, video_input],
         )
 
         msg_input.submit(
@@ -1265,7 +1202,7 @@ def create_ui():
                 msg_input, chatbot, system_prompt, image_input, video_input,
                 max_tokens, temperature, top_p, top_k, video_max_frames
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input, video_input],
         )
 
         clear_btn.click(

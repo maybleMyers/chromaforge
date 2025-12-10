@@ -243,8 +243,12 @@ class LlamaCppVLM:
             model_path_lower = model_path.lower()
             is_qwen_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen", "qwen2-vl", "qwen3-vl", "qwen2.5-vl"])
             is_llava = any(x in model_name_lower or x in model_path_lower for x in ["llava", "llava-v1"])
+            
+            # More specific detection
+            is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
+            is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: Qwen-VL={is_qwen_vl}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
 
             # Set up chat handler for vision models
             self.chat_handler = None
@@ -254,7 +258,8 @@ class LlamaCppVLM:
 
                 # Select chat handler based on model type
                 # Check for Qwen3-VL first (uses Qwen3VLChatHandler)
-                is_qwen3_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen3-vl", "qwen3vl"])
+                is_qwen3_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen3-vl", "qwen3vl", "qwen3"])
+                is_qwen25_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5-vl", "qwen25vl", "qwen2-vl"])
 
                 if is_qwen3_vl and QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
                     print("[llama.cpp] Using Qwen3VLChatHandler (for Qwen3-VL)")
@@ -263,7 +268,7 @@ class LlamaCppVLM:
                     except Exception as e:
                         print(f"Warning: Qwen3VLChatHandler failed: {e}")
                         self.chat_handler = None
-                elif is_qwen_vl and QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
+                elif is_qwen25_vl and QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
                     print("[llama.cpp] Using Qwen25VLChatHandler (for Qwen2.5-VL)")
                     try:
                         self.chat_handler = Qwen25VLChatHandler(clip_model_path=mmproj_path, verbose=False)
@@ -281,13 +286,30 @@ class LlamaCppVLM:
                             print(f"Warning: LLaVA handler failed: {e}")
                             self.chat_handler = None
                 else:
-                    # Try handlers in order of likelihood
+                    # Try handlers in order of likelihood based on model name
                     print("[llama.cpp] Trying chat handlers in order...")
                     handlers_to_try = []
-                    if QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
+                    
+                    # If it looks like a Qwen3 model, try Qwen3VL first
+                    if is_qwen3_specific and QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
                         handlers_to_try.append(("Qwen3VL", Qwen3VLChatHandler))
-                    if QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None:
+                    
+                    # Then try other handlers
+                    if QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None and ("Qwen25VL", Qwen25VLChatHandler) not in handlers_to_try:
                         handlers_to_try.append(("Qwen25VL", Qwen25VLChatHandler))
+                    if QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None and ("Qwen3VL", Qwen3VLChatHandler) not in handlers_to_try:
+                        handlers_to_try.append(("Qwen3VL", Qwen3VLChatHandler))
+                    
+                    # Try Llama3VisionAlphaChatHandler for Qwen models
+                    try:
+                        from llama_cpp.llama_chat_format import Llama3VisionAlphaChatHandler
+                        if is_qwen_vl:
+                            handlers_to_try.insert(0, ("Llama3VisionAlpha", Llama3VisionAlphaChatHandler))
+                        else:
+                            handlers_to_try.append(("Llama3VisionAlpha", Llama3VisionAlphaChatHandler))
+                    except ImportError:
+                        pass
+                    
                     handlers_to_try.extend([
                         ("Llava16", Llava16ChatHandler),
                         ("Llava15", Llava15ChatHandler),
@@ -560,17 +582,23 @@ def chat_handler(
 
     # Add chat history
     for msg in history:
-        if isinstance(msg, dict) and "role" in msg and "content" in msg:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                messages.append({"role": msg["role"], "content": content})
-            elif isinstance(content, list):
-                # Handle mixed content - extract text parts
-                text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-                if text_parts:
-                    messages.append({"role": msg["role"], "content": " ".join(text_parts)})
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+            if role and content:
+                # Extract text content for the model
+                if isinstance(content, str):
+                    messages.append({"role": role, "content": content})
+                elif isinstance(content, list):
+                    # Extract text from multimodal content
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                    if text_parts:
+                        messages.append({"role": role, "content": " ".join(text_parts)})
 
-    # Build current message content
+    # Build current message content for model
     model_content = []
 
     if image is not None:
@@ -600,15 +628,26 @@ def chat_handler(
     if image is not None:
         # Save image to temp file for display
         temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"vlm_chat_{id(image)}.png")
+        temp_path = os.path.join(temp_dir, f"vlm_chat_{int(time.time())}_{id(image)}.png")
         image.save(temp_path)
-        display_text = message if message else "[Describe this image]"
-        new_history.append({"role": "user", "content": [{"type": "text", "text": display_text}, {"type": "image", "path": temp_path}]})
+
+        display_text = message if message else "Describe this image"
+
+        # Add user text message first
+        new_history.append({"role": "user", "content": display_text})
+        # Add the image as a separate user message using gr.Image component
+        new_history.append({"role": "user", "content": gr.Image(temp_path)})
         new_history.append({"role": "assistant", "content": response})
+
     elif video is not None:
-        display_text = message if message else "[Describe this video]"
-        new_history.append({"role": "user", "content": [{"type": "text", "text": display_text}, {"type": "video", "path": video}]})
+        display_text = message if message else "Describe this video"
+
+        # Add user text message first
+        new_history.append({"role": "user", "content": display_text})
+        # Add the video as a separate user message using gr.Video component
+        new_history.append({"role": "user", "content": gr.Video(video)})
         new_history.append({"role": "assistant", "content": response})
+        
     else:
         new_history.append({"role": "user", "content": message})
         new_history.append({"role": "assistant", "content": response})
@@ -744,7 +783,7 @@ def create_ui():
                         interactive=True,
                         scale=4,
                     )
-                    refresh_models_btn = gr.Button("🔄", scale=1, min_width=40)
+                    refresh_models_btn = gr.Button("", scale=1, min_width=40)
 
                 gr.Markdown("### GPU Settings")
                 n_gpu_layers = gr.Slider(

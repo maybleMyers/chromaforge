@@ -34,6 +34,123 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     print("Warning: psutil not installed. CPU offload memory detection will use defaults.")
 
+
+def convert_model_to_fp8_scaled(model, skip_patterns=None):
+    """
+    Convert model linear layers to FP8 with per-tensor scaling.
+    Saves ~50% memory. Works on any GPU (older GPUs compute in fp16/fp32).
+
+    Intelligently skips layers that would lose too much precision in FP8.
+
+    Args:
+        model: The model to convert
+        skip_patterns: List of layer name patterns to skip (e.g., ['lm_head', 'embed'])
+
+    Returns:
+        model with FP8 weights where safe
+    """
+    import torch.nn as nn
+
+    if skip_patterns is None:
+        # Default: skip embedding and output head layers - they're sensitive
+        skip_patterns = ['embed', 'lm_head', 'wte', 'wpe', 'norm']
+
+    converted_count = 0
+    skipped_count = 0
+    total_params_before = 0
+    total_params_after = 0
+
+    for name, child in model.named_modules():
+        if isinstance(child, nn.Linear) and not hasattr(child, 'fp8_converted'):
+            weight = child.weight.data
+            original_dtype = weight.dtype
+
+            # Skip if already FP8
+            if original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                continue
+
+            # Skip patterns that shouldn't be converted
+            if any(pattern in name.lower() for pattern in skip_patterns):
+                skipped_count += 1
+                continue
+
+            # Check if layer can be safely converted to FP8
+            # FP8 E4M3 has range ~[-448, 448] with limited precision
+            abs_max = weight.abs().max().float()
+            abs_min = weight[weight != 0].abs().min().float() if (weight != 0).any() else torch.tensor(0.0)
+
+            # Skip if dynamic range is too large (would lose small values)
+            if abs_max > 0 and abs_min > 0:
+                dynamic_range = abs_max / abs_min
+                if dynamic_range > 1e6:  # Very large dynamic range
+                    skipped_count += 1
+                    continue
+
+            # Calculate memory before
+            param_bytes_before = weight.numel() * weight.element_size()
+            total_params_before += param_bytes_before
+
+            # Compute scale factor (FP8 E4M3 max value is ~448)
+            if abs_max == 0:
+                abs_max = torch.tensor(1.0, device=weight.device, dtype=torch.float32)
+            scale = (abs_max / 448.0).float()
+
+            # Convert to FP8
+            fp8_weight = (weight.float() / scale).to(torch.float8_e4m3fn)
+
+            # Store FP8 weight and scale
+            child.weight = nn.Parameter(fp8_weight, requires_grad=False)
+            child.register_buffer('scale_weight', scale.view(1))
+            child.computation_dtype = original_dtype  # Use original dtype for computation
+
+            # Calculate memory after
+            total_params_after += fp8_weight.numel() * fp8_weight.element_size()
+            total_params_after += 4  # scale is float32
+
+            # Replace forward method
+            original_forward = child.forward
+            child.original_forward = original_forward
+            child.forward = lambda x, m=child: _fp8_linear_forward(m, x)
+            child.fp8_converted = True
+
+            converted_count += 1
+
+    if converted_count > 0 or skipped_count > 0:
+        mem_before_gb = total_params_before / (1024**3)
+        mem_after_gb = total_params_after / (1024**3)
+        reduction = (1 - mem_after_gb / mem_before_gb) * 100 if mem_before_gb > 0 else 0
+        print(f"[FP8] Converted {converted_count} linear layers to FP8 scaled, skipped {skipped_count}")
+        print(f"[FP8] Linear layer memory: {mem_before_gb:.2f}GB -> {mem_after_gb:.2f}GB ({reduction:.1f}% reduction)")
+
+    # Force garbage collection to free original weights
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return model
+
+
+def _fp8_linear_forward(layer, input):
+    """FP8 linear forward with dequantization."""
+    weight = layer.weight
+    scale = layer.scale_weight
+    computation_dtype = getattr(layer, 'computation_dtype', torch.float16)
+
+    # Dequantize weight to computation dtype
+    weight_dequant = weight.to(computation_dtype) * scale.to(computation_dtype)
+
+    # Compute in original dtype
+    input_cast = input.to(computation_dtype) if input.dtype != computation_dtype else input
+
+    # Standard linear
+    if layer.bias is not None:
+        output = torch.nn.functional.linear(input_cast, weight_dequant, layer.bias.to(computation_dtype))
+    else:
+        output = torch.nn.functional.linear(input_cast, weight_dequant, None)
+
+    return output
+
 # Try to import video processing utilities
 try:
     import cv2
@@ -304,10 +421,13 @@ class Qwen3VLMBackend:
             progress(0.1, desc="Configuring device map...")
 
             # Determine torch dtype
+            # For FP8, we load in native dtype first, then convert
+            use_fp8 = dtype == "fp8_scaled"
             dtype_map = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
+                "fp8_scaled": None,  # Use native dtype, convert after
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
@@ -373,18 +493,22 @@ class Qwen3VLMBackend:
                 )
                 print(f"Loaded tokenizer for {model_name}")
 
-            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...")
+            fp8_str = " (will convert to FP8)" if use_fp8 else ""
+            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...{fp8_str}")
             print(f"Loading model from: {model_path}")
-            print(f"Dtype: {torch_dtype}, Device map: {device_map}")
+            print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
             # Load the model
             model_kwargs = {
                 "pretrained_model_name_or_path": model_path,
-                "dtype": torch_dtype,
                 "device_map": device_map,
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,
             }
+
+            # Only set dtype if not using FP8 (FP8 loads native dtype first)
+            if torch_dtype is not None:
+                model_kwargs["dtype"] = torch_dtype
 
             if max_memory is not None:
                 model_kwargs["max_memory"] = max_memory
@@ -430,6 +554,12 @@ class Qwen3VLMBackend:
             self.current_model_type = model_type
             self.device_map = device_map
 
+            # Apply FP8 conversion if requested
+            if use_fp8:
+                progress(0.9, desc="Converting to FP8 scaled...")
+                print("[FP8] Converting model to FP8 scaled format...")
+                self.model = convert_model_to_fp8_scaled(self.model)
+
             progress(1.0, desc="Model loaded!")
 
             # Print device distribution
@@ -439,7 +569,8 @@ class Qwen3VLMBackend:
 
             print_gpu_status()
 
-            return f"Loaded: {model_name} ({model_type}) on {actual_gpus} GPU(s)"
+            dtype_str = "fp8_scaled" if use_fp8 else dtype
+            return f"Loaded: {model_name} ({model_type}, {dtype_str}) on {actual_gpus} GPU(s)"
 
         except Exception as e:
             import traceback
@@ -1185,9 +1316,9 @@ def create_ui():
                 with gr.Column(scale=1):
                     dtype_dropdown = gr.Dropdown(
                         label="Precision",
-                        choices=["bfloat16", "float16", "float32"],
+                        choices=["bfloat16", "float16", "fp8_scaled", "float32"],
                         value="bfloat16",
-                        info="bfloat16 recommended for Qwen models",
+                        info="fp8_scaled saves ~50% VRAM",
                     )
 
                 with gr.Column(scale=1):

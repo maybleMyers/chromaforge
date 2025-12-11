@@ -14,8 +14,6 @@ Methods used:
 4. Vision-Specific Tests - Evaluates image encoding quality degradation
 5. Cross-Attention Analysis - Special handling for vision-language fusion layers
 
-Author: Claude
-License: MIT
 """
 
 import torch

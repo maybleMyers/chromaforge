@@ -53,8 +53,9 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
     import torch.nn as nn
 
     if skip_patterns is None:
-        # Default: skip embedding and output head layers - they're sensitive
-        skip_patterns = ['embed', 'lm_head', 'wte', 'wpe', 'norm']
+        # Default: skip embedding, output head, norm, and vision encoder layers
+        # Vision layers are sensitive to quantization (based on analysis)
+        skip_patterns = ['embed', 'lm_head', 'wte', 'wpe', 'norm', 'visual']
 
     converted_count = 0
     skipped_count = 0
@@ -572,10 +573,12 @@ class Qwen3VLMBackend:
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 
-            # For FP8: load to CPU first, convert, then dispatch to GPU
+            # For FP8: load to CPU first (with actual weights, not meta), convert, then dispatch to GPU
             elif use_fp8:
                 model_kwargs["device_map"] = "cpu"
-                print("[FP8] Loading model to CPU for FP8 conversion...")
+                model_kwargs["low_cpu_mem_usage"] = False  # Need actual weights for FP8 conversion
+                print("[FP8] Loading model to CPU RAM for FP8 conversion...")
+                print("[FP8] This requires ~62GB CPU RAM temporarily...")
             else:
                 model_kwargs["device_map"] = device_map
                 if max_memory is not None:
@@ -659,15 +662,25 @@ class Qwen3VLMBackend:
                 from accelerate import dispatch_model, infer_auto_device_map
                 from accelerate.utils import get_balanced_memory
 
+                # Calculate available GPU memory
+                gpu_memory = {}
+                for i in range(actual_gpus):
+                    free_mem, total_mem = torch.cuda.mem_get_info(i)
+                    free_gb = int(free_mem / (1024**3) * 0.95)  # Use 95% of free VRAM
+                    gpu_memory[i] = f"{free_gb}GiB"
+                    print(f"[FP8] GPU {i}: {free_gb}GB available")
+
                 # Calculate device map for the FP8 model
                 if max_memory is not None:
                     fp8_max_memory = max_memory
                 else:
                     fp8_max_memory = get_balanced_memory(
                         self.model,
-                        max_memory={i: f"{int(torch.cuda.mem_get_info(i)[0] / (1024**3) * 0.9)}GiB" for i in range(actual_gpus)},
+                        max_memory=gpu_memory,
                         no_split_module_classes=getattr(self.model, "_no_split_modules", None),
                     )
+
+                print(f"[FP8] Calculated max_memory: {fp8_max_memory}")
 
                 fp8_device_map = infer_auto_device_map(
                     self.model,
@@ -675,9 +688,15 @@ class Qwen3VLMBackend:
                     no_split_module_classes=getattr(self.model, "_no_split_modules", None),
                 )
 
+                # Check if any layers are being offloaded to disk/cpu
+                unique_devices = set(fp8_device_map.values())
+                print(f"[FP8] Device map targets: {unique_devices}")
+                if 'disk' in unique_devices or 'cpu' in unique_devices:
+                    print("[FP8] WARNING: Some layers mapped to CPU/disk - model may be too large")
+
                 self.model = dispatch_model(self.model, device_map=fp8_device_map)
                 self.device_map = fp8_device_map
-                print(f"[FP8] Model dispatched to devices: {set(fp8_device_map.values())}")
+                print(f"[FP8] Model dispatched to devices: {unique_devices}")
 
             progress(1.0, desc="Model loaded!")
 

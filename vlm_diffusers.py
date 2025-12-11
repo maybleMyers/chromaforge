@@ -720,6 +720,39 @@ class Qwen3VLMBackend:
                 del state_dict
                 gc.collect()
 
+                # Initialize any remaining meta tensors (like inv_freq for rotary embeddings)
+                # These are computed buffers not stored in checkpoints
+                print("[FP8] Initializing remaining meta tensors...")
+                meta_params = [(n, p) for n, p in self.model.named_parameters() if p.device.type == 'meta']
+                meta_buffers = [(n, b) for n, b in self.model.named_buffers() if b.device.type == 'meta']
+
+                for name, param in meta_params:
+                    print(f"[FP8] Warning: param {name} still on meta device")
+
+                for name, buf in meta_buffers:
+                    # Get the parent module
+                    parts = name.split('.')
+                    buf_name = parts[-1]
+                    module = self.model
+                    for part in parts[:-1]:
+                        module = getattr(module, part)
+
+                    # Create initialized tensor
+                    if 'inv_freq' in name:
+                        # Rotary embedding inv_freq: 1/(base^(2i/dim))
+                        dim = buf.shape[0] * 2
+                        base = getattr(module, 'base', 10000.0) if hasattr(module, 'base') else 10000.0
+                        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                        module._buffers[buf_name] = inv_freq
+                        print(f"[FP8] Initialized {name} (rotary inv_freq, dim={dim})")
+                    else:
+                        # Generic: initialize with zeros on CPU
+                        new_buf = torch.zeros(buf.shape, dtype=torch.float32, device='cpu')
+                        module._buffers[buf_name] = new_buf
+                        print(f"[FP8] Initialized {name} with zeros")
+
+                print(f"[FP8] Initialized {len(meta_buffers)} meta buffers")
+
                 # Dispatch to GPU
                 progress(0.9, desc="Moving to GPU...")
                 print("[FP8] Dispatching model to GPU...")

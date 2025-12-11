@@ -428,17 +428,24 @@ class Qwen3VLMBackend:
         try:
             progress(0.1, desc="Configuring device map...")
 
-            # Determine torch dtype
-            # For FP8, we load in native dtype first, then convert
-            # For Q8 partial, we use BitsAndBytesConfig with INT8 but skip vision layers
+            # Determine torch dtype and quantization mode
+            # Quantization options:
+            # - q8_partial: INT8 with bf16 non-quantized layers (SLOW - bf16->fp16 casting)
+            # - q8_fp16: INT8 with fp16 non-quantized layers (FAST - native bitsandbytes)
+            # - q4_nf4: 4-bit NF4 with bf16 compute (smallest memory, good quality)
+            # - fp8_scaled: Manual FP8 conversion (native on RTX 40/50 series)
             use_fp8 = dtype == "fp8_scaled"
-            use_q8_partial = dtype == "q8_partial"
+            use_q8_partial = dtype in ["q8_partial", "q8_fp16"]
+            use_q4_nf4 = dtype == "q4_nf4"
+
             dtype_map = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
                 "fp8_scaled": None,  # Use native dtype, convert after
-                "q8_partial": torch.bfloat16,  # Non-quantized layers stay in bf16
+                "q8_partial": torch.bfloat16,  # Non-quantized in bf16 (slow - casting overhead)
+                "q8_fp16": torch.float16,  # Non-quantized in fp16 (fast - native bnb support)
+                "q4_nf4": torch.bfloat16,  # 4-bit NF4 supports bf16 compute dtype
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
@@ -504,9 +511,18 @@ class Qwen3VLMBackend:
                 )
                 print(f"Loaded tokenizer for {model_name}")
 
-            fp8_str = " (will convert to FP8)" if use_fp8 else ""
-            q8_str = " (INT8 with vision layers in bf16)" if use_q8_partial else ""
-            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...{fp8_str}{q8_str}")
+            # Build progress/status strings
+            quant_str = ""
+            if use_fp8:
+                quant_str = " (FP8 scaled)"
+            elif use_q4_nf4:
+                quant_str = " (4-bit NF4)"
+            elif dtype == "q8_fp16":
+                quant_str = " (INT8 + fp16 vision)"
+            elif dtype == "q8_partial":
+                quant_str = " (INT8 + bf16 vision - slow)"
+
+            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...{quant_str}")
             print(f"Loading model from: {model_path}")
             print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
@@ -530,8 +546,27 @@ class Qwen3VLMBackend:
                     llm_int8_skip_modules=['visual'],  # Skip entire visual encoder
                     llm_int8_threshold=6.0,  # Default threshold for outlier handling
                 )
-                print("[Q8] Using partial INT8 quantization (skipping visual encoder)")
+                is_fp16_mode = dtype == "q8_fp16"
+                print(f"[Q8] Using partial INT8 quantization (skipping visual encoder)")
+                print(f"[Q8] Non-quantized layers dtype: {'fp16 (fast)' if is_fp16_mode else 'bf16 (slow - casting)'}")
                 print("[Q8] Expected memory: ~30GB (from ~62GB for bf16)")
+                model_kwargs["quantization_config"] = quantization_config
+                model_kwargs["device_map"] = device_map
+                if max_memory is not None:
+                    model_kwargs["max_memory"] = max_memory
+
+            # For Q4 NF4: 4-bit quantization with bf16 compute (smallest memory footprint)
+            elif use_q4_nf4:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",  # NormalFloat4 - better for normally distributed weights
+                    bnb_4bit_compute_dtype=torch.bfloat16,  # bf16 compute is supported for 4-bit!
+                    bnb_4bit_use_double_quant=True,  # Nested quantization for extra memory savings
+                    llm_int8_skip_modules=['visual'],  # Skip visual encoder (uses bnb_4bit_skip_modules internally)
+                )
+                print("[Q4] Using 4-bit NF4 quantization (skipping visual encoder)")
+                print("[Q4] Compute dtype: bf16 (native support)")
+                print("[Q4] Expected memory: ~20GB (from ~62GB for bf16)")
                 model_kwargs["quantization_config"] = quantization_config
                 model_kwargs["device_map"] = device_map
                 if max_memory is not None:
@@ -653,7 +688,17 @@ class Qwen3VLMBackend:
 
             print_gpu_status()
 
-            dtype_str = "fp8_scaled" if use_fp8 else ("q8_partial (vision in bf16)" if use_q8_partial else dtype)
+            # Build status string based on quantization mode
+            if use_fp8:
+                dtype_str = "fp8_scaled"
+            elif use_q4_nf4:
+                dtype_str = "q4_nf4 (bf16 compute)"
+            elif dtype == "q8_fp16":
+                dtype_str = "q8_fp16 (fast)"
+            elif dtype == "q8_partial":
+                dtype_str = "q8_partial (bf16 - slow)"
+            else:
+                dtype_str = dtype
             return f"Loaded: {model_name} ({model_type}, {dtype_str}) on {actual_gpus} GPU(s)"
 
         except Exception as e:
@@ -1400,9 +1445,16 @@ def create_ui():
                 with gr.Column(scale=1):
                     dtype_dropdown = gr.Dropdown(
                         label="Precision",
-                        choices=["bfloat16", "float16", "q8_partial", "fp8_scaled", "float32"],
-                        value="q8_partial",
-                        info="q8_partial: INT8 LLM + bf16 vision (~30GB)",
+                        choices=[
+                            "q8_fp16",      # INT8 + fp16 vision (fast, ~30GB)
+                            "q4_nf4",       # 4-bit NF4 + bf16 compute (~20GB)
+                            "fp8_scaled",   # FP8 manual (RTX 40/50 native, ~31GB)
+                            "q8_partial",   # INT8 + bf16 vision (slow - casting)
+                            "bfloat16",     # Full bf16 (~62GB)
+                            "float16",      # Full fp16 (~62GB)
+                        ],
+                        value="q8_fp16",
+                        info="q8_fp16: fast INT8 (~30GB) | q4_nf4: smallest (~20GB)",
                     )
 
                 with gr.Column(scale=1):

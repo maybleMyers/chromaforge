@@ -13,6 +13,7 @@ Usage:
 import os
 import gc
 import time
+import json
 import argparse
 import tempfile
 from pathlib import Path
@@ -552,10 +553,27 @@ class Qwen3VLMBackend:
 
             # Use appropriate model class based on type
             if model_type == "qwen-vl":
-                # Try Qwen3-VL MoE first (for newer models), then Qwen2.5-VL, then Qwen2-VL
+                # Detect model architecture from config to choose the right class
+                config_path = os.path.join(model_path, "config.json")
+                model_type_from_config = None
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        config_data = json.load(f)
+                        model_type_from_config = config_data.get("model_type", "")
+                        print(f"Detected model_type from config: {model_type_from_config}")
+
                 loaded = False
 
-                if QWEN3_VL_AVAILABLE:
+                # For Qwen3-VL models, use AutoModelForVision2Seq which loads model's custom code
+                # This is critical because Qwen3-VL has different architecture than Qwen2.5-VL
+                if model_type_from_config == "qwen3_vl":
+                    print("Loading as Qwen3-VL model using AutoModelForVision2Seq...")
+                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                    print("Loaded as Qwen3-VL model (via AutoModelForVision2Seq)")
+                    loaded = True
+
+                # For Qwen3-VL MoE models
+                if not loaded and QWEN3_VL_AVAILABLE and model_type_from_config == "qwen3_vl_moe":
                     try:
                         self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(**model_kwargs)
                         print("Loaded as Qwen3-VL MoE model")
@@ -563,7 +581,8 @@ class Qwen3VLMBackend:
                     except Exception as e:
                         print(f"Qwen3-VL MoE load failed: {e}, trying fallback...")
 
-                if not loaded:
+                # For Qwen2.5-VL models
+                if not loaded and model_type_from_config in ["qwen2_5_vl", "qwen2_vl"]:
                     try:
                         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(**model_kwargs)
                         print("Loaded as Qwen2.5-VL model")
@@ -571,6 +590,7 @@ class Qwen3VLMBackend:
                     except Exception:
                         pass
 
+                # Legacy Qwen2-VL fallback
                 if not loaded:
                     try:
                         self.model = Qwen2VLForConditionalGeneration.from_pretrained(**model_kwargs)
@@ -579,6 +599,7 @@ class Qwen3VLMBackend:
                     except Exception:
                         pass
 
+                # Final fallback
                 if not loaded:
                     self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
                     print("Loaded as generic Vision2Seq model")

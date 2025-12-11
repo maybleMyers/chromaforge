@@ -455,7 +455,7 @@ class QuantizationSensitivityAnalyzer:
         self.model = AutoModelForVision2Seq.from_pretrained(
             self.model_name,
             torch_dtype=self.dtype,
-            device_map="auto" if self.low_memory else self.device,
+            device_map="balanced" if self.low_memory else self.device,
             trust_remote_code=True,
         )
         self.model.eval()
@@ -512,7 +512,8 @@ class QuantizationSensitivityAnalyzer:
         
         # Compute weight statistics
         with torch.no_grad():
-            weight_cpu = weight.float().cpu()
+            # Move to CPU first, then convert to float (avoids GPU memory spike)
+            weight_cpu = weight.cpu().float()
             stats = WeightAnalyzer.compute_statistics(weight_cpu)
             
             result.weight_mean = stats["mean"]
@@ -534,7 +535,10 @@ class QuantizationSensitivityAnalyzer:
             
             # Clean up
             del weight_cpu, quantized
-        
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # Compute risk score
         risk_score, reasons = RiskScorer.compute_risk_score(result)
         result.risk_score = risk_score

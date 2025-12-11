@@ -429,12 +429,15 @@ class Qwen3VLMBackend:
 
             # Determine torch dtype
             # For FP8, we load in native dtype first, then convert
+            # For Q8 partial, we use BitsAndBytesConfig with INT8 but skip vision layers
             use_fp8 = dtype == "fp8_scaled"
+            use_q8_partial = dtype == "q8_partial"
             dtype_map = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
                 "fp8_scaled": None,  # Use native dtype, convert after
+                "q8_partial": torch.bfloat16,  # Non-quantized layers stay in bf16
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
@@ -501,7 +504,8 @@ class Qwen3VLMBackend:
                 print(f"Loaded tokenizer for {model_name}")
 
             fp8_str = " (will convert to FP8)" if use_fp8 else ""
-            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...{fp8_str}")
+            q8_str = " (INT8 with vision layers in bf16)" if use_q8_partial else ""
+            progress(0.3, desc=f"Loading {model_name} across {actual_gpus} GPU(s)...{fp8_str}{q8_str}")
             print(f"Loading model from: {model_path}")
             print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
@@ -512,8 +516,28 @@ class Qwen3VLMBackend:
                 "low_cpu_mem_usage": True,
             }
 
+            # For Q8 partial: use BitsAndBytesConfig to quantize language model to INT8
+            # but skip vision encoder layers which are sensitive to quantization
+            quantization_config = None
+            if use_q8_partial:
+                # Based on quantization sensitivity analysis:
+                # - Visual encoder layers (model.visual.*) are CRITICAL and should NOT be quantized
+                # - This includes pos_embed, attention blocks, MLP layers, merger layers
+                # - Language model layers can safely be quantized to INT8
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_skip_modules=['visual'],  # Skip entire visual encoder
+                    llm_int8_threshold=6.0,  # Default threshold for outlier handling
+                )
+                print("[Q8] Using partial INT8 quantization (skipping visual encoder)")
+                print("[Q8] Expected memory: ~30GB (from ~62GB for bf16)")
+                model_kwargs["quantization_config"] = quantization_config
+                model_kwargs["device_map"] = device_map
+                if max_memory is not None:
+                    model_kwargs["max_memory"] = max_memory
+
             # For FP8: load to CPU first, convert, then dispatch to GPU
-            if use_fp8:
+            elif use_fp8:
                 model_kwargs["device_map"] = "cpu"
                 print("[FP8] Loading model to CPU for FP8 conversion...")
             else:
@@ -522,6 +546,7 @@ class Qwen3VLMBackend:
                     model_kwargs["max_memory"] = max_memory
 
             # Only set dtype if not using FP8 (FP8 loads native dtype first)
+            # For Q8 partial, torch_dtype is used for non-quantized layers
             if torch_dtype is not None:
                 model_kwargs["dtype"] = torch_dtype
 
@@ -607,7 +632,7 @@ class Qwen3VLMBackend:
 
             print_gpu_status()
 
-            dtype_str = "fp8_scaled" if use_fp8 else dtype
+            dtype_str = "fp8_scaled" if use_fp8 else ("q8_partial (vision in bf16)" if use_q8_partial else dtype)
             return f"Loaded: {model_name} ({model_type}, {dtype_str}) on {actual_gpus} GPU(s)"
 
         except Exception as e:
@@ -1354,9 +1379,9 @@ def create_ui():
                 with gr.Column(scale=1):
                     dtype_dropdown = gr.Dropdown(
                         label="Precision",
-                        choices=["bfloat16", "float16", "fp8_scaled", "float32"],
-                        value="bfloat16",
-                        info="fp8_scaled saves ~50% VRAM",
+                        choices=["bfloat16", "float16", "q8_partial", "fp8_scaled", "float32"],
+                        value="q8_partial",
+                        info="q8_partial: INT8 LLM + bf16 vision (~30GB)",
                     )
 
                 with gr.Column(scale=1):

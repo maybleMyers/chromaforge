@@ -573,12 +573,15 @@ class Qwen3VLMBackend:
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 
-            # For FP8: load to CPU first (with actual weights, not meta), convert, then dispatch to GPU
+            # For FP8: Use new musubi-tuner style loading
+            # 1. Create model with meta tensors
+            # 2. Load weights from safetensors with FP8 optimization
+            # 3. Apply monkey patches and load state dict
             elif use_fp8:
-                model_kwargs["device_map"] = "cpu"
-                model_kwargs["low_cpu_mem_usage"] = False  # Need actual weights for FP8 conversion
-                print("[FP8] Loading model to CPU RAM for FP8 conversion...")
-                print("[FP8] This requires ~62GB CPU RAM temporarily...")
+                # We'll handle FP8 separately after model creation
+                model_kwargs["device_map"] = "meta"  # Create with meta tensors
+                print("[FP8] Creating model structure with meta tensors...")
+                print("[FP8] Will load and quantize weights from safetensors...")
             else:
                 model_kwargs["device_map"] = device_map
                 if max_memory is not None:
@@ -650,37 +653,90 @@ class Qwen3VLMBackend:
             self.current_model_type = model_type
             self.device_map = device_map
 
-            # Apply FP8 conversion if requested
+            # Apply FP8 optimization if requested (musubi-tuner style)
             if use_fp8:
-                progress(0.7, desc="Converting to FP8 scaled...")
-                print("[FP8] Converting model to FP8 scaled format...")
-                self.model = convert_model_to_fp8_scaled(self.model)
-
-                # Now dispatch to GPU with accelerate
-                progress(0.9, desc="Moving FP8 model to GPU...")
-                print("[FP8] Dispatching model to GPU...")
+                from backend.nn.fp8_optimization import (
+                    optimize_vlm_state_dict_fp8,
+                    apply_fp8_vlm_monkey_patch,
+                    VLM_FP8_EXCLUDE_KEYS,
+                )
+                from safetensors import safe_open
                 from accelerate import dispatch_model, infer_auto_device_map
                 from accelerate.utils import get_balanced_memory
+
+                progress(0.5, desc="Loading weights from safetensors...")
+                print("[FP8] Loading weights directly from safetensors...")
+
+                # Find safetensor files
+                index_file = os.path.join(model_path, "model.safetensors.index.json")
+                if os.path.exists(index_file):
+                    with open(index_file, "r") as f:
+                        index = json.load(f)
+                    shard_files = sorted(set(index["weight_map"].values()))
+                    safetensor_files = [os.path.join(model_path, f) for f in shard_files]
+                else:
+                    single_file = os.path.join(model_path, "model.safetensors")
+                    if os.path.exists(single_file):
+                        safetensor_files = [single_file]
+                    else:
+                        safetensor_files = sorted([str(f) for f in Path(model_path).glob("*.safetensors")])
+
+                print(f"[FP8] Found {len(safetensor_files)} safetensor shard(s)")
+
+                # Load state dict from safetensors
+                state_dict = {}
+                for shard_file in safetensor_files:
+                    print(f"[FP8] Loading {os.path.basename(shard_file)}...")
+                    with safe_open(shard_file, framework="pt", device="cpu") as f:
+                        for key in f.keys():
+                            state_dict[key] = f.get_tensor(key)
+
+                print(f"[FP8] Loaded {len(state_dict)} tensors from safetensors")
+
+                # Apply FP8 quantization to state dict
+                progress(0.7, desc="Quantizing to FP8...")
+                print("[FP8] Applying FP8 quantization (skipping visual/embed/norm)...")
+                state_dict = optimize_vlm_state_dict_fp8(
+                    state_dict,
+                    calc_device="cuda:0" if torch.cuda.is_available() else "cpu",
+                    exclude_layer_keys=VLM_FP8_EXCLUDE_KEYS,
+                    move_to_device=False,  # Keep on CPU for now
+                )
+
+                # Apply monkey patches to model
+                print("[FP8] Applying forward patches for FP8 dequantization...")
+                apply_fp8_vlm_monkey_patch(self.model, state_dict)
+
+                # Load state dict with assign=True (replaces meta tensors)
+                progress(0.85, desc="Loading quantized weights...")
+                print("[FP8] Loading quantized state dict into model...")
+                info = self.model.load_state_dict(state_dict, strict=False, assign=True)
+                if info.missing_keys:
+                    print(f"[FP8] Missing keys: {len(info.missing_keys)}")
+                if info.unexpected_keys:
+                    print(f"[FP8] Unexpected keys: {len(info.unexpected_keys)}")
+
+                # Free state dict memory
+                del state_dict
+                gc.collect()
+
+                # Dispatch to GPU
+                progress(0.9, desc="Moving to GPU...")
+                print("[FP8] Dispatching model to GPU...")
 
                 # Calculate available GPU memory
                 gpu_memory = {}
                 for i in range(actual_gpus):
                     free_mem, total_mem = torch.cuda.mem_get_info(i)
-                    free_gb = int(free_mem / (1024**3) * 0.95)  # Use 95% of free VRAM
+                    free_gb = int(free_mem / (1024**3) * 0.95)
                     gpu_memory[i] = f"{free_gb}GiB"
                     print(f"[FP8] GPU {i}: {free_gb}GB available")
 
-                # Calculate device map for the FP8 model
-                if max_memory is not None:
-                    fp8_max_memory = max_memory
-                else:
-                    fp8_max_memory = get_balanced_memory(
-                        self.model,
-                        max_memory=gpu_memory,
-                        no_split_module_classes=getattr(self.model, "_no_split_modules", None),
-                    )
-
-                print(f"[FP8] Calculated max_memory: {fp8_max_memory}")
+                fp8_max_memory = get_balanced_memory(
+                    self.model,
+                    max_memory=gpu_memory,
+                    no_split_module_classes=getattr(self.model, "_no_split_modules", None),
+                )
 
                 fp8_device_map = infer_auto_device_map(
                     self.model,
@@ -688,15 +744,12 @@ class Qwen3VLMBackend:
                     no_split_module_classes=getattr(self.model, "_no_split_modules", None),
                 )
 
-                # Check if any layers are being offloaded to disk/cpu
                 unique_devices = set(fp8_device_map.values())
-                print(f"[FP8] Device map targets: {unique_devices}")
-                if 'disk' in unique_devices or 'cpu' in unique_devices:
-                    print("[FP8] WARNING: Some layers mapped to CPU/disk - model may be too large")
+                print(f"[FP8] Device map: {unique_devices}")
 
                 self.model = dispatch_model(self.model, device_map=fp8_device_map)
                 self.device_map = fp8_device_map
-                print(f"[FP8] Model dispatched to devices: {unique_devices}")
+                print(f"[FP8] Model dispatched successfully!")
 
             progress(1.0, desc="Model loaded!")
 

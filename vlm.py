@@ -793,12 +793,12 @@ def create_ui():
                         image_input = gr.Image(
                             label="Upload Image (optional)",
                             type="pil",
-                            height=300,
+                            height=100,
                         )
                     with gr.Column(scale=1):
                         video_input = gr.Video(
                             label="Upload Video (optional)",
-                            height=300,
+                            height=100,
                         )
 
                 # Message input row

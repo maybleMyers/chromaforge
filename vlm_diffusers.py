@@ -1967,16 +1967,6 @@ def create_ui():
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
         )
 
-        msg_input.submit(
-            fn=send_message,
-            inputs=[
-                msg_input, chatbot, system_prompt,
-                image_input_1, image_input_2, image_input_3, image_input_4, video_input,
-                max_tokens, temperature, top_p, top_k, video_max_frames
-            ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
-        )
-
         clear_btn.click(
             fn=clear_chat_handler,
             outputs=[chatbot],

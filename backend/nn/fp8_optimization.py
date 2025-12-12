@@ -248,18 +248,17 @@ def fp8_linear_forward_vlm(self, x):
     scale_weight = self.scale_weight.to(device=x.device, dtype=torch.float32)
     scale_input = torch.ones(1, device=x.device, dtype=torch.float32)
 
-    # Cache transposed weight for efficiency (avoid transpose every forward)
-    if not hasattr(self, '_weight_t_cached') or self._weight_t_cached is None:
-        self._weight_t_cached = weight.t().contiguous()
-    w_t = self._weight_t_cached
+    # Get transposed weight - DO NOT call .contiguous() as cuBLASLt needs column-major layout
+    # weight is (out_features, in_features), weight.t() is (in_features, out_features) column-major
+    w_t = weight.t()
 
     # Handle 3D input (batch, seq, hidden) - common for transformers
     if x.dim() == 3:
         batch, seq_len, hidden = x.shape
-        # Reshape to 2D for matmul
-        x_2d = x.reshape(-1, hidden)
+        # Reshape to 2D for matmul and ensure contiguous (row-major) for cuBLASLt
+        x_2d = x.reshape(-1, hidden).contiguous()
 
-        # Convert input to FP8
+        # Convert input to FP8 (creates new contiguous tensor)
         x_fp8 = x_2d.to(input_fp8_dtype)
 
         # Native FP8 matmul using tensor cores
@@ -283,8 +282,8 @@ def fp8_linear_forward_vlm(self, x):
 
     # Handle 2D input (batch, hidden)
     elif x.dim() == 2:
-        # Convert input to FP8
-        x_fp8 = x.to(input_fp8_dtype)
+        # Ensure contiguous (row-major) and convert to FP8
+        x_fp8 = x.contiguous().to(input_fp8_dtype)
 
         # Native FP8 matmul
         output = torch._scaled_mm(

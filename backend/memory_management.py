@@ -461,12 +461,27 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
     # Default profiling for non-ChromaDCT models
     gpu_modules = []
     gpu_modules_only_extras = []
+    cpu_modules_legacy = []  # Legacy modules that need to go to CPU due to memory limits
     mem_counter = 0
 
+    # Process legacy modules WITH memory limit checking
+    # Previously, legacy modules were unconditionally added to GPU, causing OOM
+    # for FP32 models where parameters_manual_cast=False
     for m in legacy_modules.copy():
-        gpu_modules.append(m)
+        if mem_counter + m.total_mem < model_gpu_memory_when_using_cpu_swap:
+            gpu_modules.append(m)
+            mem_counter += m.total_mem
+        else:
+            # Legacy module doesn't fit - needs CPU offloading
+            # Enable manual cast so it can be offloaded properly
+            if hasattr(m, 'parameters_manual_cast'):
+                cpu_modules_legacy.append(m)
+            else:
+                # Module doesn't have parameters_manual_cast attribute
+                # Add it so it can use the manual cast mechanism for CPU offloading
+                m.parameters_manual_cast = False  # Will be enabled to True in model_load
+                cpu_modules_legacy.append(m)
         legacy_modules.remove(m)
-        mem_counter += m.total_mem
 
     for m in sorted(all_modules, key=lambda x: x.extra_mem).copy():
         if mem_counter + m.extra_mem < model_gpu_memory_when_using_cpu_swap:
@@ -474,7 +489,7 @@ def build_module_profile(model, model_gpu_memory_when_using_cpu_swap):
             all_modules.remove(m)
             mem_counter += m.extra_mem
 
-    cpu_modules = all_modules
+    cpu_modules = all_modules + cpu_modules_legacy  # Include legacy modules that don't fit on GPU
 
     for m in sorted(gpu_modules_only_extras, key=lambda x: x.weight_mem).copy():
         if mem_counter + m.weight_mem < model_gpu_memory_when_using_cpu_swap:

@@ -28,15 +28,22 @@
 qwen-vl-utils>=0.0.14
 
 # Transformers backend
-# NOTE: GLM-4.6V-Flash requires transformers >= 5.0.0rc0
-# Install from PyPI: pip install transformers>=5.0.0rc0
-# Or from GitHub main: pip install git+https://github.com/huggingface/transformers
-transformers>=5.0.0rc0
+# GLM-4.6V-Flash requires transformers v5.0.0rc0+ (PR #42122 added GLM-4.6V support)
+# NOT available in v4.57.x stable releases!
+#
+# Install ONE of these options:
+#   pip install transformers==5.0.0rc0      # Pre-release from PyPI
+#   pip install transformers --pre          # Latest pre-release
+#   pip install git+https://github.com/huggingface/transformers  # Dev (5.0.0.dev0)
+#
+# Source: https://github.com/huggingface/transformers/releases/tag/v5.0.0rc0
+transformers==5.0.0rc0
 accelerate
 safetensors
 
-# Gradio UI - use 5.x for vLLM compatibility
-gradio>=5.0.0
+# Gradio UI - 6.x required for huggingface_hub 1.x compatibility (used by transformers 5.x)
+# Fix: PR #11979 - "Allow gradio to run with huggingface_hub 1.x"
+gradio>=6.0.0
 gradio-client>=1.5.0
 
 # Image/Video processing (let qwen-vl-utils control these)

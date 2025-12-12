@@ -854,29 +854,26 @@ def create_ui():
                     image_input_1 = gr.Image(
                         label="Image 1",
                         type="pil",
-                        height=100,
+                        height=150,
                     )
                     image_input_2 = gr.Image(
                         label="Image 2",
                         type="pil",
-                        height=100,
+                        height=150,
                     )
                     image_input_3 = gr.Image(
                         label="Image 3",
                         type="pil",
-                        height=100,
+                        height=150,
                     )
                     image_input_4 = gr.Image(
                         label="Image 4",
                         type="pil",
-                        height=100,
+                        height=150,
                     )
-
-                # Video input row
-                with gr.Row():
                     video_input = gr.Video(
                         label="Upload Video (optional)",
-                        height=100,
+                        height=150,
                     )
 
                 # Message input row

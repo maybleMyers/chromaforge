@@ -223,18 +223,89 @@ def quantize_fp8_vlm(tensor, scale, fp8_dtype, max_value, min_value):
 
 
 def fp8_linear_forward_vlm(self, x):
-    """Patched forward method for VLM Linear layers with FP8 weights."""
-    # Dequantize the weight
-    original_dtype = self.scale_weight.dtype
-    dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
+    """
+    Patched forward method for VLM Linear layers with FP8 weights.
+    Uses torch._scaled_mm for native FP8 tensor core computation.
 
-    # Perform linear transformation
-    if self.bias is not None:
-        output = nn.functional.linear(x, dequantized_weight, self.bias)
+    BF16 layers (visual, embed, norm) are NOT patched and use regular forward.
+    Only quantized layers get this fast FP8 path.
+    """
+    weight = self.weight
+    weight_dtype = weight.dtype
+
+    # Get computation dtype from scale_weight (this is the original model dtype, usually bf16)
+    computation_dtype = self.scale_weight.dtype
+
+    # Only use FP8 fast path if weight is actually FP8
+    if weight_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        # Fallback to regular forward for non-FP8 weights
+        return nn.functional.linear(x, weight, self.bias)
+
+    # FP8 matmul requires complementary dtypes: e4m3fn weights with e5m2 inputs (or vice versa)
+    input_fp8_dtype = torch.float8_e5m2 if weight_dtype == torch.float8_e4m3fn else torch.float8_e4m3fn
+
+    # Get scales - ensure they're on the same device as input
+    scale_weight = self.scale_weight.to(device=x.device, dtype=torch.float32)
+    scale_input = torch.ones(1, device=x.device, dtype=torch.float32)
+
+    # Cache transposed weight for efficiency (avoid transpose every forward)
+    if not hasattr(self, '_weight_t_cached') or self._weight_t_cached is None:
+        self._weight_t_cached = weight.t().contiguous()
+    w_t = self._weight_t_cached
+
+    # Handle 3D input (batch, seq, hidden) - common for transformers
+    if x.dim() == 3:
+        batch, seq_len, hidden = x.shape
+        # Reshape to 2D for matmul
+        x_2d = x.reshape(-1, hidden)
+
+        # Convert input to FP8
+        x_fp8 = x_2d.to(input_fp8_dtype)
+
+        # Native FP8 matmul using tensor cores
+        output = torch._scaled_mm(
+            x_fp8, w_t,
+            out_dtype=computation_dtype,
+            scale_a=scale_input,
+            scale_b=scale_weight,
+        )
+
+        # Handle tuple return (some PyTorch versions)
+        if isinstance(output, tuple):
+            output = output[0]
+
+        # Add bias if present
+        if self.bias is not None:
+            output = output + self.bias.to(computation_dtype)
+
+        # Reshape back to 3D
+        return output.reshape(batch, seq_len, -1)
+
+    # Handle 2D input (batch, hidden)
+    elif x.dim() == 2:
+        # Convert input to FP8
+        x_fp8 = x.to(input_fp8_dtype)
+
+        # Native FP8 matmul
+        output = torch._scaled_mm(
+            x_fp8, w_t,
+            out_dtype=computation_dtype,
+            scale_a=scale_input,
+            scale_b=scale_weight,
+        )
+
+        if isinstance(output, tuple):
+            output = output[0]
+
+        if self.bias is not None:
+            output = output + self.bias.to(computation_dtype)
+
+        return output
+
     else:
-        output = nn.functional.linear(x, dequantized_weight)
-
-    return output
+        # Fallback for other shapes - use dequantization path
+        dequantized_weight = weight.to(computation_dtype) * scale_weight
+        return nn.functional.linear(x.to(computation_dtype), dequantized_weight, self.bias)
 
 
 def optimize_vlm_state_dict_fp8(

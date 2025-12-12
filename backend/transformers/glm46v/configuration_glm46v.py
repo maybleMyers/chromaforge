@@ -21,6 +21,29 @@
 
 
 from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
+from transformers import AutoConfig, AutoModel
+
+# Flag to track if we've registered
+_REGISTERED = False
+
+
+def _register_glm4v_configs():
+    """Register GLM4V configs with Auto classes if not already registered."""
+    global _REGISTERED
+    if _REGISTERED:
+        return
+
+    try:
+        # Register vision config
+        AutoConfig.register("glm4v_vision", Glm4vVisionConfig)
+        # Register text config
+        AutoConfig.register("glm4v_text", Glm4vTextConfig)
+        # Register main config
+        AutoConfig.register("glm46v", Glm46VConfig)
+        _REGISTERED = True
+    except Exception:
+        # Already registered or other issue
+        pass
 
 
 class Glm4vVisionConfig(PreTrainedConfig):

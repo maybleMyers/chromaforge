@@ -192,23 +192,25 @@ try:
         QWEN3_VL_AVAILABLE = False
         print("Note: Qwen3VLMoeForConditionalGeneration not available, will use fallback classes")
 
-    # Import GLM-4.6V classes from local backend
+    # Use native transformers GLM4V classes (GLM-4.6V-Flash is compatible with GLM-4.1V architecture)
     try:
-        from backend.transformers.glm46v import (
-            Glm46VForConditionalGeneration,
-            Glm46VProcessor,
-            Glm46VConfig,
-            Glm46VImageProcessor,
+        from transformers import (
+            Glm4vForConditionalGeneration,
+            Glm4vImageProcessor,
+            Glm4vProcessor,
         )
-        GLM46V_AVAILABLE = True
-        print("GLM-4.6V support: available (local backend)")
+        GLM4V_AVAILABLE = True
+        print("GLM-4V/4.6V support: available (native transformers)")
     except ImportError as glm_err:
-        GLM46V_AVAILABLE = False
-        print(f"Note: GLM-4.6V not available: {glm_err}")
+        GLM4V_AVAILABLE = False
+        Glm4vForConditionalGeneration = None
+        Glm4vImageProcessor = None
+        Glm4vProcessor = None
+        print(f"Note: GLM-4V not available: {glm_err}")
 except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
     QWEN3_VL_AVAILABLE = False
-    GLM46V_AVAILABLE = False
+    GLM4V_AVAILABLE = False
     print(f"Error: transformers not installed or incompatible version: {e}")
 
 try:
@@ -523,8 +525,9 @@ class Qwen3VLMBackend:
 
             # Load processor or tokenizer based on model type
             if model_type in ["qwen-vl", "glm-vl"]:
-                if model_type == "glm-vl" and GLM46V_AVAILABLE:
-                    # Manually construct GLM processor from components
+                if model_type == "glm-vl" and GLM4V_AVAILABLE:
+                    # Use native Glm4vProcessor with manual tokenizer construction
+                    # (tokenizer_config.json has incompatible "TokenizersBackend" class)
                     from transformers import PreTrainedTokenizerFast
                     from tokenizers import Tokenizer as TokenizerFast
 
@@ -552,8 +555,8 @@ class Qwen3VLMBackend:
                     if additional_special:
                         tokenizer.add_special_tokens({"additional_special_tokens": additional_special})
 
-                    # Load image processor
-                    image_processor = Glm46VImageProcessor.from_pretrained(model_path)
+                    # Load native image processor
+                    image_processor = Glm4vImageProcessor.from_pretrained(model_path)
 
                     # Load chat template
                     chat_template_path = os.path.join(model_path, "chat_template.jinja")
@@ -562,10 +565,10 @@ class Qwen3VLMBackend:
                         with open(chat_template_path, "r") as f:
                             chat_template = f.read()
 
-                    self.processor = Glm46VProcessor(
+                    # Use native Glm4vProcessor
+                    self.processor = Glm4vProcessor(
                         image_processor=image_processor,
                         tokenizer=tokenizer,
-                        video_processor=None,
                         chat_template=chat_template,
                     )
                     print(f"Loaded GLM processor for {model_name}")
@@ -676,14 +679,14 @@ class Qwen3VLMBackend:
 
                 loaded = False
 
-                # For GLM-4.6V models (GLM-4.6V-Flash, etc.)
-                # Uses local backend classes
+                # For GLM-4V/4.6V models (GLM-4.6V-Flash is compatible with GLM-4.1V architecture)
+                # Uses native transformers Glm4vForConditionalGeneration
                 if model_type_from_config in ["glm4v", "glm46v"]:
-                    if not GLM46V_AVAILABLE:
-                        return "Error: GLM-4.6V backend not available. Check backend/transformers/glm46v/"
-                    print("Loading as GLM-4.6V model using local Glm46VForConditionalGeneration...")
-                    self.model = Glm46VForConditionalGeneration.from_pretrained(**model_kwargs)
-                    print("Loaded as GLM-4.6V model")
+                    if not GLM4V_AVAILABLE:
+                        return "Error: GLM-4V not available. Requires transformers >= 4.57"
+                    print("Loading as GLM-4V model using native Glm4vForConditionalGeneration...")
+                    self.model = Glm4vForConditionalGeneration.from_pretrained(**model_kwargs)
+                    print("Loaded as GLM-4V model")
                     loaded = True
 
                 # For Qwen3-VL models, use AutoModelForVision2Seq which loads model's custom code

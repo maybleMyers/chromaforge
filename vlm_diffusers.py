@@ -1,5 +1,6 @@
 """
-VLM Backend using Diffusers/Transformers for Qwen3-VL Models
+VLM Backend using Diffusers/Transformers for Vision Language Models
+Supports Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL) and GLM-4V models.
 Supports loading unquantized models across multiple GPUs.
 
 Requirements:
@@ -7,7 +8,7 @@ Requirements:
 - For multi-GPU: pip install accelerate
 
 Usage:
-    python vlm_diffusers.py --models-dir models/VLM --port 7863
+    python vlm_diffusers.py --models-dir models/LLM --port 7863
 """
 
 import os
@@ -324,11 +325,17 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                         model_type = "qwen-vl"
                     else:
                         model_type = "qwen"
+                # Detect GLM models
+                elif "glm" in arch or "glm" in model_type_str:
+                    if config.get("vision_config") or "4v" in model_type_str or "vl" in arch:
+                        model_type = "glm-vl"
+                    else:
+                        model_type = "glm"
         except Exception:
             pass
 
-        # Only include Qwen models
-        if model_type in ["qwen", "qwen-vl"]:
+        # Include Qwen and GLM models
+        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl"]:
             models.append({
                 "name": model_dir.name,
                 "path": str(model_dir),
@@ -340,7 +347,8 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
 
 class Qwen3VLMBackend:
     """
-    Diffusers/Transformers-based VLM backend for Qwen3-VL models.
+    Diffusers/Transformers-based VLM backend for Vision Language Models.
+    Supports Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL) and GLM-4V models.
     Supports multi-GPU inference with automatic device mapping.
     """
 
@@ -499,7 +507,7 @@ class Qwen3VLMBackend:
             progress(0.2, desc="Loading processor/tokenizer...")
 
             # Load processor or tokenizer based on model type
-            if model_type == "qwen-vl":
+            if model_type in ["qwen-vl", "glm-vl"]:
                 self.processor = AutoProcessor.from_pretrained(
                     model_path,
                     trust_remote_code=True,
@@ -593,7 +601,7 @@ class Qwen3VLMBackend:
                 model_kwargs["dtype"] = torch_dtype
 
             # Use appropriate model class based on type
-            if model_type == "qwen-vl":
+            if model_type in ["qwen-vl", "glm-vl"]:
                 # Detect model architecture from config to choose the right class
                 config_path = os.path.join(model_path, "config.json")
                 model_type_from_config = None
@@ -605,9 +613,17 @@ class Qwen3VLMBackend:
 
                 loaded = False
 
+                # For GLM-4V models (GLM-4.6V-Flash, etc.)
+                # Uses custom Glm4vForConditionalGeneration class with trust_remote_code
+                if model_type_from_config == "glm4v":
+                    print("Loading as GLM-4V model using AutoModelForVision2Seq...")
+                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                    print("Loaded as GLM-4V model (via AutoModelForVision2Seq)")
+                    loaded = True
+
                 # For Qwen3-VL models, use AutoModelForVision2Seq which loads model's custom code
                 # This is critical because Qwen3-VL has different architecture than Qwen2.5-VL
-                if model_type_from_config == "qwen3_vl":
+                if not loaded and model_type_from_config == "qwen3_vl":
                     print("Loading as Qwen3-VL model using AutoModelForVision2Seq...")
                     self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
                     print("Loaded as Qwen3-VL model (via AutoModelForVision2Seq)")
@@ -915,8 +931,8 @@ class Qwen3VLMBackend:
             return "Error: No model loaded. Please load a model first.", empty_stats
 
         try:
-            # Handle vision-language model
-            if self.current_model_type == "qwen-vl" and self.processor is not None:
+            # Handle vision-language model (Qwen-VL, GLM-VL, etc.)
+            if self.current_model_type in ["qwen-vl", "glm-vl"] and self.processor is not None:
                 return self._generate_vl(
                     messages, images, video_path,
                     max_new_tokens, temperature, top_p, top_k, video_max_frames
@@ -1031,11 +1047,14 @@ class Qwen3VLMBackend:
             add_generation_prompt=True,
         )
 
-        # Process images/videos with qwen_vl_utils if available
-        if QWEN_VL_UTILS_AVAILABLE:
+        # Process images/videos
+        # Use qwen_vl_utils for Qwen models, manual extraction for GLM and others
+        is_glm_model = self.current_model_type == "glm-vl"
+
+        if QWEN_VL_UTILS_AVAILABLE and not is_glm_model:
             image_inputs, video_inputs = process_vision_info(conversation)
         else:
-            # Fallback: extract images manually
+            # Manual extraction for GLM and fallback for other models
             image_inputs = []
             video_inputs = []
             for msg in conversation:
@@ -1046,7 +1065,10 @@ class Qwen3VLMBackend:
                             if item.get("type") == "image":
                                 img_path = item.get("image")
                                 if img_path:
-                                    image_inputs.append(Image.open(img_path))
+                                    if isinstance(img_path, str):
+                                        image_inputs.append(Image.open(img_path))
+                                    elif isinstance(img_path, Image.Image):
+                                        image_inputs.append(img_path)
                             elif item.get("type") == "video":
                                 vid_path = item.get("video")
                                 if vid_path:
@@ -1767,10 +1789,11 @@ def main():
 
     print("=" * 60)
     print("Chromaforge VLM Chat (Diffusers/Transformers Backend)")
+    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4V")
     print("=" * 60)
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
-    print(f"qwen-vl-utils: {'available' if QWEN_VL_UTILS_AVAILABLE else 'NOT INSTALLED'}")
+    print(f"qwen-vl-utils: {'available' if QWEN_VL_UTILS_AVAILABLE else 'NOT INSTALLED (optional, only for Qwen)'}")
     print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")
     if args.listen:
@@ -1794,7 +1817,7 @@ def main():
             print(f"  - {m['name']} ({m['type']})")
     else:
         print(f"\nNo models found in {args.models_dir}")
-        print("Download Qwen3-VL models and place them in this directory.")
+        print("Download Qwen-VL or GLM-4V models and place them in this directory.")
 
     print("=" * 60)
 

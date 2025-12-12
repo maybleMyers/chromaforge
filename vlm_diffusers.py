@@ -525,7 +525,8 @@ class Qwen3VLMBackend:
             if model_type in ["qwen-vl", "glm-vl"]:
                 if model_type == "glm-vl" and GLM46V_AVAILABLE:
                     # Manually construct GLM processor from components
-                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    from transformers import PreTrainedTokenizerFast
+                    tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
                     image_processor = Glm46VImageProcessor.from_pretrained(model_path)
                     # Load chat template
                     chat_template_path = os.path.join(model_path, "chat_template.jinja")

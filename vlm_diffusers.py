@@ -197,6 +197,7 @@ try:
         from transformers import (
             Glm4vForConditionalGeneration,
             Glm4vImageProcessor,
+            Glm4vVideoProcessor,
             Glm4vProcessor,
         )
         GLM4V_AVAILABLE = True
@@ -205,6 +206,7 @@ try:
         GLM4V_AVAILABLE = False
         Glm4vForConditionalGeneration = None
         Glm4vImageProcessor = None
+        Glm4vVideoProcessor = None
         Glm4vProcessor = None
         print(f"Note: GLM-4V not available: {glm_err}")
 except ImportError as e:
@@ -558,6 +560,9 @@ class Qwen3VLMBackend:
                     # Load native image processor
                     image_processor = Glm4vImageProcessor.from_pretrained(model_path)
 
+                    # Load native video processor (REQUIRED by Glm4vProcessor)
+                    video_processor = Glm4vVideoProcessor.from_pretrained(model_path)
+
                     # Load chat template
                     chat_template_path = os.path.join(model_path, "chat_template.jinja")
                     chat_template = None
@@ -565,10 +570,11 @@ class Qwen3VLMBackend:
                         with open(chat_template_path, "r") as f:
                             chat_template = f.read()
 
-                    # Use native Glm4vProcessor
+                    # Use native Glm4vProcessor (requires image_processor, tokenizer, AND video_processor)
                     self.processor = Glm4vProcessor(
                         image_processor=image_processor,
                         tokenizer=tokenizer,
+                        video_processor=video_processor,
                         chat_template=chat_template,
                     )
                     print(f"Loaded GLM processor for {model_name}")

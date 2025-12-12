@@ -690,7 +690,24 @@ class Qwen3VLMBackend:
                 if model_type_from_config in ["glm4v", "glm46v"]:
                     if not GLM4V_AVAILABLE:
                         return "Error: GLM-4V not available. Requires transformers >= 4.57"
+
+                    # CRITICAL: Patch config for transformers 4.57 compatibility
+                    # GLM-4.6V config uses "rope_parameters" (5.0.0rc0 format)
+                    # but transformers 4.57.3 expects "rope_scaling" (old format)
+                    from transformers import AutoConfig
+                    glm_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+                    # Check if text_config has rope_parameters but no rope_scaling
+                    if hasattr(glm_config, 'text_config'):
+                        text_cfg = glm_config.text_config
+                        if hasattr(text_cfg, 'rope_parameters') and text_cfg.rope_parameters is not None:
+                            if not hasattr(text_cfg, 'rope_scaling') or text_cfg.rope_scaling is None:
+                                # Copy rope_parameters to rope_scaling for 4.57 compatibility
+                                text_cfg.rope_scaling = text_cfg.rope_parameters
+                                print(f"[GLM] Patched config: rope_parameters -> rope_scaling")
+
                     print("Loading as GLM-4V model using native Glm4vForConditionalGeneration...")
+                    model_kwargs["config"] = glm_config
                     self.model = Glm4vForConditionalGeneration.from_pretrained(**model_kwargs)
                     print("Loaded as GLM-4V model")
                     loaded = True

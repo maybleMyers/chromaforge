@@ -513,22 +513,28 @@ class LlamaCppVLM:
                 )
 
                 accumulated = ""
+                token_count = 0
                 for chunk in response_stream:
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content", "")
                     if content:
                         accumulated += content
-                        # Yield both raw (with thinking) and cleaned versions
+                        token_count += 1
+                        # Calculate current speed
+                        elapsed = time.perf_counter() - start_time
+                        tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
                         # Clean up thinking tags for display
                         if "</think>" in accumulated:
                             display_text = accumulated.split("</think>")[-1].strip()
                         else:
                             display_text = accumulated
-                        yield display_text, accumulated
+                        # Yield display_text, raw_text, and stats
+                        yield display_text, accumulated, f"{tokens_per_sec:.1f} tok/s"
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
-                print(f"[llama.cpp] Streamed response in {generation_time:.2f}s")
+                final_speed = token_count / generation_time if generation_time > 0 else 0
+                print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
 
             else:
                 # Non-streaming mode
@@ -612,7 +618,7 @@ def chat_handler(
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
-        yield error_history, ""
+        yield error_history, "", ""
         return
 
     # Build messages list for the model
@@ -689,7 +695,8 @@ def chat_handler(
     new_history.append({"role": "assistant", "content": ""})
 
     # Stream the response
-    for display_text, raw_text in vlm_manager.generate(
+    stats = ""
+    for display_text, raw_text, stats in vlm_manager.generate(
         messages=messages,
         max_new_tokens=max_tokens,
         temperature=temperature,
@@ -701,7 +708,7 @@ def chat_handler(
             new_history[-1]["content"] = raw_text
         else:
             new_history[-1]["content"] = display_text
-        yield new_history, ""
+        yield new_history, "", stats
 
 
 def clear_chat_handler():
@@ -859,11 +866,17 @@ def create_ui():
                     send_btn = gr.Button("Send", variant="primary", scale=1)
 
                 with gr.Row():
-                    clear_btn = gr.Button("Clear Chat")
+                    clear_btn = gr.Button("Clear Chat", scale=2)
                     show_thinking = gr.Checkbox(
                         label="Show Thinking",
                         value=False,
-                        info="Display model's reasoning process",
+                        scale=1,
+                    )
+                    stats_display = gr.Textbox(
+                        label="Speed",
+                        value="",
+                        interactive=False,
+                        scale=1,
                     )
 
             # Batch Caption Tab
@@ -994,15 +1007,15 @@ def create_ui():
 
         def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, vid_frames, thinking):
             if not msg.strip() and img is None and vid is None:
-                yield history, "", None, None
+                yield history, "", None, None, ""
                 return
 
             # Stream responses from chat_handler generator
-            for new_history, _ in chat_handler(
+            for new_history, _, stats in chat_handler(
                 msg, history, sys_prompt, img, vid,
                 max_tok, temp, vid_frames, thinking
             ):
-                yield new_history, "", None, None
+                yield new_history, "", None, None, stats
 
         send_btn.click(
             fn=send_message,
@@ -1010,7 +1023,7 @@ def create_ui():
                 msg_input, chatbot, system_prompt, image_input, video_input,
                 max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input, video_input],
+            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
         )
 
         msg_input.submit(
@@ -1019,7 +1032,7 @@ def create_ui():
                 msg_input, chatbot, system_prompt, image_input, video_input,
                 max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input, video_input],
+            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
         )
 
         clear_btn.click(

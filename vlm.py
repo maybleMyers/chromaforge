@@ -408,7 +408,8 @@ class LlamaCppVLM:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         video_max_frames: int = 8,
-    ) -> str:
+        stream: bool = False,
+    ):
         """
         Generate a response.
 
@@ -418,9 +419,10 @@ class LlamaCppVLM:
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             video_max_frames: Max frames for video processing
+            stream: If True, yields partial responses as a generator
 
         Returns:
-            Generated response string
+            Generated response string, or generator if stream=True
         """
         if self.model is None:
             return "Error: No model loaded. Please load a model first."
@@ -501,24 +503,53 @@ class LlamaCppVLM:
             # Generate response
             start_time = time.perf_counter()
 
-            response = self.model.create_chat_completion(
-                messages=llama_messages,
-                max_tokens=max_new_tokens,
-                temperature=temperature if temperature > 0 else 0.001,
-            )
+            if stream:
+                # Streaming mode - yield partial responses
+                response_stream = self.model.create_chat_completion(
+                    messages=llama_messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature if temperature > 0 else 0.001,
+                    stream=True,
+                )
 
-            end_time = time.perf_counter()
-            generation_time = end_time - start_time
-            print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
+                accumulated = ""
+                for chunk in response_stream:
+                    delta = chunk["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        accumulated += content
+                        # Yield both raw (with thinking) and cleaned versions
+                        # Clean up thinking tags for display
+                        if "</think>" in accumulated:
+                            display_text = accumulated.split("</think>")[-1].strip()
+                        else:
+                            display_text = accumulated
+                        yield display_text, accumulated
 
-            # Extract response content
-            result = response["choices"][0]["message"]["content"]
+                end_time = time.perf_counter()
+                generation_time = end_time - start_time
+                print(f"[llama.cpp] Streamed response in {generation_time:.2f}s")
 
-            # Clean up thinking tags if present
-            if "</think>" in result:
-                result = result.split("</think>")[-1].strip()
+            else:
+                # Non-streaming mode
+                response = self.model.create_chat_completion(
+                    messages=llama_messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature if temperature > 0 else 0.001,
+                )
 
-            return result
+                end_time = time.perf_counter()
+                generation_time = end_time - start_time
+                print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
+
+                # Extract response content
+                result = response["choices"][0]["message"]["content"]
+
+                # Clean up thinking tags if present
+                if "</think>" in result:
+                    result = result.split("</think>")[-1].strip()
+
+                return result
 
         except Exception as e:
             import traceback
@@ -574,13 +605,15 @@ def chat_handler(
     max_tokens: int,
     temperature: float,
     video_max_frames: int = 8,
+    show_thinking: bool = False,
 ):
-    """Handle chat messages from UI."""
+    """Handle chat messages from UI with streaming support."""
     if vlm_manager is None or vlm_manager.model is None:
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
-        return error_history, ""
+        yield error_history, ""
+        return
 
     # Build messages list for the model
     messages = []
@@ -623,15 +656,7 @@ def chat_handler(
 
     messages.append({"role": "user", "content": model_content})
 
-    # Generate response
-    response = vlm_manager.generate(
-        messages=messages,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        video_max_frames=video_max_frames,
-    )
-
-    # Build display content for chatbot
+    # Build initial display content for chatbot
     new_history = list(history)
 
     if image is not None:
@@ -641,27 +666,34 @@ def chat_handler(
         image.save(temp_path)
 
         display_text = message if message else "Describe this image"
-
-        # Add user text message first
         new_history.append({"role": "user", "content": display_text})
-        # Add the image as a separate user message using gr.Image component
         new_history.append({"role": "user", "content": gr.Image(temp_path)})
-        new_history.append({"role": "assistant", "content": response})
 
     elif video is not None:
         display_text = message if message else "Describe this video"
-
-        # Add user text message first
         new_history.append({"role": "user", "content": display_text})
-        # Add the video as a separate user message using gr.Video component
         new_history.append({"role": "user", "content": gr.Video(video)})
-        new_history.append({"role": "assistant", "content": response})
 
     else:
         new_history.append({"role": "user", "content": message})
-        new_history.append({"role": "assistant", "content": response})
 
-    return new_history, ""
+    # Add empty assistant message that we'll stream into
+    new_history.append({"role": "assistant", "content": ""})
+
+    # Stream the response
+    for display_text, raw_text in vlm_manager.generate(
+        messages=messages,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        video_max_frames=video_max_frames,
+        stream=True,
+    ):
+        # Show thinking if enabled, otherwise show cleaned text
+        if show_thinking:
+            new_history[-1]["content"] = raw_text
+        else:
+            new_history[-1]["content"] = display_text
+        yield new_history, ""
 
 
 def clear_chat_handler():
@@ -818,7 +850,13 @@ def create_ui():
                     )
                     send_btn = gr.Button("Send", variant="primary", scale=1)
 
-                clear_btn = gr.Button("Clear Chat")
+                with gr.Row():
+                    clear_btn = gr.Button("Clear Chat")
+                    show_thinking = gr.Checkbox(
+                        label="Show Thinking",
+                        value=False,
+                        info="Display model's reasoning process",
+                    )
 
             # Batch Caption Tab
             with gr.TabItem("Batch Caption"):
@@ -946,21 +984,23 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, vid_frames):
+        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, vid_frames, thinking):
             if not msg.strip() and img is None and vid is None:
-                return history, "", None, None
+                yield history, "", None, None
+                return
 
-            new_history, _ = chat_handler(
+            # Stream responses from chat_handler generator
+            for new_history, _ in chat_handler(
                 msg, history, sys_prompt, img, vid,
-                max_tok, temp, vid_frames
-            )
-            return new_history, "", None, None
+                max_tok, temp, vid_frames, thinking
+            ):
+                yield new_history, "", None, None
 
         send_btn.click(
             fn=send_message,
             inputs=[
                 msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, video_max_frames
+                max_tokens, temperature, video_max_frames, show_thinking
             ],
             outputs=[chatbot, msg_input, image_input, video_input],
         )
@@ -969,7 +1009,7 @@ def create_ui():
             fn=send_message,
             inputs=[
                 msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, video_max_frames
+                max_tokens, temperature, video_max_frames, show_thinking
             ],
             outputs=[chatbot, msg_input, image_input, video_input],
         )

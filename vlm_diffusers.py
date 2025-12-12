@@ -191,9 +191,19 @@ try:
     except ImportError:
         QWEN3_VL_AVAILABLE = False
         print("Note: Qwen3VLMoeForConditionalGeneration not available, will use fallback classes")
+
+    # Try to import GLM-4.6V classes (requires transformers >= 4.47.0 or main branch)
+    try:
+        from transformers import Glm46VForConditionalGeneration, Glm46VProcessor
+        GLM46V_AVAILABLE = True
+        print("GLM-4.6V support: available")
+    except ImportError:
+        GLM46V_AVAILABLE = False
+        print("Note: GLM-4.6V not available. Upgrade transformers: pip install git+https://github.com/huggingface/transformers")
 except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
     QWEN3_VL_AVAILABLE = False
+    GLM46V_AVAILABLE = False
     print(f"Error: transformers not installed or incompatible version: {e}")
 
 try:
@@ -508,9 +518,16 @@ class Qwen3VLMBackend:
 
             # Load processor or tokenizer based on model type
             if model_type in ["qwen-vl", "glm-vl"]:
+                # GLM models use use_fast=True for processor
+                processor_kwargs = {
+                    "trust_remote_code": True,
+                }
+                if model_type == "glm-vl":
+                    processor_kwargs["use_fast"] = True
+
                 self.processor = AutoProcessor.from_pretrained(
                     model_path,
-                    trust_remote_code=True,
+                    **processor_kwargs,
                 )
                 print(f"Loaded processor for {model_name}")
             else:
@@ -613,12 +630,16 @@ class Qwen3VLMBackend:
 
                 loaded = False
 
-                # For GLM-4V models (GLM-4.6V-Flash, etc.)
-                # Uses custom Glm4vForConditionalGeneration class with trust_remote_code
+                # For GLM-4.6V models (GLM-4.6V-Flash, etc.)
                 if model_type_from_config == "glm4v":
-                    print("Loading as GLM-4V model using AutoModelForVision2Seq...")
-                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
-                    print("Loaded as GLM-4V model (via AutoModelForVision2Seq)")
+                    if not GLM46V_AVAILABLE:
+                        return (
+                            "Error: GLM-4.6V requires a newer transformers version.\n"
+                            "Install with: pip install git+https://github.com/huggingface/transformers"
+                        )
+                    print("Loading as GLM-4.6V model using Glm46VForConditionalGeneration...")
+                    self.model = Glm46VForConditionalGeneration.from_pretrained(**model_kwargs)
+                    print("Loaded as GLM-4.6V model")
                     loaded = True
 
                 # For Qwen3-VL models, use AutoModelForVision2Seq which loads model's custom code
@@ -1040,49 +1061,79 @@ class Qwen3VLMBackend:
                 vid_content.append({"type": "text", "text": "Describe this video."})
                 conversation.append({"role": "user", "content": vid_content})
 
-        # Apply chat template
-        text = self.processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        # Process images/videos
-        # Use qwen_vl_utils for Qwen models, manual extraction for GLM and others
+        # Check if this is a GLM model
         is_glm_model = self.current_model_type == "glm-vl"
 
-        if QWEN_VL_UTILS_AVAILABLE and not is_glm_model:
-            image_inputs, video_inputs = process_vision_info(conversation)
-        else:
-            # Manual extraction for GLM and fallback for other models
+        if is_glm_model:
+            # GLM uses apply_chat_template with tokenize=True for combined processing
+            # Extract images from conversation for GLM
             image_inputs = []
-            video_inputs = []
             for msg in conversation:
                 content = msg.get("content", [])
                 if isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict):
-                            if item.get("type") == "image":
-                                img_path = item.get("image")
-                                if img_path:
-                                    if isinstance(img_path, str):
-                                        image_inputs.append(Image.open(img_path))
-                                    elif isinstance(img_path, Image.Image):
-                                        image_inputs.append(img_path)
-                            elif item.get("type") == "video":
-                                vid_path = item.get("video")
-                                if vid_path:
-                                    frames = extract_video_frames(vid_path, max_frames=video_max_frames)
-                                    video_inputs.append(frames)
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            img_path = item.get("image")
+                            if img_path:
+                                if isinstance(img_path, str):
+                                    image_inputs.append(Image.open(img_path))
+                                elif isinstance(img_path, Image.Image):
+                                    image_inputs.append(img_path)
 
-        # Prepare inputs
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs if image_inputs else None,
-            videos=video_inputs if video_inputs else None,
-            padding=True,
-            return_tensors="pt",
-        )
+            # GLM's apply_chat_template handles tokenization directly
+            inputs = self.processor.apply_chat_template(
+                conversation,
+                images=image_inputs if image_inputs else None,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            # Remove token_type_ids if present (GLM-specific)
+            inputs.pop("token_type_ids", None)
+        else:
+            # Qwen and other models: two-step process
+            # Apply chat template (text only)
+            text = self.processor.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            # Process images/videos
+            # Use qwen_vl_utils for Qwen models, manual extraction for others
+            if QWEN_VL_UTILS_AVAILABLE:
+                image_inputs, video_inputs = process_vision_info(conversation)
+            else:
+                # Manual extraction fallback
+                image_inputs = []
+                video_inputs = []
+                for msg in conversation:
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                if item.get("type") == "image":
+                                    img_path = item.get("image")
+                                    if img_path:
+                                        if isinstance(img_path, str):
+                                            image_inputs.append(Image.open(img_path))
+                                        elif isinstance(img_path, Image.Image):
+                                            image_inputs.append(img_path)
+                                elif item.get("type") == "video":
+                                    vid_path = item.get("video")
+                                    if vid_path:
+                                        frames = extract_video_frames(vid_path, max_frames=video_max_frames)
+                                        video_inputs.append(frames)
+
+            # Prepare inputs via processor
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs if image_inputs else None,
+                videos=video_inputs if video_inputs else None,
+                padding=True,
+                return_tensors="pt",
+            )
 
         # Move inputs to the appropriate device
         if hasattr(self.model, "hf_device_map"):
@@ -1789,11 +1840,12 @@ def main():
 
     print("=" * 60)
     print("Chromaforge VLM Chat (Diffusers/Transformers Backend)")
-    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4V")
+    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4.6V")
     print("=" * 60)
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
     print(f"qwen-vl-utils: {'available' if QWEN_VL_UTILS_AVAILABLE else 'NOT INSTALLED (optional, only for Qwen)'}")
+    print(f"GLM-4.6V: {'available' if GLM46V_AVAILABLE else 'NOT AVAILABLE (upgrade: pip install git+https://github.com/huggingface/transformers)'}")
     print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")
     if args.listen:

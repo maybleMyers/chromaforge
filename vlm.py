@@ -134,6 +134,7 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
     """
     Find GGUF models in a directory.
     Returns list of dicts with 'name', 'model_path', and optional 'mmproj_path'.
+    Uses the folder name as the display name instead of the GGUF filename.
     """
     models = []
     models_path = Path(models_dir)
@@ -143,16 +144,24 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
 
     # Look for .gguf files
     for gguf_file in models_path.rglob("*.gguf"):
-        name = gguf_file.stem
+        file_stem = gguf_file.stem
         model_path = str(gguf_file)
 
         # Skip mmproj/clip files as main models
-        if any(x in name.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
+        if any(x in file_stem.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
             continue
+
+        # Use folder name as display name instead of file name
+        parent = gguf_file.parent
+        if parent == models_path:
+            # File is directly in models_dir, use file stem
+            name = file_stem
+        else:
+            # File is in a subdirectory, use folder name
+            name = parent.name
 
         # Try to find matching mmproj file for vision models
         mmproj_path = None
-        parent = gguf_file.parent
 
         # Common mmproj naming patterns
         mmproj_patterns = [
@@ -243,7 +252,7 @@ class LlamaCppVLM:
             model_path_lower = model_path.lower()
             is_qwen_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen", "qwen2-vl", "qwen3-vl", "qwen2.5-vl"])
             is_llava = any(x in model_name_lower or x in model_path_lower for x in ["llava", "llava-v1"])
-            
+
             # More specific detection
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
@@ -289,17 +298,17 @@ class LlamaCppVLM:
                     # Try handlers in order of likelihood based on model name
                     print("[llama.cpp] Trying chat handlers in order...")
                     handlers_to_try = []
-                    
+
                     # If it looks like a Qwen3 model, try Qwen3VL first
                     if is_qwen3_specific and QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None:
                         handlers_to_try.append(("Qwen3VL", Qwen3VLChatHandler))
-                    
+
                     # Then try other handlers
                     if QWEN_VL_AVAILABLE and Qwen25VLChatHandler is not None and ("Qwen25VL", Qwen25VLChatHandler) not in handlers_to_try:
                         handlers_to_try.append(("Qwen25VL", Qwen25VLChatHandler))
                     if QWEN3_VL_AVAILABLE and Qwen3VLChatHandler is not None and ("Qwen3VL", Qwen3VLChatHandler) not in handlers_to_try:
                         handlers_to_try.append(("Qwen3VL", Qwen3VLChatHandler))
-                    
+
                     # Try Llama3VisionAlphaChatHandler for Qwen models
                     try:
                         from llama_cpp.llama_chat_format import Llama3VisionAlphaChatHandler
@@ -309,7 +318,7 @@ class LlamaCppVLM:
                             handlers_to_try.append(("Llama3VisionAlpha", Llama3VisionAlphaChatHandler))
                     except ImportError:
                         pass
-                    
+
                     handlers_to_try.extend([
                         ("Llava16", Llava16ChatHandler),
                         ("Llava15", Llava15ChatHandler),
@@ -647,7 +656,7 @@ def chat_handler(
         # Add the video as a separate user message using gr.Video component
         new_history.append({"role": "user", "content": gr.Video(video)})
         new_history.append({"role": "assistant", "content": response})
-        
+
     else:
         new_history.append({"role": "user", "content": message})
         new_history.append({"role": "assistant", "content": response})
@@ -767,60 +776,129 @@ def create_ui():
     initial_models = vlm_manager.get_model_names() if vlm_manager else ["Initialize manager first"]
 
     with gr.Blocks(title="Chromaforge VLM (llama.cpp)", theme=vlm_theme, css=vlm_css) as demo:
-        gr.Markdown("# Chromaforge VLM Chat (llama.cpp Backend)")
-        gr.Markdown("Load GGUF vision models and chat with images/video. Fully local, GPU accelerated.")
 
-        with gr.Row():
-            # Left column - Settings
-            with gr.Column(scale=1):
-                gr.Markdown("### Model Selection")
+        with gr.Tabs():
+            # Chat Tab
+            with gr.TabItem("Chat"):
+                # Chat interface at top - full width
+                chatbot = gr.Chatbot(
+                    label="Conversation",
+                    height=500,
+                    type="messages",
+                )
 
+                # Media inputs row
                 with gr.Row():
-                    model_dropdown = gr.Dropdown(
-                        label="Select Model",
-                        choices=initial_models,
-                        value=initial_models[0] if initial_models else None,
-                        interactive=True,
-                        scale=4,
+                    with gr.Column(scale=1):
+                        image_input = gr.Image(
+                            label="Upload Image (optional)",
+                            type="pil",
+                            height=300,
+                        )
+                    with gr.Column(scale=1):
+                        video_input = gr.Video(
+                            label="Upload Video (optional)",
+                            height=300,
+                        )
+
+                # Message input row
+                with gr.Row():
+                    msg_input = gr.Textbox(
+                        label="Message",
+                        placeholder="Type your message here...",
+                        lines=2,
+                        scale=5,
                     )
-                    refresh_models_btn = gr.Button("", scale=1, min_width=40)
+                    send_btn = gr.Button("Send", variant="primary", scale=1)
 
-                gr.Markdown("### GPU Settings")
-                n_gpu_layers = gr.Slider(
-                    minimum=-1,
-                    maximum=100,
-                    value=-1,
-                    step=1,
-                    label="GPU Layers (-1 = all)",
-                    info="Number of layers to offload to GPU",
-                )
-                n_ctx = gr.Slider(
-                    minimum=512,
-                    maximum=200000,
-                    value=32768,
-                    step=512,
-                    label="Context Length",
+                clear_btn = gr.Button("Clear Chat")
+
+            # Batch Caption Tab
+            with gr.TabItem("Batch Caption"):
+                gr.Markdown("Generate captions for all images in a folder. Outputs .txt files with matching names.")
+
+                batch_folder = gr.Textbox(
+                    label="Folder Path",
+                    placeholder="Enter the full path to folder containing images...",
+                    lines=1,
                 )
 
-                with gr.Row():
-                    load_model_btn = gr.Button("Load Model", variant="primary")
-                    unload_model_btn = gr.Button("Unload", variant="secondary")
+                batch_system_prompt = gr.Textbox(
+                    label="System Prompt",
+                    placeholder="System instructions for captioning...",
+                    lines=3,
+                    value="You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
+                )
 
+                batch_prompt = gr.Textbox(
+                    label="Caption Prompt",
+                    placeholder="Describe this image in detail.",
+                    lines=2,
+                    value="Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
+                )
+
+                batch_start_btn = gr.Button("Start Batch Captioning", variant="primary", elem_classes=["green-btn"])
+
+                batch_output = gr.Textbox(
+                    label="Output",
+                    lines=15,
+                    interactive=False,
+                )
+
+        # Settings section below chat - in accordions
+        with gr.Accordion("Model Settings", open=True):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        model_dropdown = gr.Dropdown(
+                            label="Select Model",
+                            choices=initial_models,
+                            value=initial_models[0] if initial_models else None,
+                            interactive=True,
+                            scale=4,
+                        )
+                        refresh_models_btn = gr.Button("Refresh", scale=1, min_width=80)
+
+                with gr.Column(scale=1):
+                    n_gpu_layers = gr.Slider(
+                        minimum=-1,
+                        maximum=100,
+                        value=-1,
+                        step=1,
+                        label="GPU Layers (-1 = all)",
+                        info="Layers to offload to GPU",
+                    )
+
+                with gr.Column(scale=1):
+                    n_ctx = gr.Slider(
+                        minimum=512,
+                        maximum=200000,
+                        value=32768,
+                        step=512,
+                        label="Context Length",
+                    )
+
+            with gr.Row():
+                load_model_btn = gr.Button("Load Model", variant="primary")
+                unload_model_btn = gr.Button("Unload", variant="secondary")
                 status_display = gr.Textbox(
                     label="Status",
                     value="No model loaded",
                     interactive=False,
+                    scale=3,
                 )
 
-                gr.Markdown("### System Prompt")
+        with gr.Accordion("Generation Settings", open=False):
+            with gr.Row():
                 system_prompt = gr.Textbox(
                     label="System Prompt",
                     placeholder="Enter a system prompt to guide the model's behavior...",
-                    lines=4,
+                    lines=2,
                     value="You are a helpful AI assistant that can understand and describe images and videos in detail.",
+                    scale=3,
                 )
 
-                gr.Markdown("### Generation Settings")
+            with gr.Row():
                 max_tokens = gr.Slider(
                     minimum=64,
                     maximum=2048,
@@ -835,83 +913,14 @@ def create_ui():
                     step=0.1,
                     label="Temperature",
                 )
-
-                gr.Markdown("### Video Settings")
                 video_max_frames = gr.Slider(
                     minimum=1,
                     maximum=201,
                     value=8,
                     step=1,
                     label="Max Video Frames",
-                    info="Number of frames to extract from videos",
+                    info="Frames to extract from videos",
                 )
-
-            # Right column - Chat/Batch tabs
-            with gr.Column(scale=2):
-                with gr.Tabs():
-                    # Chat Tab
-                    with gr.TabItem("Chat"):
-                        chatbot = gr.Chatbot(
-                            label="Conversation",
-                            height=400,
-                            type="messages",
-                        )
-
-                        with gr.Row():
-                            with gr.Column(scale=1):
-                                image_input = gr.Image(
-                                    label="Upload Image (optional)",
-                                    type="pil",
-                                    height=150,
-                                )
-                            with gr.Column(scale=1):
-                                video_input = gr.Video(
-                                    label="Upload Video (optional)",
-                                    height=150,
-                                )
-
-                        with gr.Row():
-                            msg_input = gr.Textbox(
-                                label="Message",
-                                placeholder="Type your message here...",
-                                lines=2,
-                                scale=4,
-                            )
-                            send_btn = gr.Button("Send", variant="primary", scale=1)
-
-                        clear_btn = gr.Button("Clear Chat")
-
-                    # Batch Caption Tab
-                    with gr.TabItem("Batch Caption"):
-                        gr.Markdown("Generate captions for all images in a folder. Outputs .txt files with matching names.")
-
-                        batch_folder = gr.Textbox(
-                            label="Folder Path",
-                            placeholder="Enter the full path to folder containing images...",
-                            lines=1,
-                        )
-
-                        batch_system_prompt = gr.Textbox(
-                            label="System Prompt",
-                            placeholder="System instructions for captioning...",
-                            lines=3,
-                            value="You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
-                        )
-
-                        batch_prompt = gr.Textbox(
-                            label="Caption Prompt",
-                            placeholder="Describe this image in detail.",
-                            lines=2,
-                            value="Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
-                        )
-
-                        batch_start_btn = gr.Button("Start Batch Captioning", variant="primary", elem_classes=["green-btn"])
-
-                        batch_output = gr.Textbox(
-                            label="Output",
-                            lines=15,
-                            interactive=False,
-                        )
 
         # Event handlers
         refresh_models_btn.click(

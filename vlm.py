@@ -660,19 +660,27 @@ def chat_handler(
     new_history = list(history)
 
     if image is not None:
-        # Save image to temp file for display
+        # Resize image to 150px height for chat display
+        orig_width, orig_height = image.size
+        new_height = 150
+        new_width = int(orig_width * (new_height / orig_height))
+        display_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Save resized image to temp file for display
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"vlm_chat_{int(time.time())}_{id(image)}.png")
-        image.save(temp_path)
+        display_image.save(temp_path)
 
         display_text = message if message else "Describe this image"
         new_history.append({"role": "user", "content": display_text})
-        new_history.append({"role": "user", "content": gr.Image(temp_path)})
+        # Use dict with "path" key for file content in chatbot
+        new_history.append({"role": "user", "content": {"path": temp_path}})
 
     elif video is not None:
         display_text = message if message else "Describe this video"
         new_history.append({"role": "user", "content": display_text})
-        new_history.append({"role": "user", "content": gr.Video(video)})
+        # Use dict with "path" key for file content in chatbot
+        new_history.append({"role": "user", "content": {"path": video}})
 
     else:
         new_history.append({"role": "user", "content": message})

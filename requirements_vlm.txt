@@ -28,7 +28,10 @@
 qwen-vl-utils>=0.0.14
 
 # Transformers backend
-transformers>=4.51.0
+# NOTE: GLM-4.6V-Flash requires transformers >= 5.0.0rc0
+# Install from PyPI: pip install transformers>=5.0.0rc0
+# Or from GitHub main: pip install git+https://github.com/huggingface/transformers
+transformers>=5.0.0rc0
 accelerate
 safetensors
 

@@ -198,6 +198,7 @@ try:
             Glm46VForConditionalGeneration,
             Glm46VProcessor,
             Glm46VConfig,
+            Glm46VImageProcessor,
         )
         GLM46V_AVAILABLE = True
         print("GLM-4.6V support: available (local backend)")
@@ -523,14 +524,24 @@ class Qwen3VLMBackend:
             # Load processor or tokenizer based on model type
             if model_type in ["qwen-vl", "glm-vl"]:
                 if model_type == "glm-vl" and GLM46V_AVAILABLE:
-                    # Use local GLM processor
-                    self.processor = Glm46VProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
+                    # Manually construct GLM processor from components
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    image_processor = Glm46VImageProcessor.from_pretrained(model_path)
+                    # Load chat template
+                    chat_template_path = os.path.join(model_path, "chat_template.jinja")
+                    chat_template = None
+                    if os.path.exists(chat_template_path):
+                        with open(chat_template_path, "r") as f:
+                            chat_template = f.read()
+                    self.processor = Glm46VProcessor(
+                        image_processor=image_processor,
+                        tokenizer=tokenizer,
+                        video_processor=None,
+                        chat_template=chat_template,
                     )
                     print(f"Loaded GLM processor for {model_name}")
                 else:
-                    # Use AutoProcessor for Qwen and fallback
+                    # Use AutoProcessor for Qwen
                     self.processor = AutoProcessor.from_pretrained(
                         model_path,
                         trust_remote_code=True,

@@ -21,53 +21,98 @@
 
 
 from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
-from transformers import AutoConfig
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+
+class Glm4vVisionConfig(PreTrainedConfig):
+    """Configuration for GLM-4V vision encoder."""
+    model_type = "glm4v_vision"
+
+    def __init__(
+        self,
+        hidden_size=1536,
+        intermediate_size=13696,
+        num_heads=12,
+        depth=24,
+        patch_size=14,
+        image_size=336,
+        in_channels=3,
+        hidden_act="silu",
+        attention_dropout=0.0,
+        hidden_dropout_prob=0.0,
+        initializer_range=0.02,
+        rms_norm_eps=1e-5,
+        out_hidden_size=4096,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        attention_bias=False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_heads = num_heads
+        self.depth = depth
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.in_channels = in_channels
+        self.hidden_act = hidden_act
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.out_hidden_size = out_hidden_size
+        self.spatial_merge_size = spatial_merge_size
+        self.temporal_patch_size = temporal_patch_size
+        self.attention_bias = attention_bias
+
+
+class Glm4vTextConfig(PreTrainedConfig):
+    """Configuration for GLM-4V text decoder."""
+    model_type = "glm4v_text"
+
+    def __init__(
+        self,
+        vocab_size=151552,
+        hidden_size=4096,
+        intermediate_size=13696,
+        num_hidden_layers=40,
+        num_attention_heads=32,
+        num_key_value_heads=2,
+        hidden_act="silu",
+        max_position_embeddings=131072,
+        initializer_range=0.02,
+        rms_norm_eps=1e-5,
+        use_cache=True,
+        pad_token_id=151329,
+        eos_token_id=None,
+        attention_bias=True,
+        attention_dropout=0.0,
+        rope_theta=500000,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.rope_theta = rope_theta
 
 
 class Glm46VConfig(PreTrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`Glm4vModel`]. It is used to instantiate a
-    GLM-4.6V model according to the specified arguments, defining the model architecture. Instantiating a
-    configuration with the defaults will yield a similar configuration to that of
-    GLM-4.1V-9B-Thinking [zai-org/GLM-4.1V-9B-Thinking](https://huggingface.co/zai-org/GLM-4.1V-9B-Thinking).
-
-    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PreTrainedConfig`] for more information.
-
-    Args:
-        text_config (`Union[PreTrainedConfig, dict]`, *optional*, defaults to `Glm4vTextConfig`):
-            The config object or dictionary of the text backbone.
-        vision_config (`Union[PreTrainedConfig, dict]`,  *optional*, defaults to `Glm4vVisionConfig`):
-            The config object or dictionary of the vision backbone.
-        image_token_id (`int`, *optional*, defaults to 151343):
-            The image token index to encode the image prompt.
-        video_token_id (`int`, *optional*, defaults to 151344):
-            The video token index to encode the image prompt.
-        image_start_token_id (`int`, *optional*, defaults to 151339):
-            The image start token index to encode the start of image.
-        image_end_token_id (`int`, *optional*, defaults to 151340):
-            The image end token index to encode the end of image.
-        video_start_token_id (`int`, *optional*, defaults to 151361):
-            The video start token index to encode the start of video.
-        video_end_token_id (`int`, *optional*, defaults to 151362):
-            The video end token index to encode the end of video.
-
-    ```python
-    >>> from transformers import Glm46VForConditionalGeneration, Glm46VConfig
-
-    >>> # Initializing a GLM-4.6V style configuration
-    >>> configuration = Glm46VConfig()
-
-    >>> # Initializing a model from the GLM-4.6V style configuration
-    >>> model = Glm4vForConditionalGeneration(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
+    """Configuration for GLM-4.6V model."""
 
     model_type = "glm46v"
-    sub_configs = {"text_config": AutoConfig, "vision_config": AutoConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -82,17 +127,21 @@ class Glm46VConfig(PreTrainedConfig):
         video_end_token_id=151362,
         **kwargs,
     ):
+        # Handle vision config
         if isinstance(vision_config, dict):
-            vision_config["model_type"] = vision_config.get("model_type", "glm4v_vision")
-            self.vision_config = CONFIG_MAPPING[vision_config["model_type"]](**vision_config)
+            self.vision_config = Glm4vVisionConfig(**vision_config)
         elif vision_config is None:
-            self.vision_config = CONFIG_MAPPING["glm4v_vision"]()
+            self.vision_config = Glm4vVisionConfig()
+        else:
+            self.vision_config = vision_config
 
+        # Handle text config
         if isinstance(text_config, dict):
-            text_config["model_type"] = text_config.get("model_type", "glm4v_text")
-            self.text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
+            self.text_config = Glm4vTextConfig(**text_config)
         elif text_config is None:
-            self.text_config = CONFIG_MAPPING["glm4v_text"]()
+            self.text_config = Glm4vTextConfig()
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

@@ -1,7 +1,7 @@
 # GLM-4.6V model implementation
 # Adapted from HuggingFace transformers for local use
 
-from .configuration_glm46v import Glm46VConfig
+from .configuration_glm46v import Glm46VConfig, Glm4vVisionConfig, Glm4vTextConfig
 from .modeling_glm46v import (
     Glm46VForConditionalGeneration,
     Glm46VModel,

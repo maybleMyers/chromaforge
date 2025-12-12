@@ -44,6 +44,7 @@ except ImportError:
 
 @auto_docstring
 class Glm46VPreTrainedModel(PreTrainedModel):
+    config_class = Glm46VConfig
     config: Glm46VConfig
     base_model_prefix = "model"
     input_modalities = ("image", "video", "text")

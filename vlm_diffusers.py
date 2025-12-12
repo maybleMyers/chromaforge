@@ -526,14 +526,42 @@ class Qwen3VLMBackend:
                 if model_type == "glm-vl" and GLM46V_AVAILABLE:
                     # Manually construct GLM processor from components
                     from transformers import PreTrainedTokenizerFast
-                    tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
+                    from tokenizers import Tokenizer as TokenizerFast
+
+                    # Load tokenizer directly from tokenizer.json (bypasses tokenizer_config issues)
+                    tokenizer_file = os.path.join(model_path, "tokenizer.json")
+                    tokenizer_config_file = os.path.join(model_path, "tokenizer_config.json")
+
+                    tokenizer_object = TokenizerFast.from_file(tokenizer_file)
+
+                    # Load config for special tokens
+                    with open(tokenizer_config_file, 'r') as f:
+                        tokenizer_config = json.load(f)
+
+                    # Create fast tokenizer with proper special tokens
+                    tokenizer = PreTrainedTokenizerFast(
+                        tokenizer_object=tokenizer_object,
+                        eos_token=tokenizer_config.get("eos_token", "<|endoftext|>"),
+                        pad_token=tokenizer_config.get("pad_token", "<|endoftext|>"),
+                        model_max_length=tokenizer_config.get("model_max_length", 128000),
+                        padding_side=tokenizer_config.get("padding_side", "left"),
+                    )
+
+                    # Add additional special tokens
+                    additional_special = tokenizer_config.get("additional_special_tokens", [])
+                    if additional_special:
+                        tokenizer.add_special_tokens({"additional_special_tokens": additional_special})
+
+                    # Load image processor
                     image_processor = Glm46VImageProcessor.from_pretrained(model_path)
+
                     # Load chat template
                     chat_template_path = os.path.join(model_path, "chat_template.jinja")
                     chat_template = None
                     if os.path.exists(chat_template_path):
                         with open(chat_template_path, "r") as f:
                             chat_template = f.read()
+
                     self.processor = Glm46VProcessor(
                         image_processor=image_processor,
                         tokenizer=tokenizer,

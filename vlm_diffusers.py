@@ -784,6 +784,20 @@ class Qwen3VLMBackend:
                 self.device_map = fp8_device_map
                 print(f"[FP8] Model dispatched successfully!")
 
+                # Apply torch.compile for optimized kernels
+                print("[FP8] Applying torch.compile for optimized inference...")
+                try:
+                    # Use reduce-overhead mode for CUDA graphs (best for autoregressive)
+                    # fullgraph=False allows for graph breaks with dynamic control flow
+                    self.model = torch.compile(
+                        self.model,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    print("[FP8] torch.compile applied successfully!")
+                except Exception as e:
+                    print(f"[FP8] torch.compile failed (will use eager mode): {e}")
+
             progress(1.0, desc="Model loaded!")
 
             # Print device distribution

@@ -1924,8 +1924,8 @@ def create_ui():
                 )
                 video_max_frames = gr.Slider(
                     minimum=1,
-                    maximum=64,
-                    value=16,
+                    maximum=251,
+                    value=81,
                     step=1,
                     label="Max Video Frames",
                 )

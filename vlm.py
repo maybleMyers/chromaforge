@@ -901,7 +901,7 @@ def create_ui():
             with gr.Row():
                 max_tokens = gr.Slider(
                     minimum=64,
-                    maximum=2048,
+                    maximum=262048,
                     value=512,
                     step=64,
                     label="Max New Tokens",

@@ -606,7 +606,10 @@ def chat_handler(
     message: str,
     history: List[Dict[str, Any]],
     system_prompt: str,
-    image,
+    image1,
+    image2,
+    image3,
+    image4,
     video,
     max_tokens: int,
     temperature: float,
@@ -649,8 +652,10 @@ def chat_handler(
     # Build current message content for model
     model_content = []
 
-    if image is not None:
-        model_content.append({"type": "image", "image": image})
+    # Add all provided images
+    images = [img for img in [image1, image2, image3, image4] if img is not None]
+    for img in images:
+        model_content.append({"type": "image", "image": img})
 
     if video is not None:
         model_content.append({"type": "video", "video": video})
@@ -665,22 +670,25 @@ def chat_handler(
     # Build initial display content for chatbot
     new_history = list(history)
 
-    if image is not None:
-        # Resize image to 150px height for chat display
-        orig_width, orig_height = image.size
-        new_height = 150
-        new_width = int(orig_width * (new_height / orig_height))
-        display_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Save resized image to temp file for display
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"vlm_chat_{int(time.time())}_{id(image)}.png")
-        display_image.save(temp_path)
-
-        display_text = message if message else "Describe this image"
+    if images:
+        display_text = message if message else f"Describe {'these images' if len(images) > 1 else 'this image'}"
         new_history.append({"role": "user", "content": display_text})
-        # Use dict with "path" key for file content in chatbot
-        new_history.append({"role": "user", "content": {"path": temp_path}})
+
+        # Add each image to chat display
+        for idx, img in enumerate(images):
+            # Resize image to 150px height for chat display
+            orig_width, orig_height = img.size
+            new_height = 150
+            new_width = int(orig_width * (new_height / orig_height))
+            display_image = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # Save resized image to temp file for display
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"vlm_chat_{int(time.time())}_{idx}_{id(img)}.png")
+            display_image.save(temp_path)
+
+            # Use dict with "path" key for file content in chatbot
+            new_history.append({"role": "user", "content": {"path": temp_path}})
 
     elif video is not None:
         display_text = message if message else "Describe this video"
@@ -841,19 +849,35 @@ def create_ui():
                     elem_classes=["resizable-chatbot"],
                 )
 
-                # Media inputs row
+                # Media inputs row - 4 image inputs
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        image_input = gr.Image(
-                            label="Upload Image (optional)",
-                            type="pil",
-                            height=100,
-                        )
-                    with gr.Column(scale=1):
-                        video_input = gr.Video(
-                            label="Upload Video (optional)",
-                            height=100,
-                        )
+                    image_input_1 = gr.Image(
+                        label="Image 1",
+                        type="pil",
+                        height=100,
+                    )
+                    image_input_2 = gr.Image(
+                        label="Image 2",
+                        type="pil",
+                        height=100,
+                    )
+                    image_input_3 = gr.Image(
+                        label="Image 3",
+                        type="pil",
+                        height=100,
+                    )
+                    image_input_4 = gr.Image(
+                        label="Image 4",
+                        type="pil",
+                        height=100,
+                    )
+
+                # Video input row
+                with gr.Row():
+                    video_input = gr.Video(
+                        label="Upload Video (optional)",
+                        height=100,
+                    )
 
                 # Message input row
                 with gr.Row():
@@ -1005,34 +1029,36 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img, vid, max_tok, temp, vid_frames, thinking):
-            if not msg.strip() and img is None and vid is None:
-                yield history, "", None, None, ""
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, thinking):
+            if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
+                yield history, "", None, None, None, None, None, ""
                 return
 
             # Stream responses from chat_handler generator
             for new_history, _, stats in chat_handler(
-                msg, history, sys_prompt, img, vid,
+                msg, history, sys_prompt, img1, img2, img3, img4, vid,
                 max_tok, temp, vid_frames, thinking
             ):
-                yield new_history, "", None, None, stats
+                yield new_history, "", None, None, None, None, None, stats
 
         send_btn.click(
             fn=send_message,
             inputs=[
-                msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, video_max_frames, show_thinking
+                msg_input, chatbot, system_prompt,
+                image_input_1, image_input_2, image_input_3, image_input_4,
+                video_input, max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
         )
 
         msg_input.submit(
             fn=send_message,
             inputs=[
-                msg_input, chatbot, system_prompt, image_input, video_input,
-                max_tokens, temperature, video_max_frames, show_thinking
+                msg_input, chatbot, system_prompt,
+                image_input_1, image_input_2, image_input_3, image_input_4,
+                video_input, max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
         )
 
         clear_btn.click(

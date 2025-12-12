@@ -192,14 +192,18 @@ try:
         QWEN3_VL_AVAILABLE = False
         print("Note: Qwen3VLMoeForConditionalGeneration not available, will use fallback classes")
 
-    # Try to import GLM-4.6V classes (requires transformers >= 4.47.0 or main branch)
+    # Import GLM-4.6V classes from local backend
     try:
-        from transformers import Glm46VForConditionalGeneration, Glm46VProcessor
+        from backend.transformers.glm46v import (
+            Glm46VForConditionalGeneration,
+            Glm46VProcessor,
+            Glm46VConfig,
+        )
         GLM46V_AVAILABLE = True
-        print("GLM-4.6V support: available")
-    except ImportError:
+        print("GLM-4.6V support: available (local backend)")
+    except ImportError as glm_err:
         GLM46V_AVAILABLE = False
-        print("Note: GLM-4.6V not available. Upgrade transformers: pip install git+https://github.com/huggingface/transformers")
+        print(f"Note: GLM-4.6V not available: {glm_err}")
 except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
     QWEN3_VL_AVAILABLE = False
@@ -518,18 +522,20 @@ class Qwen3VLMBackend:
 
             # Load processor or tokenizer based on model type
             if model_type in ["qwen-vl", "glm-vl"]:
-                # GLM models use use_fast=True for processor
-                processor_kwargs = {
-                    "trust_remote_code": True,
-                }
-                if model_type == "glm-vl":
-                    processor_kwargs["use_fast"] = True
-
-                self.processor = AutoProcessor.from_pretrained(
-                    model_path,
-                    **processor_kwargs,
-                )
-                print(f"Loaded processor for {model_name}")
+                if model_type == "glm-vl" and GLM46V_AVAILABLE:
+                    # Use local GLM processor
+                    self.processor = Glm46VProcessor.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+                    print(f"Loaded GLM processor for {model_name}")
+                else:
+                    # Use AutoProcessor for Qwen and fallback
+                    self.processor = AutoProcessor.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+                    print(f"Loaded processor for {model_name}")
             else:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_path,
@@ -631,13 +637,11 @@ class Qwen3VLMBackend:
                 loaded = False
 
                 # For GLM-4.6V models (GLM-4.6V-Flash, etc.)
-                if model_type_from_config == "glm4v":
+                # Uses local backend classes
+                if model_type_from_config in ["glm4v", "glm46v"]:
                     if not GLM46V_AVAILABLE:
-                        return (
-                            "Error: GLM-4.6V requires a newer transformers version.\n"
-                            "Install with: pip install git+https://github.com/huggingface/transformers"
-                        )
-                    print("Loading as GLM-4.6V model using Glm46VForConditionalGeneration...")
+                        return "Error: GLM-4.6V backend not available. Check backend/transformers/glm46v/"
+                    print("Loading as GLM-4.6V model using local Glm46VForConditionalGeneration...")
                     self.model = Glm46VForConditionalGeneration.from_pretrained(**model_kwargs)
                     print("Loaded as GLM-4.6V model")
                     loaded = True
@@ -1845,7 +1849,6 @@ def main():
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
     print(f"qwen-vl-utils: {'available' if QWEN_VL_UTILS_AVAILABLE else 'NOT INSTALLED (optional, only for Qwen)'}")
-    print(f"GLM-4.6V: {'available' if GLM46V_AVAILABLE else 'NOT AVAILABLE (upgrade: pip install git+https://github.com/huggingface/transformers)'}")
     print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")
     if args.listen:

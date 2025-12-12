@@ -1118,24 +1118,44 @@ class Qwen3VLMBackend:
         is_glm_model = self.current_model_type == "glm-vl"
 
         if is_glm_model:
-            # GLM uses apply_chat_template with tokenize=True for combined processing
-            # Extract images from conversation for GLM
+            # GLM processor requires ALL content to be list of dicts with "type" keys
+            # Convert any string content to [{"type": "text", "text": "..."}] format
+            glm_conversation = []
             image_inputs = []
+
             for msg in conversation:
-                content = msg.get("content", [])
-                if isinstance(content, list):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+
+                if isinstance(content, str):
+                    # Convert string to list format
+                    glm_content = [{"type": "text", "text": content}]
+                elif isinstance(content, list):
+                    # Already list format - extract images and normalize
+                    glm_content = []
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "image":
-                            img_path = item.get("image")
-                            if img_path:
-                                if isinstance(img_path, str):
-                                    image_inputs.append(Image.open(img_path))
-                                elif isinstance(img_path, Image.Image):
-                                    image_inputs.append(img_path)
+                        if isinstance(item, dict):
+                            if item.get("type") == "image":
+                                img_path = item.get("image")
+                                if img_path:
+                                    if isinstance(img_path, str):
+                                        image_inputs.append(Image.open(img_path))
+                                    elif isinstance(img_path, Image.Image):
+                                        image_inputs.append(img_path)
+                                # Add image placeholder (processor will handle it)
+                                glm_content.append({"type": "image"})
+                            elif item.get("type") == "text":
+                                glm_content.append({"type": "text", "text": item.get("text", "")})
+                            elif item.get("type") == "video":
+                                glm_content.append(item)
+                else:
+                    glm_content = [{"type": "text", "text": str(content)}]
+
+                glm_conversation.append({"role": role, "content": glm_content})
 
             # GLM's apply_chat_template handles tokenization directly
             inputs = self.processor.apply_chat_template(
-                conversation,
+                glm_conversation,
                 images=image_inputs if image_inputs else None,
                 tokenize=True,
                 add_generation_prompt=True,

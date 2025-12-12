@@ -1119,9 +1119,9 @@ class Qwen3VLMBackend:
 
         if is_glm_model:
             # GLM processor requires ALL content to be list of dicts with "type" keys
-            # Convert any string content to [{"type": "text", "text": "..."}] format
+            # Images must be embedded in content as {"type": "image", "image": <PIL>}
+            # NOT passed separately (causes "multiple values for keyword argument 'images'")
             glm_conversation = []
-            image_inputs = []
 
             for msg in conversation:
                 role = msg.get("role", "user")
@@ -1131,19 +1131,22 @@ class Qwen3VLMBackend:
                     # Convert string to list format
                     glm_content = [{"type": "text", "text": content}]
                 elif isinstance(content, list):
-                    # Already list format - extract images and normalize
+                    # Already list format - normalize and embed images directly
                     glm_content = []
                     for item in content:
                         if isinstance(item, dict):
                             if item.get("type") == "image":
-                                img_path = item.get("image")
-                                if img_path:
-                                    if isinstance(img_path, str):
-                                        image_inputs.append(Image.open(img_path))
-                                    elif isinstance(img_path, Image.Image):
-                                        image_inputs.append(img_path)
-                                # Add image placeholder (processor will handle it)
-                                glm_content.append({"type": "image"})
+                                img_data = item.get("image")
+                                if img_data:
+                                    if isinstance(img_data, str):
+                                        # Load image from path and embed directly
+                                        glm_content.append({"type": "image", "image": Image.open(img_data)})
+                                    elif isinstance(img_data, Image.Image):
+                                        # Already PIL image, embed directly
+                                        glm_content.append({"type": "image", "image": img_data})
+                                else:
+                                    # No image data, just placeholder
+                                    glm_content.append({"type": "image"})
                             elif item.get("type") == "text":
                                 glm_content.append({"type": "text", "text": item.get("text", "")})
                             elif item.get("type") == "video":
@@ -1153,10 +1156,9 @@ class Qwen3VLMBackend:
 
                 glm_conversation.append({"role": role, "content": glm_content})
 
-            # GLM's apply_chat_template handles tokenization directly
+            # GLM's apply_chat_template - images embedded in content, NOT passed separately
             inputs = self.processor.apply_chat_template(
                 glm_conversation,
-                images=image_inputs if image_inputs else None,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,

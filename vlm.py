@@ -770,6 +770,12 @@ def create_ui():
     .green-btn:hover {
         background: linear-gradient(to bottom right, #27ae60, #219651) !important;
     }
+    .resizable-chatbot {
+        resize: vertical;
+        overflow: auto;
+        min-height: 200px;
+        max-height: 90vh;
+    }
     """
 
     # Get initial model list
@@ -780,11 +786,12 @@ def create_ui():
         with gr.Tabs():
             # Chat Tab
             with gr.TabItem("Chat"):
-                # Chat interface at top - full width
+                # Chat interface at top - full width, user-resizable
                 chatbot = gr.Chatbot(
                     label="Conversation",
                     height=500,
                     type="messages",
+                    elem_classes=["resizable-chatbot"],
                 )
 
                 # Media inputs row

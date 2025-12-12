@@ -74,9 +74,8 @@ class Glm46VProcessor(ProcessorMixin):
 
     # Required class attributes for ProcessorMixin compatibility
     attributes = ["image_processor", "tokenizer"]
-    image_processor_class = "Glm46VImageProcessor"
-    tokenizer_class = "PreTrainedTokenizerFast"
-    # optional_attributes = ["video_processor"]
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
 
     def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
         self.image_token = "<|image|>" if not hasattr(tokenizer, "image_token") else tokenizer.image_token
@@ -91,11 +90,13 @@ class Glm46VProcessor(ProcessorMixin):
             if getattr(tokenizer, "video_token_id", None)
             else tokenizer.convert_tokens_to_ids(self.video_token)
         )
-        # Store video_processor separately (not in attributes list for older transformers compat)
+        # Store all attributes directly - bypass ProcessorMixin validation
+        self.image_processor = image_processor
+        self.tokenizer = tokenizer
         self.video_processor = video_processor
-        self.chat_template = chat_template
-        # Only pass image_processor and tokenizer to parent (matches attributes list)
-        super().__init__(image_processor, tokenizer)
+        # Set chat_template on tokenizer if provided
+        if chat_template is not None and tokenizer is not None:
+            self.tokenizer.chat_template = chat_template
 
     def __call__(
         self,

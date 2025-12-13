@@ -565,6 +565,8 @@ class LlamaCppVLM:
 
 # Global manager instance
 vlm_manager: Optional[LlamaCppVLM] = None
+# Global stop flag for generation
+stop_generation: bool = False
 
 
 def initialize_manager(models_dir: str = "models/LLM"):
@@ -702,6 +704,10 @@ def chat_handler(
     # Add empty assistant message that we'll stream into
     new_history.append({"role": "assistant", "content": ""})
 
+    # Reset stop flag before starting generation
+    global stop_generation
+    stop_generation = False
+
     # Stream the response
     stats = ""
     for display_text, raw_text, stats in vlm_manager.generate(
@@ -711,6 +717,13 @@ def chat_handler(
         video_max_frames=video_max_frames,
         stream=True,
     ):
+        # Check stop flag
+        if stop_generation:
+            new_history[-1]["content"] += "\n\n[Generation stopped]"
+            stop_generation = False
+            yield new_history, "", stats
+            return
+
         # Show thinking if enabled, otherwise show cleaned text
         if show_thinking:
             new_history[-1]["content"] = raw_text
@@ -722,6 +735,13 @@ def chat_handler(
 def clear_chat_handler():
     """Clear chat history."""
     return []
+
+
+def stop_generation_handler():
+    """Set the stop flag to interrupt generation."""
+    global stop_generation
+    stop_generation = True
+    return
 
 
 def batch_caption_handler(
@@ -825,6 +845,14 @@ def create_ui():
     .green-btn:hover {
         background: linear-gradient(to bottom right, #27ae60, #219651) !important;
     }
+    .red-btn {
+        background: linear-gradient(to bottom right, #e74c3c, #c0392b) !important;
+        color: white !important;
+        border: none !important;
+    }
+    .red-btn:hover {
+        background: linear-gradient(to bottom right, #c0392b, #a93226) !important;
+    }
     .resizable-chatbot {
         resize: vertical;
         overflow: auto;
@@ -887,17 +915,13 @@ def create_ui():
                     send_btn = gr.Button("Send", variant="primary", scale=1)
 
                 with gr.Row():
-                    clear_btn = gr.Button("Clear Chat", scale=2)
-                    show_thinking = gr.Checkbox(
-                        label="Show Thinking",
-                        value=False,
-                        scale=1,
-                    )
+                    clear_btn = gr.Button("Clear Chat", scale=1)
+                    stop_btn = gr.Button("Stop", variant="stop", scale=1, elem_classes=["red-btn"])
                     stats_display = gr.Textbox(
                         label="Speed",
                         value="",
                         interactive=False,
-                        scale=1,
+                        scale=2,
                     )
 
             # Batch Caption Tab
@@ -1009,6 +1033,12 @@ def create_ui():
                     info="Frames to extract from videos",
                 )
 
+            with gr.Row():
+                show_thinking = gr.Checkbox(
+                    label="Show Thinking",
+                    value=True,
+                )
+
         # Event handlers
         refresh_models_btn.click(
             fn=refresh_models_handler,
@@ -1061,6 +1091,10 @@ def create_ui():
         clear_btn.click(
             fn=clear_chat_handler,
             outputs=[chatbot],
+        )
+
+        stop_btn.click(
+            fn=stop_generation_handler,
         )
 
         batch_start_btn.click(

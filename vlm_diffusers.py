@@ -1139,10 +1139,24 @@ class Qwen3VLMBackend:
                 _original_build_preprocessor = InternVLVisionModel.build_preprocessor
 
                 def _patched_build_preprocessor(self):
-                    # Convert vision_config dict to namespace if needed
-                    if hasattr(self, 'config') and hasattr(self.config, 'vision_config'):
-                        if isinstance(self.config.vision_config, dict):
-                            self.config.vision_config = dict_to_namespace(self.config.vision_config)
+                    # Debug: print what we have
+                    print(f"[DEBUG] Patch called, self type: {type(self)}")
+                    print(f"[DEBUG] hasattr config: {hasattr(self, 'config')}")
+                    if hasattr(self, 'config'):
+                        print(f"[DEBUG] config type: {type(self.config)}")
+                        print(f"[DEBUG] config keys/attrs: {dir(self.config)[:10]}...")
+                        if hasattr(self.config, 'vision_config'):
+                            print(f"[DEBUG] vision_config type: {type(self.config.vision_config)}")
+                            if isinstance(self.config.vision_config, dict):
+                                print(f"[DEBUG] Converting vision_config dict to namespace")
+                                self.config.vision_config = dict_to_namespace(self.config.vision_config)
+                        elif hasattr(self.config, '__getitem__'):
+                            # Config might be dict-like
+                            try:
+                                vc = self.config['vision_config']
+                                print(f"[DEBUG] vision_config via __getitem__: {type(vc)}")
+                            except:
+                                pass
                     return _original_build_preprocessor(self)
 
                 InternVLVisionModel.build_preprocessor = _patched_build_preprocessor

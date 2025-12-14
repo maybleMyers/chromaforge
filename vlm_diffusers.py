@@ -755,6 +755,29 @@ class Qwen3VLMBackend:
                 # InternVL uses custom model classes via auto_map with trust_remote_code
                 if model_type_from_config == "internvl_chat":
                     print("Loading as InternVL model using AutoModel with trust_remote_code...")
+                    # Patch InternVL config class to fix repr() bug (fails when creating default config)
+                    # The bug: to_diff_dict() calls self.__class__() which fails with empty llm_config
+                    import sys
+                    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+                    # Get the config class from the model's custom code
+                    config_class = get_class_from_dynamic_module(
+                        "configuration_internvl_chat.InternVLChatConfig",
+                        model_path,
+                    )
+
+                    # Store original __init__ and patch it to handle empty configs
+                    original_init = config_class.__init__
+                    def patched_init(self, vision_config=None, llm_config=None, **kwargs):
+                        if llm_config is None:
+                            llm_config = {}
+                        if not llm_config.get('architectures'):
+                            llm_config['architectures'] = ['LlamaForCausalLM']
+                        return original_init(self, vision_config=vision_config, llm_config=llm_config, **kwargs)
+
+                    config_class.__init__ = patched_init
+
+                    # Now load the model
                     self.model = AutoModel.from_pretrained(**model_kwargs)
                     print("Loaded as InternVL model")
                     loaded = True

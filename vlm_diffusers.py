@@ -1121,9 +1121,10 @@ class Qwen3VLMBackend:
             progress(0.3, desc=f"Loading model with lmdeploy (tp={tp})...")
             print(f"Loading {model_name} with lmdeploy backend (tp={tp})")
 
-            # Patch lmdeploy's InternVL config loading to handle dict vision_config
-            # lmdeploy expects vision_config to be an object with attributes,
-            # but local models may have it as a dict in config.json
+            # Patch lmdeploy's InternVL build_preprocessor to handle dict vision_config
+            # The issue: AutoConfig loads vision_config as dict for local models
+            # build_preprocessor does: self.config = self.hf_config, then accesses
+            # self.config.vision_config.image_size which fails on dict
             try:
                 from lmdeploy.vl.model import internvl as lmdeploy_internvl
                 from types import SimpleNamespace
@@ -1136,30 +1137,42 @@ class Qwen3VLMBackend:
                         return [dict_to_namespace(i) for i in d]
                     return d
 
-                # Patch the InternVLVisionModel.__init__ to fix config after parent init
-                _original_init = lmdeploy_internvl.InternVLVisionModel.__init__
+                _original_build_preprocessor = lmdeploy_internvl.InternVLVisionModel.build_preprocessor
 
-                def _patched_init(self, *args, **kwargs):
-                    _original_init(self, *args, **kwargs)
-                    # After init, fix vision_config if it's a dict
-                    try:
-                        if hasattr(self, 'config') and hasattr(self.config, 'vision_config'):
-                            if isinstance(self.config.vision_config, dict):
-                                self.config.vision_config = dict_to_namespace(self.config.vision_config)
-                                print("Converted vision_config dict to namespace in __init__")
-                    except Exception as e:
-                        print(f"Note: vision_config conversion in __init__: {e}")
+                def _patched_build_preprocessor(self):
+                    # Fix hf_config.vision_config BEFORE original method assigns it to self.config
+                    if hasattr(self, 'hf_config') and hasattr(self.hf_config, 'vision_config'):
+                        if isinstance(self.hf_config.vision_config, dict):
+                            self.hf_config.vision_config = dict_to_namespace(self.hf_config.vision_config)
+                            print("Converted hf_config.vision_config dict to namespace")
+                    return _original_build_preprocessor(self)
 
-                lmdeploy_internvl.InternVLVisionModel.__init__ = _patched_init
-                print("Patched lmdeploy InternVL __init__ for dict vision_config")
+                lmdeploy_internvl.InternVLVisionModel.build_preprocessor = _patched_build_preprocessor
+                print("Patched lmdeploy InternVL build_preprocessor")
             except Exception as patch_err:
                 print(f"Warning: Could not patch lmdeploy InternVL: {patch_err}")
 
-            # Configure lmdeploy backend
-            backend_config = PytorchEngineConfig(
-                cache_max_entry_count=0.2,
-                tp=tp,
-            )
+            # Detect if model is AWQ/GPTQ quantized for proper backend config
+            is_awq = 'awq' in model_name.lower() or 'awq' in model_path.lower()
+            is_gptq = 'gptq' in model_name.lower() or 'gptq' in model_path.lower()
+
+            if (is_awq or is_gptq) and TurbomindEngineConfig is not None:
+                # Use TurbomindEngineConfig for AWQ/GPTQ models (per lmdeploy docs)
+                model_format = 'awq' if is_awq else 'gptq'
+                backend_config = TurbomindEngineConfig(
+                    model_format=model_format,
+                    cache_max_entry_count=0.2,
+                    tp=tp,
+                )
+                print(f"Using TurbomindEngineConfig with model_format='{model_format}'")
+            else:
+                # Use PytorchEngineConfig for non-quantized models or fallback
+                backend_config = PytorchEngineConfig(
+                    cache_max_entry_count=0.2,
+                    tp=tp,
+                )
+                if is_awq or is_gptq:
+                    print("Warning: TurbomindEngineConfig not available, using PytorchEngineConfig for AWQ/GPTQ")
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(

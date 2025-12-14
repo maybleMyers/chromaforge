@@ -1129,6 +1129,47 @@ class Qwen3VLMBackend:
                 tp=tp,
             )
 
+            # For InternVL models, lmdeploy has issues with local configs where vision_config
+            # is a dict instead of an object. Patch the config loading to handle this.
+            config_path = os.path.join(model_path, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config_data = json.load(f)
+
+                # Check if this is an InternVL model that needs config patching
+                if model_type == "internvl" or config_data.get("model_type") == "internvl_chat":
+                    # Patch lmdeploy's InternVL model to handle dict configs
+                    try:
+                        import lmdeploy.vl.model.internvl as internvl_module
+
+                        # Save original build_preprocessor if not already patched
+                        if not hasattr(internvl_module.InternVLVisionModel, '_original_build_preprocessor'):
+                            internvl_module.InternVLVisionModel._original_build_preprocessor = \
+                                internvl_module.InternVLVisionModel.build_preprocessor
+
+                            def patched_build_preprocessor(self):
+                                # Handle vision_config as dict
+                                vision_config = self.config.vision_config
+                                if isinstance(vision_config, dict):
+                                    input_size = vision_config.get('image_size', 448)
+                                else:
+                                    input_size = vision_config.image_size
+                                self.input_size = input_size
+
+                                from torchvision import transforms
+                                IMAGENET_MEAN = (0.485, 0.456, 0.406)
+                                IMAGENET_STD = (0.229, 0.224, 0.225)
+                                self.transform = transforms.Compose([
+                                    transforms.Resize((input_size, input_size)),
+                                    transforms.ToTensor(),
+                                    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+                                ])
+
+                            internvl_module.InternVLVisionModel.build_preprocessor = patched_build_preprocessor
+                            print("Patched lmdeploy InternVL config handling for local model")
+                    except Exception as e:
+                        print(f"Warning: Could not patch lmdeploy InternVL handler: {e}")
+
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(
                 model_path,

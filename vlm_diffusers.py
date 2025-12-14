@@ -1702,14 +1702,22 @@ class Qwen3VLMBackend:
 
         # Prepare lmdeploy input
         # lmdeploy expects (prompt, image) tuple for VLMs
-        # lmdeploy.vl.load_image() accepts PIL.Image directly - no temp files needed
+        # Use temp files and pass file paths to load_image (like prompt.py does)
+        # Keep temp files alive until after pipeline execution
+        temp_files_to_cleanup = []
+
         if all_images:
             processed_images = []
             for img in all_images:
                 if isinstance(img, Image.Image):
-                    # Pass PIL image directly to load_image (it accepts Union[str, Image.Image])
+                    # Save to temp file and pass path to load_image (matches prompt.py pattern)
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                        img.save(f, format='PNG')
+                        temp_path = f.name
+                    temp_files_to_cleanup.append(temp_path)
                     if lmdeploy_load_image is not None:
-                        processed_images.append(lmdeploy_load_image(img))
+                        processed_images.append(lmdeploy_load_image(temp_path))
                     else:
                         processed_images.append(img)
                 else:
@@ -1732,13 +1740,30 @@ class Qwen3VLMBackend:
             gen_config["top_k"] = top_k
 
         # Generate with lmdeploy
+        # Debug: log what we're passing to the pipeline
+        print(f"[DEBUG] prompt_text: {prompt_text[:100] if prompt_text else 'None'}...")
+        print(f"[DEBUG] num_images: {len(all_images) if all_images else 0}")
+        print(f"[DEBUG] lmdeploy_input type: {type(lmdeploy_input)}")
+        if isinstance(lmdeploy_input, tuple):
+            print(f"[DEBUG] lmdeploy_input[0] (prompt): {lmdeploy_input[0][:100] if lmdeploy_input[0] else 'None'}...")
+            print(f"[DEBUG] lmdeploy_input[1] type: {type(lmdeploy_input[1])}")
+
         try:
-            from lmdeploy import GenerationConfig
-            gen_cfg = GenerationConfig(**gen_config)
-            response = self.lmdeploy_pipe(lmdeploy_input, gen_config=gen_cfg)
-        except ImportError:
-            # Fallback without GenerationConfig
-            response = self.lmdeploy_pipe(lmdeploy_input)
+            try:
+                from lmdeploy import GenerationConfig
+                gen_cfg = GenerationConfig(**gen_config)
+                print(f"[DEBUG] gen_config: {gen_config}")
+                response = self.lmdeploy_pipe(lmdeploy_input, gen_config=gen_cfg)
+            except ImportError:
+                # Fallback without GenerationConfig
+                response = self.lmdeploy_pipe(lmdeploy_input)
+        finally:
+            # Cleanup temp files after pipeline execution
+            for temp_path in temp_files_to_cleanup:
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
 
         # Extract response text
         if hasattr(response, 'text'):
@@ -2448,10 +2473,10 @@ def create_ui():
                     context_len_slider = gr.Slider(
                         minimum=512,
                         maximum=262144,
-                        value=8192,
+                        value=65536,
                         step=512,
                         label="Context Length",
-                        info="Session length for lmdeploy",
+                        info="Session length for lmdeploy (InternVL images need 65K+)",
                     )
 
                 with gr.Column(scale=1):

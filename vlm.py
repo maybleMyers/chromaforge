@@ -250,6 +250,8 @@ class LlamaCppVLM:
         model_name: str,
         n_gpu_layers: int = -1,
         n_ctx: int = 4096,
+        tensor_split: Optional[str] = None,
+        flash_attn: bool = False,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -259,6 +261,8 @@ class LlamaCppVLM:
             model_name: Name of the model to load
             n_gpu_layers: Number of layers to offload to GPU (-1 = all)
             n_ctx: Context length
+            tensor_split: Comma-separated GPU memory split ratios (e.g., "0.5,0.5" for 2 GPUs)
+            flash_attn: Enable Flash Attention for faster inference
             progress: Gradio progress callback
 
         Returns:
@@ -392,14 +396,37 @@ class LlamaCppVLM:
             print(f"[llama.cpp] Loading model from: {model_path}")
             print(f"[llama.cpp] GPU layers: {n_gpu_layers}, Context: {n_ctx}")
 
+            # Parse tensor_split if provided
+            tensor_split_list = None
+            if tensor_split and tensor_split.strip():
+                try:
+                    tensor_split_list = [float(x.strip()) for x in tensor_split.split(",")]
+                    print(f"[llama.cpp] Tensor split: {tensor_split_list}")
+                except ValueError:
+                    print(f"[llama.cpp] Warning: Invalid tensor_split format '{tensor_split}', ignoring")
+                    tensor_split_list = None
+
+            if flash_attn:
+                print("[llama.cpp] Flash Attention: enabled")
+
+            # Build kwargs for Llama constructor
+            llama_kwargs = {
+                "model_path": model_path,
+                "chat_handler": self.chat_handler,
+                "n_ctx": n_ctx,
+                "n_gpu_layers": n_gpu_layers,
+                "verbose": True,
+            }
+
+            # Add optional parameters
+            if tensor_split_list:
+                llama_kwargs["tensor_split"] = tensor_split_list
+
+            if flash_attn:
+                llama_kwargs["flash_attn"] = True
+
             # Load the model
-            self.model = Llama(
-                model_path=model_path,
-                chat_handler=self.chat_handler,
-                n_ctx=n_ctx,
-                n_gpu_layers=n_gpu_layers,
-                verbose=True,  # Enable verbose to see any loading issues
-            )
+            self.model = Llama(**llama_kwargs)
 
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path
@@ -726,11 +753,25 @@ def refresh_models_handler():
     return gr.update(choices=models, value=models[0] if models else None)
 
 
-def load_model_handler(model_name: str, n_gpu_layers: int, n_ctx: int, progress=gr.Progress()):
+def load_model_handler(
+    model_name: str,
+    n_gpu_layers: int,
+    n_ctx: int,
+    tensor_split: str,
+    flash_attn: bool,
+    progress=gr.Progress()
+):
     """Handle model loading."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.load_model(model_name, n_gpu_layers, n_ctx, progress)
+    return vlm_manager.load_model(
+        model_name,
+        n_gpu_layers,
+        n_ctx,
+        tensor_split,
+        flash_attn,
+        progress
+    )
 
 
 def unload_model_handler():
@@ -1133,6 +1174,21 @@ def create_ui():
                     )
 
             with gr.Row():
+                with gr.Column(scale=2):
+                    tensor_split = gr.Textbox(
+                        label="Tensor Split (Multi-GPU)",
+                        placeholder="e.g., 0.5,0.5 for 2 GPUs or 0.4,0.6 for uneven split",
+                        value="",
+                        info="Comma-separated ratios for distributing layers across GPUs",
+                    )
+                with gr.Column(scale=1):
+                    flash_attn = gr.Checkbox(
+                        label="Flash Attention",
+                        value=False,
+                        info="Faster attention (requires all layers on GPU)",
+                    )
+
+            with gr.Row():
                 load_model_btn = gr.Button("Load Model", variant="primary")
                 unload_model_btn = gr.Button("Unload", variant="secondary")
                 status_display = gr.Textbox(
@@ -1190,7 +1246,7 @@ def create_ui():
 
         load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, n_gpu_layers, n_ctx],
+            inputs=[model_dropdown, n_gpu_layers, n_ctx, tensor_split, flash_attn],
             outputs=[status_display],
         )
 

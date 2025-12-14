@@ -134,7 +134,8 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
     """
     Find GGUF models in a directory.
     Returns list of dicts with 'name', 'model_path', and optional 'mmproj_path'.
-    Uses the folder name as the display name instead of the GGUF filename.
+    Groups by folder - each subfolder is treated as one model.
+    For split models, selects the first shard as the model_path.
     """
     models = []
     models_path = Path(models_dir)
@@ -142,40 +143,73 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
     if not models_path.exists():
         return models
 
-    # Look for .gguf files
-    for gguf_file in models_path.rglob("*.gguf"):
-        file_stem = gguf_file.stem
-        model_path = str(gguf_file)
+    # Track folders we've already processed
+    processed_folders = set()
 
-        # Skip mmproj/clip files as main models
-        if any(x in file_stem.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
+    # First, find all subdirectories containing .gguf files
+    for gguf_file in models_path.rglob("*.gguf"):
+        parent = gguf_file.parent
+
+        # Skip if we've already processed this folder
+        if parent in processed_folders:
             continue
 
-        # Use folder name as display name instead of file name
-        parent = gguf_file.parent
+        # Skip files directly in models_dir (no subfolder)
         if parent == models_path:
-            # File is directly in models_dir, use file stem
-            name = file_stem
-        else:
-            # File is in a subdirectory, use folder name
-            name = parent.name
+            # Handle loose files in root - treat each as its own model
+            file_stem = gguf_file.stem
 
-        # Try to find matching mmproj file for vision models
+            # Skip mmproj/clip files as main models
+            if any(x in file_stem.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
+                continue
+
+            # Skip split model shards (not the first one)
+            if "-0000" in file_stem and not file_stem.endswith("-00001-of"):
+                # Check if this is a shard that's not the first
+                import re
+                shard_match = re.search(r'-(\d{5})-of-(\d{5})', file_stem)
+                if shard_match and shard_match.group(1) != "00001":
+                    continue
+
+            models.append({
+                "name": file_stem,
+                "model_path": str(gguf_file),
+                "mmproj_path": None,
+            })
+            continue
+
+        # Mark this folder as processed
+        processed_folders.add(parent)
+
+        # Use folder name as display name
+        name = parent.name
+
+        # Find all gguf files in this folder
+        all_ggufs = list(parent.glob("*.gguf"))
+
+        # Separate mmproj/clip files from model files
         mmproj_path = None
+        model_files = []
 
-        # Common mmproj naming patterns
-        mmproj_patterns = [
-            "*mmproj*.gguf",
-            "*clip*.gguf",
-            "*vision*.gguf",
-            "*image-encoder*.gguf",
-        ]
+        mmproj_patterns = ["mmproj", "clip", "vision-encoder", "image-encoder"]
 
-        for pattern in mmproj_patterns:
-            mmproj_files = list(parent.glob(pattern))
-            if mmproj_files:
-                mmproj_path = str(mmproj_files[0])
-                break
+        for gf in all_ggufs:
+            stem_lower = gf.stem.lower()
+            if any(p in stem_lower for p in mmproj_patterns):
+                if mmproj_path is None:
+                    mmproj_path = str(gf)
+            else:
+                model_files.append(gf)
+
+        if not model_files:
+            continue
+
+        # Sort model files to get consistent ordering
+        # For split models, this ensures we get the first shard
+        model_files.sort(key=lambda x: x.name)
+
+        # Use the first model file (or first shard for split models)
+        model_path = str(model_files[0])
 
         models.append({
             "name": name,

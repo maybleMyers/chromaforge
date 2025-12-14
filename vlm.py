@@ -15,6 +15,7 @@ Installation with CUDA (Windows prebuilt):
 
 import os
 import gc
+import re
 import base64
 import argparse
 import tempfile
@@ -230,6 +231,8 @@ class LlamaCppVLM:
         self.current_model_path: Optional[str] = None
         self.current_mmproj_path: Optional[str] = None
         self.chat_handler = None
+        self.is_text_only_model = False  # Flag for text-only models like GPT-OSS
+        self.model_type: Optional[str] = None  # Track model type (e.g., "gpt-oss", "qwen", "llava")
 
     def get_available_models(self) -> List[Dict[str, str]]:
         """Get list of available GGUF models."""
@@ -287,11 +290,28 @@ class LlamaCppVLM:
             is_qwen_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen", "qwen2-vl", "qwen3-vl", "qwen2.5-vl"])
             is_llava = any(x in model_name_lower or x in model_path_lower for x in ["llava", "llava-v1"])
 
+            # Detect GPT-OSS models (text-only with Harmony format)
+            is_gpt_oss = any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
+
             # More specific detection
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+
+            # Set model type tracking
+            self.is_text_only_model = is_gpt_oss or (mmproj_path is None)
+            if is_gpt_oss:
+                self.model_type = "gpt-oss"
+            elif is_qwen_vl:
+                self.model_type = "qwen-vl"
+            elif is_llava:
+                self.model_type = "llava"
+            else:
+                self.model_type = "generic"
+
+            if is_gpt_oss:
+                print("[llama.cpp] GPT-OSS model detected - using text-only mode with Harmony format")
 
             # Set up chat handler for vision models
             self.chat_handler = None
@@ -410,6 +430,8 @@ class LlamaCppVLM:
             self.chat_handler = None
             self.current_model_path = None
             self.current_mmproj_path = None
+            self.is_text_only_model = False
+            self.model_type = None
 
             # Force garbage collection
             gc.collect()
@@ -433,7 +455,8 @@ class LlamaCppVLM:
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "Unknown"
         vision_status = "vision" if self.chat_handler else "text-only"
-        return f"Loaded: {model_name} ({vision_status})"
+        model_type_str = f", {self.model_type}" if self.model_type and self.model_type != "generic" else ""
+        return f"Loaded: {model_name} ({vision_status}{model_type_str})"
 
     def generate(
         self,
@@ -465,65 +488,106 @@ class LlamaCppVLM:
             # Build messages in llama.cpp format
             llama_messages = []
 
+            # For text-only models (like GPT-OSS), we need to convert all content to plain text
+            # The chat templates for these models expect string content, not list content
+            use_text_only = self.is_text_only_model
+
             for msg in messages:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
 
                 if role == "system":
-                    llama_messages.append({"role": "system", "content": content})
+                    # System messages should always be strings
+                    if isinstance(content, list):
+                        # Extract text from list content
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                text_parts.append(item)
+                        content = " ".join(text_parts) if text_parts else str(content)
+                    llama_messages.append({"role": "system", "content": str(content)})
 
                 elif role == "user":
                     if isinstance(content, list):
-                        # Handle multimodal content
-                        parts = []
-                        for item in content:
-                            if isinstance(item, dict):
-                                if item.get("type") == "text":
-                                    parts.append({
-                                        "type": "text",
-                                        "text": item.get("text", "")
-                                    })
-                                elif item.get("type") == "image" and "image" in item:
-                                    img = item["image"]
-                                    if isinstance(img, Image.Image):
-                                        b64_url = image_to_base64(img)
-                                        parts.append({
-                                            "type": "image_url",
-                                            "image_url": {"url": b64_url}
-                                        })
-                                elif item.get("type") == "video" and "video" in item:
-                                    video_path = item["video"]
-                                    if isinstance(video_path, str) and os.path.exists(video_path):
-                                        try:
-                                            frames = extract_video_frames(video_path, max_frames=video_max_frames)
-                                            for frame in frames:
-                                                b64_url = image_to_base64(frame)
-                                                parts.append({
-                                                    "type": "image_url",
-                                                    "image_url": {"url": b64_url}
-                                                })
-                                            parts.append({
-                                                "type": "text",
-                                                "text": f"[Video with {len(frames)} frames]"
-                                            })
-                                        except Exception as e:
-                                            parts.append({
-                                                "type": "text",
-                                                "text": f"[Video error: {e}]"
-                                            })
+                        if use_text_only:
+                            # For text-only models, extract only text content
+                            text_parts = []
+                            has_images = False
+                            has_video = False
+                            for item in content:
+                                if isinstance(item, dict):
+                                    if item.get("type") == "text":
+                                        text_parts.append(item.get("text", ""))
+                                    elif item.get("type") == "image":
+                                        has_images = True
+                                    elif item.get("type") == "video":
+                                        has_video = True
+                                elif isinstance(item, str):
+                                    text_parts.append(item)
 
-                        if parts:
-                            llama_messages.append({"role": "user", "content": parts})
+                            # Build text-only content
+                            final_text = " ".join(text_parts) if text_parts else ""
+                            if has_images and not final_text:
+                                final_text = "Please respond to this message."
+                            elif has_images:
+                                final_text = f"[Note: Images were provided but this model is text-only] {final_text}"
+                            if has_video:
+                                final_text = f"[Note: Video was provided but this model is text-only] {final_text}"
+
+                            llama_messages.append({"role": "user", "content": final_text if final_text else "Hello"})
                         else:
-                            llama_messages.append({"role": "user", "content": "Describe this."})
+                            # Handle multimodal content for vision models
+                            parts = []
+                            for item in content:
+                                if isinstance(item, dict):
+                                    if item.get("type") == "text":
+                                        parts.append({
+                                            "type": "text",
+                                            "text": item.get("text", "")
+                                        })
+                                    elif item.get("type") == "image" and "image" in item:
+                                        img = item["image"]
+                                        if isinstance(img, Image.Image):
+                                            b64_url = image_to_base64(img)
+                                            parts.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": b64_url}
+                                            })
+                                    elif item.get("type") == "video" and "video" in item:
+                                        video_path = item["video"]
+                                        if isinstance(video_path, str) and os.path.exists(video_path):
+                                            try:
+                                                frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                                for frame in frames:
+                                                    b64_url = image_to_base64(frame)
+                                                    parts.append({
+                                                        "type": "image_url",
+                                                        "image_url": {"url": b64_url}
+                                                    })
+                                                parts.append({
+                                                    "type": "text",
+                                                    "text": f"[Video with {len(frames)} frames]"
+                                                })
+                                            except Exception as e:
+                                                parts.append({
+                                                    "type": "text",
+                                                    "text": f"[Video error: {e}]"
+                                                })
+
+                            if parts:
+                                llama_messages.append({"role": "user", "content": parts})
+                            else:
+                                llama_messages.append({"role": "user", "content": "Describe this."})
                     else:
                         llama_messages.append({"role": "user", "content": str(content)})
 
                 elif role == "assistant":
                     llama_messages.append({"role": "assistant", "content": str(content)})
 
-            # Add any direct images
-            if images:
+            # Add any direct images (only for vision models)
+            if images and not use_text_only:
                 image_parts = []
                 for img in images:
                     b64_url = image_to_base64(img)
@@ -533,6 +597,16 @@ class LlamaCppVLM:
                     })
                 image_parts.append({"type": "text", "text": "Describe this image."})
                 llama_messages.append({"role": "user", "content": image_parts})
+            elif images and use_text_only:
+                # For text-only models, just add a note about images
+                llama_messages.append({"role": "user", "content": "[Note: Images were provided but this model is text-only. Please respond to the previous message.]"})
+
+            # Debug logging for GPT-OSS and other text-only models
+            if self.model_type == "gpt-oss":
+                print(f"[llama.cpp] GPT-OSS: Building request with {len(llama_messages)} messages")
+                for i, msg in enumerate(llama_messages):
+                    content_preview = str(msg.get('content', ''))[:100]
+                    print(f"[llama.cpp]   [{i}] {msg['role']}: {content_preview}...")
 
             # Generate response
             start_time = time.perf_counter()
@@ -557,13 +631,36 @@ class LlamaCppVLM:
                         # Calculate current speed
                         elapsed = time.perf_counter() - start_time
                         tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-                        # Clean up thinking tags for display
-                        if "</think>" in accumulated:
-                            display_text = accumulated.split("</think>")[-1].strip()
-                        else:
-                            display_text = accumulated
-                        # Yield display_text, raw_text, and stats
-                        yield display_text, accumulated, f"{tokens_per_sec:.1f} tok/s"
+                        # Clean up thinking tags and GPT-OSS Harmony format tags for display
+                        display_text = accumulated
+                        raw_for_thinking = accumulated  # Keep a version with thinking preserved
+
+                        if "</think>" in display_text:
+                            display_text = display_text.split("</think>")[-1].strip()
+
+                        # Clean up GPT-OSS Harmony format tags if present
+                        if self.model_type == "gpt-oss":
+                            # For display_text (no thinking): extract only the final channel content
+                            # First, try to get just the final channel
+                            final_match = re.search(r'<\|channel\|>final<\|message\|>(.*?)(?:<\|(?:end|return)\|>|$)', display_text, re.DOTALL)
+                            if final_match:
+                                display_text = final_match.group(1).strip()
+                            else:
+                                # If no final channel yet, just clean up any tags
+                                display_text = re.sub(r'<\|channel\|>(analysis|commentary|final)<\|message\|>', '', display_text)
+                                display_text = re.sub(r'<\|(start|end|return|call)\|>', '', display_text)
+                                display_text = display_text.strip()
+
+                            # For raw_for_thinking (with thinking): make the analysis channel readable
+                            # Convert channel markers to readable labels
+                            raw_for_thinking = re.sub(r'<\|channel\|>analysis<\|message\|>', '\n[Thinking]\n', raw_for_thinking)
+                            raw_for_thinking = re.sub(r'<\|channel\|>final<\|message\|>', '\n[Response]\n', raw_for_thinking)
+                            raw_for_thinking = re.sub(r'<\|channel\|>commentary<\|message\|>', '\n[Commentary]\n', raw_for_thinking)
+                            raw_for_thinking = re.sub(r'<\|(start|end|return|call)\|>', '', raw_for_thinking)
+                            raw_for_thinking = raw_for_thinking.strip()
+
+                        # Yield display_text, raw_text (with thinking formatted), and stats
+                        yield display_text, raw_for_thinking, f"{tokens_per_sec:.1f} tok/s"
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
@@ -588,6 +685,18 @@ class LlamaCppVLM:
                 # Clean up thinking tags if present
                 if "</think>" in result:
                     result = result.split("</think>")[-1].strip()
+
+                # Clean up GPT-OSS Harmony format tags if present
+                if self.model_type == "gpt-oss":
+                    # For non-streaming, extract only the final channel content
+                    final_match = re.search(r'<\|channel\|>final<\|message\|>(.*?)(?:<\|(?:end|return)\|>|$)', result, re.DOTALL)
+                    if final_match:
+                        result = final_match.group(1).strip()
+                    else:
+                        # If no final channel, just clean up any tags
+                        result = re.sub(r'<\|channel\|>(analysis|commentary|final)<\|message\|>', '', result)
+                        result = re.sub(r'<\|(start|end|return|call)\|>', '', result)
+                        result = result.strip()
 
                 return result
 

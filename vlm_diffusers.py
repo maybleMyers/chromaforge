@@ -1156,16 +1156,10 @@ class Qwen3VLMBackend:
             except Exception as patch_err:
                 print(f"Warning: Could not patch lmdeploy InternVL: {patch_err}")
 
-            # Use PytorchEngineConfig - works better with local models that have
-            # dict configs (TurbomindEngineConfig has stricter config requirements)
-            # Set session_len for InternVL dynamic patching (up to 12 patches + thumbnail)
-            # which can require ~26,000 tokens per image
-            backend_config = PytorchEngineConfig(
-                cache_max_entry_count=0.2,
-                tp=tp,
-                session_len=context_len,
-            )
-            print(f"Using PytorchEngineConfig with tp={tp}, session_len={context_len}")
+            # Use PytorchEngineConfig - matches claudecaptioner2w.py pattern
+            # Do not set session_len - let lmdeploy use model defaults
+            backend_config = PytorchEngineConfig(cache_max_entry_count=0.2, tp=tp)
+            print(f"Using PytorchEngineConfig with tp={tp}")
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(
@@ -1730,14 +1724,9 @@ class Qwen3VLMBackend:
         else:
             lmdeploy_input = prompt_text
 
-        # Configure generation parameters
-        gen_config = {
-            "max_new_tokens": max_new_tokens,
-        }
-        if temperature > 0:
-            gen_config["temperature"] = temperature
-            gen_config["top_p"] = top_p
-            gen_config["top_k"] = top_k
+        # Note: generation parameters (max_new_tokens, temperature, etc.) are not passed
+        # to lmdeploy pipeline - it uses model defaults. This matches claudecaptioner2w.py
+        # which also calls the pipeline without generation config.
 
         # Generate with lmdeploy
         # Debug: log what we're passing to the pipeline
@@ -1749,14 +1738,11 @@ class Qwen3VLMBackend:
             print(f"[DEBUG] lmdeploy_input[1] type: {type(lmdeploy_input[1])}")
 
         try:
-            try:
-                from lmdeploy import GenerationConfig
-                gen_cfg = GenerationConfig(**gen_config)
-                print(f"[DEBUG] gen_config: {gen_config}")
-                response = self.lmdeploy_pipe(lmdeploy_input, gen_config=gen_cfg)
-            except ImportError:
-                # Fallback without GenerationConfig
-                response = self.lmdeploy_pipe(lmdeploy_input)
+            # Call pipeline directly without GenerationConfig wrapper
+            # This matches the working pattern from claudecaptioner2w.py
+            # GenerationConfig causes INPUT_LENGTH_ERROR with VLM image tokenization
+            print(f"[DEBUG] Calling lmdeploy pipeline directly (no GenerationConfig)")
+            response = self.lmdeploy_pipe(lmdeploy_input)
         finally:
             # Cleanup temp files after pipeline execution
             for temp_path in temp_files_to_cleanup:

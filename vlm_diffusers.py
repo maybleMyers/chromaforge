@@ -1717,32 +1717,24 @@ class Qwen3VLMBackend:
                 else:
                     processed_images.append(img)
 
-            if len(processed_images) == 1:
-                lmdeploy_input = (prompt_text, processed_images[0])
-            else:
-                lmdeploy_input = (prompt_text, processed_images)
+            # lmdeploy 0.11+ API: pipe([(prompt, [images])])
+            # Images must be in a list, and the whole input must be a list of tuples
+            lmdeploy_input = [(prompt_text, processed_images)]
         else:
-            lmdeploy_input = prompt_text
-
-        # Note: generation parameters (max_new_tokens, temperature, etc.) are not passed
-        # to lmdeploy pipeline - it uses model defaults. This matches claudecaptioner2w.py
-        # which also calls the pipeline without generation config.
+            # Text-only input for lmdeploy 0.11+
+            lmdeploy_input = [prompt_text]
 
         # Generate with lmdeploy
         # Debug: log what we're passing to the pipeline
         print(f"[DEBUG] prompt_text: {prompt_text[:100] if prompt_text else 'None'}...")
         print(f"[DEBUG] num_images: {len(all_images) if all_images else 0}")
-        print(f"[DEBUG] lmdeploy_input type: {type(lmdeploy_input)}")
-        if isinstance(lmdeploy_input, tuple):
-            print(f"[DEBUG] lmdeploy_input[0] (prompt): {lmdeploy_input[0][:100] if lmdeploy_input[0] else 'None'}...")
-            print(f"[DEBUG] lmdeploy_input[1] type: {type(lmdeploy_input[1])}")
+        print(f"[DEBUG] lmdeploy_input: {type(lmdeploy_input)}, len={len(lmdeploy_input)}")
 
         try:
-            # Call pipeline directly without GenerationConfig wrapper
-            # This matches the working pattern from claudecaptioner2w.py
-            # GenerationConfig causes INPUT_LENGTH_ERROR with VLM image tokenization
-            print(f"[DEBUG] Calling lmdeploy pipeline directly (no GenerationConfig)")
-            response = self.lmdeploy_pipe(lmdeploy_input)
+            # lmdeploy 0.11+ API: returns list of responses
+            print(f"[DEBUG] Calling lmdeploy pipeline with 0.11+ API format")
+            responses = self.lmdeploy_pipe(lmdeploy_input)
+            response = responses[0] if responses else None
         finally:
             # Cleanup temp files after pipeline execution
             for temp_path in temp_files_to_cleanup:
@@ -1752,7 +1744,9 @@ class Qwen3VLMBackend:
                     pass
 
         # Extract response text
-        if hasattr(response, 'text'):
+        if response is None:
+            output_text = "[Error: No response from model]"
+        elif hasattr(response, 'text'):
             output_text = response.text
         elif isinstance(response, str):
             output_text = response

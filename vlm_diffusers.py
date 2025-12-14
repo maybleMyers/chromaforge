@@ -463,6 +463,7 @@ class Qwen3VLMBackend:
         cpu_offload: bool = False,
         cpu_offload_ram: Optional[int] = None,
         backend: str = "transformers",
+        context_len: int = 8192,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -476,6 +477,7 @@ class Qwen3VLMBackend:
             cpu_offload: Enable CPU offloading for large models
             cpu_offload_ram: Max CPU RAM to use for offloading in GB
             backend: Inference backend ("transformers" or "lmdeploy")
+            context_len: Context/session length for lmdeploy
             progress: Gradio progress callback
 
         Returns:
@@ -485,7 +487,7 @@ class Qwen3VLMBackend:
         if backend == "lmdeploy":
             if not LMDEPLOY_AVAILABLE:
                 return "Error: lmdeploy not installed. Install with: pip install lmdeploy"
-            return self._load_model_lmdeploy(model_name, dtype, num_gpus, progress)
+            return self._load_model_lmdeploy(model_name, dtype, num_gpus, context_len, progress)
 
         if not TRANSFORMERS_AVAILABLE:
             return "Error: transformers not installed"
@@ -1083,6 +1085,7 @@ class Qwen3VLMBackend:
         model_name: str,
         dtype: str = "bfloat16",
         num_gpus: int = 1,
+        context_len: int = 8192,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -1093,6 +1096,7 @@ class Qwen3VLMBackend:
             model_name: Name of the model to load
             dtype: Data type (used for cache, model uses native format)
             num_gpus: Number of GPUs for tensor parallelism (tp)
+            context_len: Session/context length for lmdeploy
             progress: Gradio progress callback
 
         Returns:
@@ -1157,7 +1161,9 @@ class Qwen3VLMBackend:
             backend_config = PytorchEngineConfig(
                 cache_max_entry_count=0.2,
                 tp=tp,
+                session_len=context_len,
             )
+            print(f"Using session_len={context_len}")
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(
@@ -2022,6 +2028,7 @@ def load_model_handler(
     cpu_offload: bool = False,
     cpu_offload_ram: Optional[int] = None,
     backend: str = "transformers",
+    context_len: int = 8192,
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -2040,6 +2047,7 @@ def load_model_handler(
         cpu_offload=cpu_offload,
         cpu_offload_ram=cpu_ram,
         backend=backend,
+        context_len=context_len,
         progress=progress,
     )
 
@@ -2426,6 +2434,16 @@ def create_ui():
                     )
 
                 with gr.Column(scale=1):
+                    context_len_slider = gr.Slider(
+                        minimum=512,
+                        maximum=262144,
+                        value=8192,
+                        step=512,
+                        label="Context Length",
+                        info="Session length for lmdeploy",
+                    )
+
+                with gr.Column(scale=1):
                     max_memory_slider = gr.Slider(
                         minimum=0,
                         maximum=48,
@@ -2515,7 +2533,7 @@ def create_ui():
 
         load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider, backend_dropdown],
+            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, context_len_slider],
             outputs=[model_status],
         )
 

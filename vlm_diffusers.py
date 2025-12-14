@@ -1121,14 +1121,42 @@ class Qwen3VLMBackend:
             progress(0.3, desc=f"Loading model with lmdeploy (tp={tp})...")
             print(f"Loading {model_name} with lmdeploy backend (tp={tp})")
 
-            # Configure lmdeploy backend - match working examples exactly
-            # PytorchEngineConfig with simple settings works for local InternVL models
+            # Patch lmdeploy's InternVL handler to work with dict configs
+            # lmdeploy expects vision_config to be an object with attributes,
+            # but some models store it as a dict in config.json
+            try:
+                from lmdeploy.vl.model.internvl import InternVLVisionModel
+                from types import SimpleNamespace
+
+                def dict_to_namespace(d):
+                    """Recursively convert dict to SimpleNamespace for attribute access."""
+                    if isinstance(d, dict):
+                        return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
+                    elif isinstance(d, list):
+                        return [dict_to_namespace(i) for i in d]
+                    return d
+
+                _original_build_preprocessor = InternVLVisionModel.build_preprocessor
+
+                def _patched_build_preprocessor(self):
+                    # Convert vision_config dict to namespace if needed
+                    if hasattr(self, 'config') and hasattr(self.config, 'vision_config'):
+                        if isinstance(self.config.vision_config, dict):
+                            self.config.vision_config = dict_to_namespace(self.config.vision_config)
+                    return _original_build_preprocessor(self)
+
+                InternVLVisionModel.build_preprocessor = _patched_build_preprocessor
+                print("Patched lmdeploy InternVL config handling for dict vision_config")
+            except Exception as patch_err:
+                print(f"Warning: Could not patch lmdeploy InternVL handler: {patch_err}")
+
+            # Configure lmdeploy backend
             backend_config = PytorchEngineConfig(
                 cache_max_entry_count=0.2,
                 tp=tp,
             )
 
-            # Create lmdeploy pipeline - simple call like working examples
+            # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(
                 model_path,
                 backend_config=backend_config,

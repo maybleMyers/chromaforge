@@ -1158,12 +1158,13 @@ class Qwen3VLMBackend:
 
             # Use PytorchEngineConfig - works better with local models that have
             # dict configs (TurbomindEngineConfig has stricter config requirements)
+            # Note: Don't set session_len explicitly - let lmdeploy use model defaults
+            # Setting it explicitly may override model-specific settings incorrectly
             backend_config = PytorchEngineConfig(
                 cache_max_entry_count=0.2,
                 tp=tp,
-                session_len=context_len,
             )
-            print(f"Using session_len={context_len}")
+            print(f"Using PytorchEngineConfig with tp={tp}")
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(

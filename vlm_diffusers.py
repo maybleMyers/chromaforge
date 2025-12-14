@@ -1152,27 +1152,12 @@ class Qwen3VLMBackend:
             except Exception as patch_err:
                 print(f"Warning: Could not patch lmdeploy InternVL: {patch_err}")
 
-            # Detect if model is AWQ/GPTQ quantized for proper backend config
-            is_awq = 'awq' in model_name.lower() or 'awq' in model_path.lower()
-            is_gptq = 'gptq' in model_name.lower() or 'gptq' in model_path.lower()
-
-            if (is_awq or is_gptq) and TurbomindEngineConfig is not None:
-                # Use TurbomindEngineConfig for AWQ/GPTQ models (per lmdeploy docs)
-                model_format = 'awq' if is_awq else 'gptq'
-                backend_config = TurbomindEngineConfig(
-                    model_format=model_format,
-                    cache_max_entry_count=0.2,
-                    tp=tp,
-                )
-                print(f"Using TurbomindEngineConfig with model_format='{model_format}'")
-            else:
-                # Use PytorchEngineConfig for non-quantized models or fallback
-                backend_config = PytorchEngineConfig(
-                    cache_max_entry_count=0.2,
-                    tp=tp,
-                )
-                if is_awq or is_gptq:
-                    print("Warning: TurbomindEngineConfig not available, using PytorchEngineConfig for AWQ/GPTQ")
+            # Use PytorchEngineConfig - works better with local models that have
+            # dict configs (TurbomindEngineConfig has stricter config requirements)
+            backend_config = PytorchEngineConfig(
+                cache_max_entry_count=0.2,
+                tp=tp,
+            )
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(

@@ -2076,7 +2076,7 @@ def chat_handler(
     """Handle chat messages from UI."""
     empty_stats = "Tokens: 0 | Time: 0.00s | Speed: 0.00 tok/s"
 
-    if vlm_backend is None or vlm_backend.model is None:
+    if vlm_backend is None or (vlm_backend.model is None and vlm_backend.lmdeploy_pipe is None):
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded."})
@@ -2176,7 +2176,7 @@ def batch_caption_handler(
     progress=gr.Progress(),
 ):
     """Process a folder of images and generate captions."""
-    if vlm_backend is None or vlm_backend.model is None:
+    if vlm_backend is None or (vlm_backend.model is None and vlm_backend.lmdeploy_pipe is None):
         return "Error: No model loaded."
 
     if not folder_path or not os.path.isdir(folder_path):

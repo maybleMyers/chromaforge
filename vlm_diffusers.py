@@ -1121,11 +1121,11 @@ class Qwen3VLMBackend:
             progress(0.3, desc=f"Loading model with lmdeploy (tp={tp})...")
             print(f"Loading {model_name} with lmdeploy backend (tp={tp})")
 
-            # Patch lmdeploy's InternVL handler to work with dict configs
+            # Patch lmdeploy's InternVL config loading to handle dict vision_config
             # lmdeploy expects vision_config to be an object with attributes,
-            # but some models store it as a dict in config.json
+            # but local models may have it as a dict in config.json
             try:
-                from lmdeploy.vl.model.internvl import InternVLVisionModel
+                from lmdeploy.vl.model import internvl as lmdeploy_internvl
                 from types import SimpleNamespace
 
                 def dict_to_namespace(d):
@@ -1136,30 +1136,24 @@ class Qwen3VLMBackend:
                         return [dict_to_namespace(i) for i in d]
                     return d
 
-                _original_build_preprocessor = InternVLVisionModel.build_preprocessor
+                # Patch the InternVLVisionModel.__init__ to fix config after parent init
+                _original_init = lmdeploy_internvl.InternVLVisionModel.__init__
 
-                def _patched_build_preprocessor(self):
-                    # Try to access config directly - might be a property or __getattr__
+                def _patched_init(self, *args, **kwargs):
+                    _original_init(self, *args, **kwargs)
+                    # After init, fix vision_config if it's a dict
                     try:
-                        config = self.config
-                        print(f"[DEBUG] config type: {type(config)}")
-                        if hasattr(config, 'vision_config'):
-                            vc = config.vision_config
-                            print(f"[DEBUG] vision_config type: {type(vc)}")
-                            if isinstance(vc, dict):
-                                print(f"[DEBUG] Converting vision_config dict to namespace")
-                                self.config.vision_config = dict_to_namespace(vc)
-                                print(f"[DEBUG] After conversion: {type(self.config.vision_config)}")
+                        if hasattr(self, 'config') and hasattr(self.config, 'vision_config'):
+                            if isinstance(self.config.vision_config, dict):
+                                self.config.vision_config = dict_to_namespace(self.config.vision_config)
+                                print("Converted vision_config dict to namespace in __init__")
                     except Exception as e:
-                        print(f"[DEBUG] Error accessing config: {e}")
-                        # Print all attributes to debug
-                        print(f"[DEBUG] self.__dict__: {self.__dict__.keys() if hasattr(self, '__dict__') else 'no __dict__'}")
-                    return _original_build_preprocessor(self)
+                        print(f"Note: vision_config conversion in __init__: {e}")
 
-                InternVLVisionModel.build_preprocessor = _patched_build_preprocessor
-                print("Patched lmdeploy InternVL config handling for dict vision_config")
+                lmdeploy_internvl.InternVLVisionModel.__init__ = _patched_init
+                print("Patched lmdeploy InternVL __init__ for dict vision_config")
             except Exception as patch_err:
-                print(f"Warning: Could not patch lmdeploy InternVL handler: {patch_err}")
+                print(f"Warning: Could not patch lmdeploy InternVL: {patch_err}")
 
             # Configure lmdeploy backend
             backend_config = PytorchEngineConfig(
@@ -2402,26 +2396,24 @@ def create_ui():
                     dtype_dropdown = gr.Dropdown(
                         label="Precision",
                         choices=[
+                            "bfloat16",     # Full bf16 (~62GB)
+                            "float16",      # Full fp16 (~62GB)
                             "q8_fp16",      # INT8 + fp16 vision (fast, ~30GB)
                             "q4_nf4",       # 4-bit NF4 + bf16 compute (~20GB)
                             "fp8_scaled",   # FP8 manual (RTX 40/50 native, ~31GB)
                             "q8_partial",   # INT8 + bf16 vision (slow - casting)
-                            "bfloat16",     # Full bf16 (~62GB)
-                            "float16",      # Full fp16 (~62GB)
                         ],
-                        value="q8_fp16",
-                        info="q8_fp16: fast INT8 (~30GB) | q4_nf4: smallest (~20GB)",
+                        value="bfloat16",
+                        info="bfloat16: full precision | q8_fp16: INT8 (~30GB)",
                     )
 
                 with gr.Column(scale=1):
                     # Backend selection - lmdeploy for AWQ/GPTQ models
-                    backend_choices = ["transformers"]
-                    if LMDEPLOY_AVAILABLE:
-                        backend_choices.append("lmdeploy")
+                    backend_choices = ["lmdeploy", "transformers"] if LMDEPLOY_AVAILABLE else ["transformers"]
                     backend_dropdown = gr.Dropdown(
                         label="Backend",
                         choices=backend_choices,
-                        value="transformers",
+                        value="lmdeploy" if LMDEPLOY_AVAILABLE else "transformers",
                         info="lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install lmdeploy for AWQ support",
                     )
 

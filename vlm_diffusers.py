@@ -1158,13 +1158,14 @@ class Qwen3VLMBackend:
 
             # Use PytorchEngineConfig - works better with local models that have
             # dict configs (TurbomindEngineConfig has stricter config requirements)
-            # Note: Don't set session_len explicitly - let lmdeploy use model defaults
-            # Setting it explicitly may override model-specific settings incorrectly
+            # Set session_len for InternVL dynamic patching (up to 12 patches + thumbnail)
+            # which can require ~26,000 tokens per image
             backend_config = PytorchEngineConfig(
                 cache_max_entry_count=0.2,
                 tp=tp,
+                session_len=context_len,
             )
-            print(f"Using PytorchEngineConfig with tp={tp}")
+            print(f"Using PytorchEngineConfig with tp={tp}, session_len={context_len}")
 
             # Create lmdeploy pipeline
             self.lmdeploy_pipe = lmdeploy_pipeline(
@@ -1701,23 +1702,16 @@ class Qwen3VLMBackend:
 
         # Prepare lmdeploy input
         # lmdeploy expects (prompt, image) tuple for VLMs
-        # Use lmdeploy's load_image for proper preprocessing
+        # lmdeploy.vl.load_image() accepts PIL.Image directly - no temp files needed
         if all_images:
-            import tempfile
             processed_images = []
             for img in all_images:
                 if isinstance(img, Image.Image):
-                    # Save PIL image to temp file and load with lmdeploy
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                        img.save(f, format='PNG')
-                        temp_path = f.name
-                    try:
-                        if lmdeploy_load_image is not None:
-                            processed_images.append(lmdeploy_load_image(temp_path))
-                        else:
-                            processed_images.append(img)
-                    finally:
-                        os.unlink(temp_path)
+                    # Pass PIL image directly to load_image (it accepts Union[str, Image.Image])
+                    if lmdeploy_load_image is not None:
+                        processed_images.append(lmdeploy_load_image(img))
+                    else:
+                        processed_images.append(img)
                 else:
                     processed_images.append(img)
 

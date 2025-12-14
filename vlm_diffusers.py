@@ -174,6 +174,7 @@ try:
     import transformers
     from transformers import (
         AutoProcessor,
+        AutoModel,
         AutoModelForVision2Seq,
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -358,8 +359,11 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                 arch = config.get("architectures", [""])[0].lower()
                 model_type_str = config.get("model_type", "").lower()
 
+                # Detect InternVL models
+                if "internvl" in arch or "internvl" in model_type_str:
+                    model_type = "internvl"
                 # Detect Qwen models
-                if "qwen" in arch or "qwen" in model_type_str:
+                elif "qwen" in arch or "qwen" in model_type_str:
                     if "vl" in arch or "vision" in model_type_str or config.get("vision_config"):
                         model_type = "qwen-vl"
                     else:
@@ -373,8 +377,8 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
         except Exception:
             pass
 
-        # Include Qwen and GLM models
-        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl"]:
+        # Include Qwen, GLM, and InternVL models
+        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl", "internvl"]:
             models.append({
                 "name": model_dir.name,
                 "path": str(model_dir),
@@ -546,8 +550,17 @@ class Qwen3VLMBackend:
             progress(0.2, desc="Loading processor/tokenizer...")
 
             # Load processor or tokenizer based on model type
-            if model_type in ["qwen-vl", "glm-vl"]:
-                if model_type == "glm-vl" and (GLM4V_AVAILABLE or GLM46V_AVAILABLE):
+            if model_type in ["qwen-vl", "glm-vl", "internvl"]:
+                if model_type == "internvl":
+                    # InternVL uses AutoTokenizer with trust_remote_code
+                    # The model has its own chat() method that handles image processing
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+                    self.processor = None  # InternVL doesn't use a separate processor
+                    print(f"Loaded tokenizer for InternVL model {model_name}")
+                elif model_type == "glm-vl" and (GLM4V_AVAILABLE or GLM46V_AVAILABLE):
                     # Detect GLM version by checking preprocessor_config.json
                     # GLM-4.6V uses Glm46V* classes, GLM-4.1V uses Glm4v* classes
                     preprocessor_config_path = os.path.join(model_path, "preprocessor_config.json")
@@ -726,7 +739,7 @@ class Qwen3VLMBackend:
                 model_kwargs["dtype"] = torch_dtype
 
             # Use appropriate model class based on type
-            if model_type in ["qwen-vl", "glm-vl"]:
+            if model_type in ["qwen-vl", "glm-vl", "internvl"]:
                 # Detect model architecture from config to choose the right class
                 config_path = os.path.join(model_path, "config.json")
                 model_type_from_config = None
@@ -738,10 +751,18 @@ class Qwen3VLMBackend:
 
                 loaded = False
 
+                # For InternVL models
+                # InternVL uses custom model classes via auto_map with trust_remote_code
+                if model_type_from_config == "internvl_chat":
+                    print("Loading as InternVL model using AutoModel with trust_remote_code...")
+                    self.model = AutoModel.from_pretrained(**model_kwargs)
+                    print("Loaded as InternVL model")
+                    loaded = True
+
                 # For GLM-4V/4.6V models
                 # GLM-4.6V-Flash uses Glm4vForConditionalGeneration (model) but Glm46V* (processors)
                 # GLM-4.1V uses Glm4v* for both model and processors
-                if model_type_from_config in ["glm4v", "glm46v"]:
+                if not loaded and model_type_from_config in ["glm4v", "glm46v"]:
                     # Check GLM version from preprocessor_config (already detected earlier via is_glm46v)
                     # Re-detect here for model loading decision
                     preprocessor_config_path = os.path.join(model_path, "preprocessor_config.json")
@@ -1094,8 +1115,14 @@ class Qwen3VLMBackend:
             return "Error: No model loaded. Please load a model first.", empty_stats
 
         try:
+            # Handle InternVL models (use model's built-in chat method)
+            if self.current_model_type == "internvl" and self.tokenizer is not None:
+                return self._generate_internvl(
+                    messages, images, video_path,
+                    max_new_tokens, temperature, top_p, top_k, video_max_frames
+                )
             # Handle vision-language model (Qwen-VL, GLM-VL, etc.)
-            if self.current_model_type in ["qwen-vl", "glm-vl"] and self.processor is not None:
+            elif self.current_model_type in ["qwen-vl", "glm-vl"] and self.processor is not None:
                 return self._generate_vl(
                     messages, images, video_path,
                     max_new_tokens, temperature, top_p, top_k, video_max_frames
@@ -1422,6 +1449,247 @@ class Qwen3VLMBackend:
         print(f"Generated {num_tokens} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
 
         return output_text, stats
+
+    def _generate_internvl(
+        self,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Image.Image]],
+        video_path: Optional[str],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        video_max_frames: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate response from InternVL model using its built-in chat() method."""
+        start_time = time.perf_counter()
+
+        # Extract images and text from messages
+        all_images = []
+        question_text = ""
+        system_text = ""
+        history = []  # List of (question, answer) tuples
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "system":
+                if isinstance(content, str):
+                    system_text = content
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            system_text = item.get("text", "")
+
+            elif role == "user":
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") == "image" and "image" in item:
+                                img = item["image"]
+                                if isinstance(img, Image.Image):
+                                    all_images.append(img)
+                            elif item.get("type") == "video" and "video" in item:
+                                vid_path = item["video"]
+                                if isinstance(vid_path, str) and os.path.exists(vid_path):
+                                    try:
+                                        frames = extract_video_frames(vid_path, max_frames=video_max_frames)
+                                        all_images.extend(frames)
+                                    except Exception as e:
+                                        print(f"Video extraction error: {e}")
+                    question_text = " ".join(text_parts) if text_parts else ""
+                else:
+                    question_text = str(content)
+
+            elif role == "assistant":
+                # Store as history for multi-turn chat
+                if question_text and str(content):
+                    history.append((question_text, str(content)))
+                    question_text = ""
+
+        # Add direct images if provided
+        if images:
+            all_images.extend(images)
+
+        # Add video frames if provided
+        if video_path and os.path.exists(video_path):
+            try:
+                frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                all_images.extend(frames)
+            except Exception as e:
+                print(f"Video extraction error: {e}")
+
+        # Prepare pixel_values for InternVL
+        pixel_values = None
+        num_patches_list = None
+
+        if all_images:
+            pixel_values, num_patches_list = self._load_internvl_images(all_images)
+            if pixel_values is not None:
+                # Move to model device
+                if hasattr(self.model, "hf_device_map"):
+                    first_device = next(iter(self.model.hf_device_map.values()))
+                    if isinstance(first_device, int):
+                        pixel_values = pixel_values.to(f"cuda:{first_device}")
+                    else:
+                        pixel_values = pixel_values.to(first_device)
+                else:
+                    pixel_values = pixel_values.to(self.model.device)
+
+        # Set custom system message if provided
+        if system_text:
+            self.model.system_message = system_text
+
+        # Build generation config
+        generation_config = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            generation_config["temperature"] = temperature
+            generation_config["top_p"] = top_p
+            generation_config["top_k"] = top_k
+
+        # Use the model's chat method
+        if not question_text:
+            question_text = "Describe this image." if all_images else "Hello"
+
+        response = self.model.chat(
+            tokenizer=self.tokenizer,
+            pixel_values=pixel_values,
+            question=question_text,
+            generation_config=generation_config,
+            num_patches_list=num_patches_list,
+            history=history if history else None,
+            return_history=False,
+            verbose=False,
+        )
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        # Estimate token count (rough approximation)
+        num_tokens = len(self.tokenizer.encode(response))
+        tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
+
+        stats = {
+            "tokens": num_tokens,
+            "time": elapsed_time,
+            "tokens_per_sec": tokens_per_sec,
+        }
+        print(f"Generated {num_tokens} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
+
+        return response, stats
+
+    def _load_internvl_images(
+        self,
+        images: List[Image.Image],
+        max_num: int = 12,
+        input_size: int = 448,
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[int]]]:
+        """
+        Load and preprocess images for InternVL model.
+        Supports dynamic image sizing with multiple patches.
+
+        Args:
+            images: List of PIL Images
+            max_num: Maximum number of patches per image
+            input_size: Input size for each patch
+
+        Returns:
+            Tuple of (pixel_values tensor, num_patches_list)
+        """
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+
+        def build_transform(input_size):
+            return T.Compose([
+                T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+                T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+                T.ToTensor(),
+                T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+            ])
+
+        def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+            best_ratio_diff = float('inf')
+            best_ratio = (1, 1)
+            area = width * height
+            for ratio in target_ratios:
+                target_aspect_ratio = ratio[0] / ratio[1]
+                ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+                if ratio_diff < best_ratio_diff:
+                    best_ratio_diff = ratio_diff
+                    best_ratio = ratio
+                elif ratio_diff == best_ratio_diff:
+                    if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                        best_ratio = ratio
+            return best_ratio
+
+        def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=True):
+            orig_width, orig_height = image.size
+            aspect_ratio = orig_width / orig_height
+
+            # Calculate possible aspect ratios
+            target_ratios = set(
+                (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+                i * j <= max_num and i * j >= min_num)
+            target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+            # Find closest aspect ratio
+            target_aspect_ratio = find_closest_aspect_ratio(
+                aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+            # Calculate target dimensions
+            target_width = image_size * target_aspect_ratio[0]
+            target_height = image_size * target_aspect_ratio[1]
+            blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+            # Resize and split into patches
+            resized_img = image.resize((target_width, target_height))
+            processed_images = []
+            for i in range(blocks):
+                box = (
+                    (i % (target_width // image_size)) * image_size,
+                    (i // (target_width // image_size)) * image_size,
+                    ((i % (target_width // image_size)) + 1) * image_size,
+                    ((i // (target_width // image_size)) + 1) * image_size
+                )
+                # Split into patches
+                split_img = resized_img.crop(box)
+                processed_images.append(split_img)
+
+            if use_thumbnail and len(processed_images) != 1:
+                thumbnail_img = image.resize((image_size, image_size))
+                processed_images.append(thumbnail_img)
+
+            return processed_images
+
+        transform = build_transform(input_size=input_size)
+        all_pixel_values = []
+        num_patches_list = []
+
+        for img in images:
+            # Dynamic preprocessing
+            patches = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
+            pixel_values = [transform(patch) for patch in patches]
+            pixel_values = torch.stack(pixel_values)
+            all_pixel_values.append(pixel_values)
+            num_patches_list.append(pixel_values.shape[0])
+
+        if all_pixel_values:
+            # Concatenate all patches
+            pixel_values = torch.cat(all_pixel_values, dim=0)
+            # Convert to bfloat16 for model
+            pixel_values = pixel_values.to(torch.bfloat16)
+            return pixel_values, num_patches_list
+        return None, None
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path."""
@@ -2021,7 +2289,7 @@ def main():
 
     print("=" * 60)
     print("Chromaforge VLM Chat (Diffusers/Transformers Backend)")
-    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4.6V")
+    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4.6V, InternVL")
     print("=" * 60)
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
@@ -2049,7 +2317,7 @@ def main():
             print(f"  - {m['name']} ({m['type']})")
     else:
         print(f"\nNo models found in {args.models_dir}")
-        print("Download Qwen-VL or GLM-4V models and place them in this directory.")
+        print("Download Qwen-VL, GLM-4V, or InternVL models and place them in this directory.")
 
     print("=" * 60)
 

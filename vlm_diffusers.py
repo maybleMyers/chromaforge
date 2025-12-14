@@ -252,6 +252,21 @@ except ImportError:
     QWEN_VL_UTILS_AVAILABLE = False
     print("Warning: qwen-vl-utils not installed. Install with: pip install qwen-vl-utils")
 
+# Try to import lmdeploy for optimized VLM inference (supports AWQ, GPTQ, etc.)
+try:
+    from lmdeploy import pipeline as lmdeploy_pipeline
+    from lmdeploy import PytorchEngineConfig, TurbomindEngineConfig
+    from lmdeploy.vl import load_image as lmdeploy_load_image
+    LMDEPLOY_AVAILABLE = True
+    print("lmdeploy: available (optimized VLM inference with AWQ/GPTQ support)")
+except ImportError:
+    LMDEPLOY_AVAILABLE = False
+    lmdeploy_pipeline = None
+    PytorchEngineConfig = None
+    TurbomindEngineConfig = None
+    lmdeploy_load_image = None
+    print("Note: lmdeploy not installed. Install with: pip install lmdeploy")
+
 
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
@@ -404,6 +419,10 @@ class Qwen3VLMBackend:
         self.current_model_type: Optional[str] = None
         self.device_map = None
 
+        # lmdeploy backend support
+        self.lmdeploy_pipe = None
+        self.current_backend: Optional[str] = None  # "transformers" or "lmdeploy"
+
         # Check GPU availability
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         print(f"Detected {self.num_gpus} GPU(s)")
@@ -443,6 +462,7 @@ class Qwen3VLMBackend:
         max_memory_per_gpu: Optional[int] = None,
         cpu_offload: bool = False,
         cpu_offload_ram: Optional[int] = None,
+        backend: str = "transformers",
         progress=gr.Progress(),
     ) -> str:
         """
@@ -455,11 +475,18 @@ class Qwen3VLMBackend:
             max_memory_per_gpu: Max memory per GPU in GB (None = auto)
             cpu_offload: Enable CPU offloading for large models
             cpu_offload_ram: Max CPU RAM to use for offloading in GB
+            backend: Inference backend ("transformers" or "lmdeploy")
             progress: Gradio progress callback
 
         Returns:
             Status message
         """
+        # Check backend availability
+        if backend == "lmdeploy":
+            if not LMDEPLOY_AVAILABLE:
+                return "Error: lmdeploy not installed. Install with: pip install lmdeploy"
+            return self._load_model_lmdeploy(model_name, dtype, num_gpus, progress)
+
         if not TRANSFORMERS_AVAILABLE:
             return "Error: transformers not installed"
 
@@ -1051,16 +1078,105 @@ class Qwen3VLMBackend:
             self.tokenizer = None
             return f"Error loading model: {str(e)}"
 
+    def _load_model_lmdeploy(
+        self,
+        model_name: str,
+        dtype: str = "bfloat16",
+        num_gpus: int = 1,
+        progress=gr.Progress(),
+    ) -> str:
+        """
+        Load a VLM model using lmdeploy backend.
+        lmdeploy provides optimized inference with native AWQ/GPTQ support.
+
+        Args:
+            model_name: Name of the model to load
+            dtype: Data type (used for cache, model uses native format)
+            num_gpus: Number of GPUs for tensor parallelism (tp)
+            progress: Gradio progress callback
+
+        Returns:
+            Status message
+        """
+        # Find the model
+        models = self.get_available_models()
+        model_info = next((m for m in models if m["name"] == model_name), None)
+
+        if model_info is None:
+            return f"Error: Model '{model_name}' not found"
+
+        model_path = model_info["path"]
+        model_type = model_info["type"]
+
+        # Unload current model if any
+        if self.model is not None or self.lmdeploy_pipe is not None:
+            self.unload_model()
+
+        try:
+            progress(0.1, desc="Configuring lmdeploy...")
+
+            # Determine tensor parallelism
+            tp = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 1
+
+            progress(0.3, desc=f"Loading model with lmdeploy (tp={tp})...")
+            print(f"Loading {model_name} with lmdeploy backend (tp={tp})")
+
+            # Configure lmdeploy backend
+            # PytorchEngineConfig is more compatible, TurbomindEngineConfig is faster for supported models
+            # cache_max_entry_count controls KV cache size (0.2 = 20% of available memory)
+            backend_config = PytorchEngineConfig(
+                cache_max_entry_count=0.2,
+                tp=tp,
+            )
+
+            # Create lmdeploy pipeline
+            self.lmdeploy_pipe = lmdeploy_pipeline(
+                model_path,
+                backend_config=backend_config,
+                log_level='WARNING',
+            )
+
+            self.current_model_path = model_path
+            self.current_model_type = model_type
+            self.current_backend = "lmdeploy"
+
+            # Clear transformers model references
+            self.model = None
+            self.processor = None
+            self.tokenizer = None
+
+            progress(1.0, desc="Model loaded!")
+            print(f"Successfully loaded {model_name} with lmdeploy")
+
+            return f"Loaded: {model_name} ({model_type}) via lmdeploy (tp={tp})"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.lmdeploy_pipe = None
+            self.current_backend = None
+            return f"Error loading model with lmdeploy: {str(e)}"
+
     def unload_model(self) -> str:
         """Unload the current model and free GPU memory."""
-        if self.model is None:
+        if self.model is None and self.lmdeploy_pipe is None:
             return "No model loaded"
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "model"
 
         try:
-            # Delete model and related objects
-            del self.model
+            # Handle lmdeploy pipeline
+            if self.lmdeploy_pipe is not None:
+                try:
+                    self.lmdeploy_pipe.close()
+                except:
+                    pass
+                del self.lmdeploy_pipe
+                self.lmdeploy_pipe = None
+
+            # Delete transformers model and related objects
+            if self.model is not None:
+                del self.model
             if self.processor is not None:
                 del self.processor
             if self.tokenizer is not None:
@@ -1071,6 +1187,7 @@ class Qwen3VLMBackend:
             self.tokenizer = None
             self.current_model_path = None
             self.current_model_type = None
+            self.current_backend = None
             self.device_map = None
 
             # Force garbage collection
@@ -1091,13 +1208,17 @@ class Qwen3VLMBackend:
 
     def get_status(self) -> str:
         """Get current status."""
-        if self.model is None:
+        if self.model is None and self.lmdeploy_pipe is None:
             return "No model loaded"
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "Unknown"
 
-        # Get device info
-        if hasattr(self.model, "hf_device_map"):
+        # Handle lmdeploy backend
+        if self.current_backend == "lmdeploy" and self.lmdeploy_pipe is not None:
+            return f"Loaded: {model_name} ({self.current_model_type}) via lmdeploy"
+
+        # Get device info for transformers backend
+        if self.model is not None and hasattr(self.model, "hf_device_map"):
             unique_devices = set(self.model.hf_device_map.values())
             device_str = f"devices: {unique_devices}"
         else:
@@ -1134,10 +1255,17 @@ class Qwen3VLMBackend:
         """
         empty_stats = {"tokens": 0, "time": 0.0, "tokens_per_sec": 0.0}
 
-        if self.model is None:
+        if self.model is None and self.lmdeploy_pipe is None:
             return "Error: No model loaded. Please load a model first.", empty_stats
 
         try:
+            # Handle lmdeploy backend
+            if self.current_backend == "lmdeploy" and self.lmdeploy_pipe is not None:
+                return self._generate_lmdeploy(
+                    messages, images, video_path,
+                    max_new_tokens, temperature, top_p, top_k, video_max_frames
+                )
+
             # Handle InternVL models (use model's built-in chat method)
             if self.current_model_type == "internvl" and self.tokenizer is not None:
                 return self._generate_internvl(
@@ -1473,6 +1601,122 @@ class Qwen3VLMBackend:
 
         return output_text, stats
 
+    def _generate_lmdeploy(
+        self,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Image.Image]],
+        video_path: Optional[str],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        video_max_frames: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate response using lmdeploy pipeline."""
+        start_time = time.perf_counter()
+
+        # Extract images and text from messages
+        all_images = []
+        prompt_text = ""
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "user":
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") == "image" and "image" in item:
+                                img = item["image"]
+                                if isinstance(img, Image.Image):
+                                    all_images.append(img)
+                            elif item.get("type") == "video" and "video" in item:
+                                vid_path = item["video"]
+                                if isinstance(vid_path, str) and os.path.exists(vid_path):
+                                    try:
+                                        frames = extract_video_frames(vid_path, max_frames=video_max_frames)
+                                        all_images.extend(frames)
+                                    except Exception as e:
+                                        print(f"Video extraction error: {e}")
+                    prompt_text = " ".join(text_parts) if text_parts else ""
+                else:
+                    prompt_text = str(content)
+
+        # Add direct images if provided
+        if images:
+            all_images.extend(images)
+
+        # Add video frames if provided
+        if video_path and os.path.exists(video_path):
+            try:
+                frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                all_images.extend(frames)
+            except Exception as e:
+                print(f"Video extraction error: {e}")
+
+        # Default prompt if none provided
+        if not prompt_text:
+            prompt_text = "Describe this image in detail." if all_images else "Hello"
+
+        # Prepare lmdeploy input
+        # lmdeploy expects (prompt, image) tuple for VLMs
+        if all_images:
+            # For multiple images, lmdeploy typically takes the first one
+            # or you can pass a list depending on model support
+            if len(all_images) == 1:
+                lmdeploy_input = (prompt_text, all_images[0])
+            else:
+                # For multiple images, some models support list input
+                lmdeploy_input = (prompt_text, all_images)
+        else:
+            lmdeploy_input = prompt_text
+
+        # Configure generation parameters
+        gen_config = {
+            "max_new_tokens": max_new_tokens,
+        }
+        if temperature > 0:
+            gen_config["temperature"] = temperature
+            gen_config["top_p"] = top_p
+            gen_config["top_k"] = top_k
+
+        # Generate with lmdeploy
+        try:
+            from lmdeploy import GenerationConfig
+            gen_cfg = GenerationConfig(**gen_config)
+            response = self.lmdeploy_pipe(lmdeploy_input, gen_config=gen_cfg)
+        except ImportError:
+            # Fallback without GenerationConfig
+            response = self.lmdeploy_pipe(lmdeploy_input)
+
+        # Extract response text
+        if hasattr(response, 'text'):
+            output_text = response.text
+        elif isinstance(response, str):
+            output_text = response
+        else:
+            output_text = str(response)
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        # Estimate token count
+        num_tokens = len(output_text.split()) * 1.3  # Rough estimate
+        tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
+
+        stats = {
+            "tokens": int(num_tokens),
+            "time": elapsed_time,
+            "tokens_per_sec": tokens_per_sec,
+        }
+        print(f"Generated ~{int(num_tokens)} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
+
+        return output_text, stats
+
     def _generate_internvl(
         self,
         messages: List[Dict[str, Any]],
@@ -1747,6 +1991,7 @@ def load_model_handler(
     max_memory_per_gpu: Optional[int],
     cpu_offload: bool = False,
     cpu_offload_ram: Optional[int] = None,
+    backend: str = "transformers",
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -1764,6 +2009,7 @@ def load_model_handler(
         max_memory_per_gpu=max_mem,
         cpu_offload=cpu_offload,
         cpu_offload_ram=cpu_ram,
+        backend=backend,
         progress=progress,
     )
 
@@ -2130,6 +2376,18 @@ def create_ui():
                     )
 
                 with gr.Column(scale=1):
+                    # Backend selection - lmdeploy for AWQ/GPTQ models
+                    backend_choices = ["transformers"]
+                    if LMDEPLOY_AVAILABLE:
+                        backend_choices.append("lmdeploy")
+                    backend_dropdown = gr.Dropdown(
+                        label="Backend",
+                        choices=backend_choices,
+                        value="transformers",
+                        info="lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install lmdeploy for AWQ support",
+                    )
+
+                with gr.Column(scale=1):
                     num_gpus_slider = gr.Slider(
                         minimum=1,
                         maximum=max(8, num_gpus),
@@ -2229,7 +2487,7 @@ def create_ui():
 
         load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider],
+            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider, backend_dropdown],
             outputs=[model_status],
         )
 
@@ -2316,6 +2574,7 @@ def main():
     print("=" * 60)
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
+    print(f"lmdeploy: {'available (AWQ/GPTQ support)' if LMDEPLOY_AVAILABLE else 'NOT INSTALLED (pip install lmdeploy for AWQ)'}")
     print(f"qwen-vl-utils: {'available' if QWEN_VL_UTILS_AVAILABLE else 'NOT INSTALLED (optional, only for Qwen)'}")
     print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")

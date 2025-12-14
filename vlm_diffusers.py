@@ -1139,24 +1139,21 @@ class Qwen3VLMBackend:
                 _original_build_preprocessor = InternVLVisionModel.build_preprocessor
 
                 def _patched_build_preprocessor(self):
-                    # Debug: print what we have
-                    print(f"[DEBUG] Patch called, self type: {type(self)}")
-                    print(f"[DEBUG] hasattr config: {hasattr(self, 'config')}")
-                    if hasattr(self, 'config'):
-                        print(f"[DEBUG] config type: {type(self.config)}")
-                        print(f"[DEBUG] config keys/attrs: {dir(self.config)[:10]}...")
-                        if hasattr(self.config, 'vision_config'):
-                            print(f"[DEBUG] vision_config type: {type(self.config.vision_config)}")
-                            if isinstance(self.config.vision_config, dict):
+                    # Try to access config directly - might be a property or __getattr__
+                    try:
+                        config = self.config
+                        print(f"[DEBUG] config type: {type(config)}")
+                        if hasattr(config, 'vision_config'):
+                            vc = config.vision_config
+                            print(f"[DEBUG] vision_config type: {type(vc)}")
+                            if isinstance(vc, dict):
                                 print(f"[DEBUG] Converting vision_config dict to namespace")
-                                self.config.vision_config = dict_to_namespace(self.config.vision_config)
-                        elif hasattr(self.config, '__getitem__'):
-                            # Config might be dict-like
-                            try:
-                                vc = self.config['vision_config']
-                                print(f"[DEBUG] vision_config via __getitem__: {type(vc)}")
-                            except:
-                                pass
+                                self.config.vision_config = dict_to_namespace(vc)
+                                print(f"[DEBUG] After conversion: {type(self.config.vision_config)}")
+                    except Exception as e:
+                        print(f"[DEBUG] Error accessing config: {e}")
+                        # Print all attributes to debug
+                        print(f"[DEBUG] self.__dict__: {self.__dict__.keys() if hasattr(self, '__dict__') else 'no __dict__'}")
                     return _original_build_preprocessor(self)
 
                 InternVLVisionModel.build_preprocessor = _patched_build_preprocessor

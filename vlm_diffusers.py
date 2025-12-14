@@ -1700,14 +1700,30 @@ class Qwen3VLMBackend:
 
         # Prepare lmdeploy input
         # lmdeploy expects (prompt, image) tuple for VLMs
+        # Use lmdeploy's load_image for proper preprocessing
         if all_images:
-            # For multiple images, lmdeploy typically takes the first one
-            # or you can pass a list depending on model support
-            if len(all_images) == 1:
-                lmdeploy_input = (prompt_text, all_images[0])
+            import tempfile
+            processed_images = []
+            for img in all_images:
+                if isinstance(img, Image.Image):
+                    # Save PIL image to temp file and load with lmdeploy
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                        img.save(f, format='PNG')
+                        temp_path = f.name
+                    try:
+                        if lmdeploy_load_image is not None:
+                            processed_images.append(lmdeploy_load_image(temp_path))
+                        else:
+                            processed_images.append(img)
+                    finally:
+                        os.unlink(temp_path)
+                else:
+                    processed_images.append(img)
+
+            if len(processed_images) == 1:
+                lmdeploy_input = (prompt_text, processed_images[0])
             else:
-                # For multiple images, some models support list input
-                lmdeploy_input = (prompt_text, all_images)
+                lmdeploy_input = (prompt_text, processed_images)
         else:
             lmdeploy_input = prompt_text
 

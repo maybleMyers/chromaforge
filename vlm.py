@@ -230,7 +230,7 @@ class LlamaCppVLM:
     """Manages VLM inference via llama-cpp-python or native llama-server subprocess."""
 
     # Default path to llama-server executable
-    DEFAULT_LLAMA_SERVER_PATH = "llama-server.exe"
+    DEFAULT_LLAMA_SERVER_PATH = "llama-server"
 
     def __init__(self, models_dir: str = "models/LLM"):
         """Initialize llama.cpp VLM Manager."""
@@ -1578,8 +1578,8 @@ def create_ui():
                 with gr.Column(scale=2):
                     llama_server_path = gr.Textbox(
                         label="llama-server Path",
-                        placeholder="llama-server.exe",
-                        value="llama-server.exe",
+                        placeholder="llama-server",
+                        value="llama-server",
                         info="Path to llama-server executable",
                     )
 

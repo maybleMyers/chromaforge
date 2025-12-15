@@ -1181,26 +1181,27 @@ def chat_handler(
     messages = []
 
     # Add system prompt if provided
-    if system_prompt.strip():
+    if system_prompt and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
 
-    # Add chat history
-    for msg in history:
-        if isinstance(msg, dict):
-            role = msg.get("role")
-            content = msg.get("content")
-            if role and content:
-                # Extract text content for the model
-                if isinstance(content, str):
-                    messages.append({"role": role, "content": content})
-                elif isinstance(content, list):
-                    # Extract text from multimodal content
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                    if text_parts:
-                        messages.append({"role": role, "content": " ".join(text_parts)})
+    # Add chat history (handle None case)
+    if history:
+        for msg in history:
+            if isinstance(msg, dict):
+                role = msg.get("role")
+                content = msg.get("content")
+                if role and content:
+                    # Extract text content for the model
+                    if isinstance(content, str):
+                        messages.append({"role": role, "content": content})
+                    elif isinstance(content, list):
+                        # Extract text from multimodal content
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                        if text_parts:
+                            messages.append({"role": role, "content": " ".join(text_parts)})
 
     # Build current message content for model
     model_content = []
@@ -1304,7 +1305,11 @@ def batch_caption_handler(
     progress=gr.Progress(),
 ):
     """Process a folder of images and generate captions."""
-    if vlm_manager is None or vlm_manager.model is None:
+    model_ready = (
+        vlm_manager is not None and
+        (vlm_manager.model is not None or vlm_manager.use_server_backend)
+    )
+    if not model_ready:
         return "Error: No model loaded. Please load a model first."
 
     if not folder_path or not os.path.isdir(folder_path):
@@ -1574,7 +1579,7 @@ def create_ui():
                 with gr.Column(scale=1):
                     flash_attn = gr.Checkbox(
                         label="Flash Attention",
-                        value=True,
+                        value=False,
                         info="Faster attention (requires layers on GPU)",
                     )
 
@@ -1597,8 +1602,8 @@ def create_ui():
                 with gr.Column(scale=2):
                     llama_server_path = gr.Textbox(
                         label="llama-server Path",
-                        placeholder="llama-server",
-                        value="llama-server",
+                        placeholder="llama.cpp/build/bin/llama-server",
+                        value="llama.cpp/build/bin/llama-server",
                         info="Path to llama-server executable",
                     )
 

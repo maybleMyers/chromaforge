@@ -1165,7 +1165,12 @@ def chat_handler(
     show_thinking: bool = False,
 ):
     """Handle chat messages from UI with streaming support."""
-    if vlm_manager is None or vlm_manager.model is None:
+    # Check if any model is loaded (either local or server mode)
+    model_ready = (
+        vlm_manager is not None and
+        (vlm_manager.model is not None or vlm_manager.use_server_backend)
+    )
+    if not model_ready:
         error_history = list(history)
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})

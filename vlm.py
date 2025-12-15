@@ -589,9 +589,9 @@ class LlamaCppVLM:
         if tensor_split and tensor_split.strip():
             cmd.extend(["--tensor-split", tensor_split.strip()])
 
-        # Add flash attention
+        # Add flash attention (new llama.cpp requires value: on/off/auto)
         if flash_attn:
-            cmd.append("-fa")
+            cmd.extend(["-fa", "on"])
 
         # Add KV cache types
         if type_k:
@@ -1205,6 +1205,7 @@ def load_model_server_handler(
     main_gpu: int,
     kv_cache_type: str,
     override_tensor: str,
+    extra_args: str,
     server_port: int,
     llama_server_path: str,
     progress=gr.Progress()
@@ -1232,6 +1233,7 @@ def load_model_server_handler(
         type_v=type_v,
         override_tensor=override_tensor,
         server_port=server_port,
+        extra_args=extra_args,
         progress=progress,
     )
 
@@ -1676,7 +1678,7 @@ def create_ui():
                     kv_cache_type = gr.Dropdown(
                         label="KV Cache Type",
                         choices=["f16", "q8_0", "q4_0"],
-                        value="q8_0",
+                        value="f16",
                         info="Quantize KV cache to save VRAM",
                     )
                 with gr.Column(scale=1):
@@ -1694,6 +1696,13 @@ def create_ui():
                         placeholder=r"\.ffn_.*_exps\.weight=CPU",
                         value=r"\.ffn_.*_exps\.weight=CPU",
                         info="MoE optimization: offload expert FFN to CPU. Use ; for multiple patterns.",
+                    )
+                with gr.Column(scale=2):
+                    extra_args = gr.Textbox(
+                        label="Extra Args",
+                        placeholder="--cpu-moe or --n-cpu-moe 82",
+                        value="",
+                        info="Additional llama-server args (e.g., --cpu-moe, --numa distribute)",
                     )
                 with gr.Column(scale=1):
                     server_port = gr.Number(
@@ -1778,14 +1787,14 @@ def create_ui():
 
         def load_model_dispatcher(
             backend, model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-            main_gpu, kv_cache_type, override_tensor, server_port, llama_server_path,
+            main_gpu, kv_cache_type, override_tensor, extra_args_val, server_port, llama_server_path,
             progress=gr.Progress()
         ):
             """Route to appropriate load handler based on backend selection."""
             if backend == "llama-server":
                 return load_model_server_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-                    main_gpu, kv_cache_type, override_tensor, int(server_port),
+                    main_gpu, kv_cache_type, override_tensor, extra_args_val, int(server_port),
                     llama_server_path, progress
                 )
             else:
@@ -1798,7 +1807,7 @@ def create_ui():
             fn=load_model_dispatcher,
             inputs=[
                 backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
-                flash_attn, main_gpu, kv_cache_type, override_tensor, server_port,
+                flash_attn, main_gpu, kv_cache_type, override_tensor, extra_args, server_port,
                 llama_server_path
             ],
             outputs=[status_display],

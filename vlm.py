@@ -477,7 +477,8 @@ class LlamaCppVLM:
 
     def unload_model(self) -> str:
         """Unload the current model."""
-        if self.model is None:
+        # Check if anything is loaded (either local model or server)
+        if self.model is None and self.server_process is None:
             return "No model loaded"
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "model"
@@ -490,13 +491,18 @@ class LlamaCppVLM:
                     self.server_process.terminate()
                     self.server_process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
+                    print("[llama.cpp] Server didn't stop gracefully, killing...")
                     self.server_process.kill()
+                print(f"[llama.cpp] Server stopped for {model_name}")
                 self.server_process = None
                 self.server_url = None
                 self.use_server_backend = False
 
-            del self.model
-            del self.chat_handler
+            # Clean up local model if loaded
+            if self.model is not None:
+                del self.model
+            if self.chat_handler is not None:
+                del self.chat_handler
             self.model = None
             self.chat_handler = None
             self.current_model_path = None

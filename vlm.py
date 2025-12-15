@@ -689,9 +689,10 @@ class LlamaCppVLM:
         temperature: float = 0.7,
         stream: bool = False,
     ):
-        """Generate response via llama-server OpenAI-compatible API."""
+        """Generate response via llama-server OpenAI-compatible API using requests only."""
         if not self.server_url:
-            return "Error: Server not running"
+            yield "Error: Server not running", "Error: Server not running", "0 tok/s"
+            return
 
         api_url = f"{self.server_url}/v1/chat/completions"
 
@@ -711,91 +712,110 @@ class LlamaCppVLM:
                         text_parts.append(item)
                 content = " ".join(text_parts)
 
-            api_messages.append({"role": role, "content": str(content)})
+            if content:  # Only add non-empty messages
+                api_messages.append({"role": role, "content": str(content)})
+
+        if not api_messages:
+            yield "Error: No message content", "Error: No message content", "0 tok/s"
+            return
+
+        print(f"[llama-server] API request to {api_url}")
+        print(f"[llama-server] {len(api_messages)} messages, max_tokens={max_new_tokens}, temp={temperature}, stream={stream}")
+        for i, msg in enumerate(api_messages):
+            preview = msg['content'][:80] + "..." if len(msg['content']) > 80 else msg['content']
+            print(f"[llama-server]   [{i}] {msg['role']}: {preview}")
 
         payload = {
-            "model": "gpt-3.5-turbo",  # llama-server ignores this but OpenAI compat requires it
+            "model": "local-model",
             "messages": api_messages,
             "max_tokens": max_new_tokens,
             "temperature": temperature if temperature > 0 else 0.001,
             "stream": stream,
         }
 
-        print(f"[llama-server] API request: {len(api_messages)} messages, max_tokens={max_new_tokens}, stream={stream}")
-
         start_time = time.perf_counter()
 
-        if stream:
-            # Streaming mode
-            try:
-                print(f"[llama-server] Sending streaming request to {api_url}")
-                response = requests.post(
-                    api_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    stream=True,
-                    timeout=300,
-                )
-                response.raise_for_status()
-                print(f"[llama-server] Got response, streaming...")
+        try:
+            print(f"[llama-server] Sending POST request...")
+            response = requests.post(
+                api_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                stream=stream,
+                timeout=300,
+            )
 
+            print(f"[llama-server] Response status: {response.status_code}")
+
+            if response.status_code != 200:
+                error_text = response.text[:500]
+                print(f"[llama-server] Error response: {error_text}")
+                yield f"Error {response.status_code}: {error_text}", f"Error {response.status_code}", "0 tok/s"
+                return
+
+            if stream:
                 accumulated = ""
                 token_count = 0
+                print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
                     if line:
-                        line = line.decode("utf-8")
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data.strip() == "[DONE]":
+                        line_str = line.decode("utf-8")
+                        # Debug: show raw SSE data
+                        if token_count == 0:
+                            print(f"[llama-server] First SSE line: {line_str[:100]}")
+
+                        if line_str.startswith("data: "):
+                            data_str = line_str[6:]
+                            if data_str.strip() == "[DONE]":
+                                print(f"[llama-server] Received [DONE]")
                                 break
                             try:
-                                chunk = json.loads(data)
-                                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    accumulated += content
-                                    token_count += 1
-                                    elapsed = time.perf_counter() - start_time
-                                    tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-                                    yield accumulated, accumulated, f"{tokens_per_sec:.1f} tok/s"
-                            except json.JSONDecodeError:
-                                pass
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        accumulated += content
+                                        token_count += 1
+                                        elapsed = time.perf_counter() - start_time
+                                        tps = token_count / elapsed if elapsed > 0 else 0
+                                        yield accumulated, accumulated, f"{tps:.1f} tok/s"
+                            except json.JSONDecodeError as e:
+                                print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
-                print(f"[llama-server] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
+                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
 
-                # Yield final result
                 if accumulated:
                     yield accumulated, accumulated, f"{final_speed:.1f} tok/s"
                 else:
+                    print(f"[llama-server] Warning: No content accumulated from stream")
                     yield "No response generated", "No response generated", "0 tok/s"
-
-            except requests.exceptions.RequestException as e:
-                print(f"[llama-server] Request error: {e}")
-                yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
-            except Exception as e:
-                print(f"[llama-server] Error: {e}")
-                import traceback
-                traceback.print_exc()
-                yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
-        else:
-            # Non-streaming mode
-            try:
-                response = requests.post(
-                    api_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=300,
-                )
-                response.raise_for_status()
+            else:
+                # Non-streaming mode
                 data = response.json()
+                print(f"[llama-server] Got JSON response: {str(data)[:200]}")
                 result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return result
-            except Exception as e:
-                return f"Error: {str(e)}"
+                end_time = time.perf_counter()
+                elapsed = end_time - start_time
+                print(f"[llama-server] Done in {elapsed:.2f}s")
+                yield result, result, f"{elapsed:.2f}s"
+
+        except requests.exceptions.Timeout:
+            print(f"[llama-server] Request timed out")
+            yield "Error: Request timed out", "Error: Request timed out", "0 tok/s"
+        except requests.exceptions.ConnectionError as e:
+            print(f"[llama-server] Connection error: {e}")
+            yield f"Error: Connection failed - {e}", f"Error: Connection failed", "0 tok/s"
+        except Exception as e:
+            print(f"[llama-server] Unexpected error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
 
     def generate(
         self,
@@ -1188,7 +1208,7 @@ def chat_handler(
         (vlm_manager.model is not None or vlm_manager.use_server_backend)
     )
     if not model_ready:
-        error_history = list(history)
+        error_history = list(history) if history else []
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
         yield error_history, "", ""
@@ -1239,7 +1259,7 @@ def chat_handler(
     messages.append({"role": "user", "content": model_content})
 
     # Build initial display content for chatbot
-    new_history = list(history)
+    new_history = list(history) if history else []
 
     if images:
         display_text = message if message else f"Describe {'these images' if len(images) > 1 else 'this image'}"

@@ -561,6 +561,7 @@ class LlamaCppVLM:
             return f"Error: Model '{model_name}' not found"
 
         model_path = model_info["model_path"]
+        mmproj_path = model_info.get("mmproj_path")
 
         # Unload current model if any
         if self.model is not None or self.server_process is not None:
@@ -578,6 +579,11 @@ class LlamaCppVLM:
             "-c", str(n_ctx),
             "--main-gpu", str(main_gpu),
         ]
+
+        # Add mmproj/clip model for vision support
+        if mmproj_path and os.path.exists(mmproj_path):
+            cmd.extend(["--mmproj", mmproj_path])
+            print(f"[llama-server] Vision model (mmproj): {mmproj_path}")
 
         # Add tensor split if provided
         if tensor_split and tensor_split.strip():
@@ -666,13 +672,15 @@ class LlamaCppVLM:
                 return "Error: Server failed to become ready within timeout"
 
             self.current_model_path = model_path
+            self.current_mmproj_path = mmproj_path
             self.use_server_backend = True
-            self.is_text_only_model = True  # Server mode is text-only for now
+            self.is_text_only_model = not (mmproj_path and os.path.exists(mmproj_path))
 
-            print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, server_process={self.server_process is not None}")
+            vision_status = "with vision" if not self.is_text_only_model else "text-only"
+            print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, vision={not self.is_text_only_model}")
 
             progress(1.0, desc="Server ready!")
-            return f"Server started: {model_name} @ {self.server_url}"
+            return f"Server started: {model_name} ({vision_status}) @ {self.server_url}"
 
         except FileNotFoundError:
             return f"Error: llama-server not found at '{self.llama_server_path}'. Set the correct path."

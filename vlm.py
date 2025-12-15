@@ -714,17 +714,21 @@ class LlamaCppVLM:
             api_messages.append({"role": role, "content": str(content)})
 
         payload = {
+            "model": "gpt-3.5-turbo",  # llama-server ignores this but OpenAI compat requires it
             "messages": api_messages,
             "max_tokens": max_new_tokens,
             "temperature": temperature if temperature > 0 else 0.001,
             "stream": stream,
         }
 
+        print(f"[llama-server] API request: {len(api_messages)} messages, max_tokens={max_new_tokens}, stream={stream}")
+
         start_time = time.perf_counter()
 
         if stream:
             # Streaming mode
             try:
+                print(f"[llama-server] Sending streaming request to {api_url}")
                 response = requests.post(
                     api_url,
                     json=payload,
@@ -733,6 +737,7 @@ class LlamaCppVLM:
                     timeout=300,
                 )
                 response.raise_for_status()
+                print(f"[llama-server] Got response, streaming...")
 
                 accumulated = ""
                 token_count = 0
@@ -762,7 +767,19 @@ class LlamaCppVLM:
                 final_speed = token_count / generation_time if generation_time > 0 else 0
                 print(f"[llama-server] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
 
+                # Yield final result
+                if accumulated:
+                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s"
+                else:
+                    yield "No response generated", "No response generated", "0 tok/s"
+
+            except requests.exceptions.RequestException as e:
+                print(f"[llama-server] Request error: {e}")
+                yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
             except Exception as e:
+                print(f"[llama-server] Error: {e}")
+                import traceback
+                traceback.print_exc()
                 yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
         else:
             # Non-streaming mode

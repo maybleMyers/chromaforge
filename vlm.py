@@ -846,19 +846,26 @@ class LlamaCppVLM:
         # Route to API if using server backend
         if self.use_server_backend and self.server_process is not None:
             print(f"[vlm.py] Using server backend at {self.server_url}")
-            return self.generate_via_api(
+            # Must use 'yield from' because generate() is a generator function (has yield statements)
+            # Using 'return' would just terminate the generator without yielding anything
+            yield from self.generate_via_api(
                 messages=messages,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 stream=stream,
             )
+            return
 
         if self.model is None and not self.use_server_backend:
-            return "Error: No model loaded. Please load a model first."
+            error_msg = "Error: No model loaded. Please load a model first."
+            yield error_msg, error_msg, "0 tok/s"
+            return
 
         if self.model is None and self.use_server_backend:
             # Server mode but server_process is None - server may have crashed
-            return f"Error: Server backend enabled but server not running. server_process={self.server_process}, url={self.server_url}"
+            error_msg = f"Error: Server backend enabled but server not running. server_process={self.server_process}, url={self.server_url}"
+            yield error_msg, error_msg, "0 tok/s"
+            return
 
         try:
             # Build messages in llama.cpp format
@@ -1074,12 +1081,16 @@ class LlamaCppVLM:
                         result = re.sub(r'<\|(start|end|return|call)\|>', '', result)
                         result = result.strip()
 
-                return result
+                # Non-streaming mode - yield the final result as a tuple
+                yield result, result, f"{generation_time:.2f}s"
+                return
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return f"Error during generation: {str(e)}"
+            error_msg = f"Error during generation: {str(e)}"
+            yield error_msg, error_msg, "0 tok/s"
+            return
 
 
 # Global manager instance
@@ -1387,12 +1398,15 @@ def batch_caption_handler(
             ]
             messages.append({"role": "user", "content": content})
 
-            # Generate caption
-            caption = vlm_manager.generate(
+            # Generate caption (generate() is a generator, consume it to get the final result)
+            caption = ""
+            for display_text, raw_text, stats in vlm_manager.generate(
                 messages=messages,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
-            )
+                stream=False,
+            ):
+                caption = display_text
 
             # Save caption to .txt file
             base_name = os.path.splitext(filename)[0]

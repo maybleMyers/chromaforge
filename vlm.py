@@ -646,13 +646,17 @@ class LlamaCppVLM:
                     if resp.status_code == 200:
                         data = resp.json()
                         status = data.get("status", "")
+                        print(f"[llama-server] Health check: {resp.status_code}, status='{status}'")
                         if status == "ok":
                             server_ready = True
+                            print("[llama-server] Server is ready!")
                             break
                         elif status == "loading model":
                             progress(0.5, desc="Server loading model...")
-                except requests.exceptions.RequestException:
-                    pass
+                    else:
+                        print(f"[llama-server] Health check: {resp.status_code}")
+                except requests.exceptions.RequestException as e:
+                    print(f"[llama-server] Health check failed: {e}")
 
                 time.sleep(1)
 
@@ -799,6 +803,7 @@ class LlamaCppVLM:
         """
         # Route to API if using server backend
         if self.use_server_backend and self.server_process is not None:
+            print(f"[vlm.py] Using server backend at {self.server_url}")
             return self.generate_via_api(
                 messages=messages,
                 max_new_tokens=max_new_tokens,
@@ -806,8 +811,12 @@ class LlamaCppVLM:
                 stream=stream,
             )
 
-        if self.model is None:
+        if self.model is None and not self.use_server_backend:
             return "Error: No model loaded. Please load a model first."
+
+        if self.model is None and self.use_server_backend:
+            # Server mode but server_process is None - server may have crashed
+            return f"Error: Server backend enabled but server not running. server_process={self.server_process}, url={self.server_url}"
 
         try:
             # Build messages in llama.cpp format

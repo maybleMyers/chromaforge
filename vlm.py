@@ -696,23 +696,60 @@ class LlamaCppVLM:
 
         api_url = f"{self.server_url}/v1/chat/completions"
 
-        # Convert messages to simple text format for API
+        # Convert messages to OpenAI-compatible format (with multimodal support)
         api_messages = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            # Extract text from complex content
+            # Handle multimodal content (lists with text and images)
             if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                    elif isinstance(item, str):
-                        text_parts.append(item)
-                content = " ".join(text_parts)
+                content_parts = []
+                has_images = False
 
-            if content:  # Only add non-empty messages
+                for item in content:
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+
+                        if item_type == "text":
+                            text = item.get("text", "")
+                            if text:
+                                content_parts.append({"type": "text", "text": text})
+
+                        elif item_type == "image" and "image" in item:
+                            # Convert PIL image to base64 data URL for llama-server
+                            img = item["image"]
+                            if isinstance(img, Image.Image):
+                                b64_url = image_to_base64(img)
+                                content_parts.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": b64_url}
+                                })
+                                has_images = True
+
+                        elif item_type == "image_url":
+                            # Already in correct format, pass through
+                            content_parts.append(item)
+                            has_images = True
+
+                    elif isinstance(item, str):
+                        if item:
+                            content_parts.append({"type": "text", "text": item})
+
+                # If we have multimodal content, use the list format
+                if content_parts:
+                    if has_images:
+                        # Use multimodal format
+                        api_messages.append({"role": role, "content": content_parts})
+                    else:
+                        # Text only - extract and join
+                        text_only = " ".join(
+                            p.get("text", "") for p in content_parts if p.get("type") == "text"
+                        )
+                        if text_only:
+                            api_messages.append({"role": role, "content": text_only})
+
+            elif content:  # Simple string content
                 api_messages.append({"role": role, "content": str(content)})
 
         if not api_messages:
@@ -722,7 +759,14 @@ class LlamaCppVLM:
         print(f"[llama-server] API request to {api_url}")
         print(f"[llama-server] {len(api_messages)} messages, max_tokens={max_new_tokens}, temp={temperature}, stream={stream}")
         for i, msg in enumerate(api_messages):
-            preview = msg['content'][:80] + "..." if len(msg['content']) > 80 else msg['content']
+            content = msg['content']
+            if isinstance(content, list):
+                # Multimodal content - summarize
+                text_parts = [p.get("text", "")[:50] for p in content if p.get("type") == "text"]
+                image_count = sum(1 for p in content if p.get("type") == "image_url")
+                preview = f"[{image_count} image(s)] {' '.join(text_parts)}"[:80]
+            else:
+                preview = content[:80] + "..." if len(content) > 80 else content
             print(f"[llama-server]   [{i}] {msg['role']}: {preview}")
 
         payload = {
@@ -1692,7 +1736,7 @@ def create_ui():
                 max_tokens = gr.Slider(
                     minimum=64,
                     maximum=262048,
-                    value=512,
+                    value=8096,
                     step=64,
                     label="Max New Tokens",
                 )

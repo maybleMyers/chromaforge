@@ -16,13 +16,18 @@ Installation with CUDA (Windows prebuilt):
 import os
 import gc
 import re
+import json
 import base64
 import argparse
 import tempfile
 import time
+import subprocess
+import signal
+import threading
+import requests
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Generator
 
 import gradio as gr
 from gradio import themes
@@ -222,7 +227,10 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
 
 
 class LlamaCppVLM:
-    """Manages VLM inference via llama-cpp-python."""
+    """Manages VLM inference via llama-cpp-python or native llama-server subprocess."""
+
+    # Default path to llama-server executable
+    DEFAULT_LLAMA_SERVER_PATH = "llama-server.exe"
 
     def __init__(self, models_dir: str = "models/LLM"):
         """Initialize llama.cpp VLM Manager."""
@@ -233,6 +241,12 @@ class LlamaCppVLM:
         self.chat_handler = None
         self.is_text_only_model = False  # Flag for text-only models like GPT-OSS
         self.model_type: Optional[str] = None  # Track model type (e.g., "gpt-oss", "qwen", "llava")
+
+        # llama-server subprocess mode
+        self.server_process: Optional[subprocess.Popen] = None
+        self.server_url: Optional[str] = None
+        self.use_server_backend = False
+        self.llama_server_path = self.DEFAULT_LLAMA_SERVER_PATH
 
     def get_available_models(self) -> List[Dict[str, str]]:
         """Get list of available GGUF models."""
@@ -252,6 +266,9 @@ class LlamaCppVLM:
         n_ctx: int = 4096,
         tensor_split: Optional[str] = None,
         flash_attn: bool = False,
+        main_gpu: int = 0,
+        type_k: Optional[str] = None,
+        type_v: Optional[str] = None,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -263,6 +280,9 @@ class LlamaCppVLM:
             n_ctx: Context length
             tensor_split: Comma-separated GPU memory split ratios (e.g., "0.5,0.5" for 2 GPUs)
             flash_attn: Enable Flash Attention for faster inference
+            main_gpu: Index of the main GPU for small tensors (default: 0)
+            type_k: KV cache quantization type for keys (e.g., "q8_0", "q4_0", "f16")
+            type_v: KV cache quantization type for values (e.g., "q8_0", "q4_0", "f16")
             progress: Gradio progress callback
 
         Returns:
@@ -394,7 +414,7 @@ class LlamaCppVLM:
 
             progress(0.3, desc=f"Loading {model_name}...")
             print(f"[llama.cpp] Loading model from: {model_path}")
-            print(f"[llama.cpp] GPU layers: {n_gpu_layers}, Context: {n_ctx}")
+            print(f"[llama.cpp] GPU layers: {n_gpu_layers}, Context: {n_ctx}, Main GPU: {main_gpu}")
 
             # Parse tensor_split if provided
             tensor_split_list = None
@@ -409,12 +429,18 @@ class LlamaCppVLM:
             if flash_attn:
                 print("[llama.cpp] Flash Attention: enabled")
 
+            if type_k:
+                print(f"[llama.cpp] KV cache key type: {type_k}")
+            if type_v:
+                print(f"[llama.cpp] KV cache value type: {type_v}")
+
             # Build kwargs for Llama constructor
             llama_kwargs = {
                 "model_path": model_path,
                 "chat_handler": self.chat_handler,
                 "n_ctx": n_ctx,
                 "n_gpu_layers": n_gpu_layers,
+                "main_gpu": main_gpu,
                 "verbose": True,
             }
 
@@ -424,6 +450,12 @@ class LlamaCppVLM:
 
             if flash_attn:
                 llama_kwargs["flash_attn"] = True
+
+            # Add KV cache type parameters if specified
+            if type_k:
+                llama_kwargs["type_k"] = type_k
+            if type_v:
+                llama_kwargs["type_v"] = type_v
 
             # Load the model
             self.model = Llama(**llama_kwargs)
@@ -451,6 +483,18 @@ class LlamaCppVLM:
         model_name = Path(self.current_model_path).stem if self.current_model_path else "model"
 
         try:
+            # Kill server subprocess if running
+            if self.server_process is not None:
+                print("[llama.cpp] Stopping llama-server subprocess...")
+                try:
+                    self.server_process.terminate()
+                    self.server_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.server_process.kill()
+                self.server_process = None
+                self.server_url = None
+                self.use_server_backend = False
+
             del self.model
             del self.chat_handler
             self.model = None
@@ -477,6 +521,10 @@ class LlamaCppVLM:
 
     def get_status(self) -> str:
         """Get current status."""
+        if self.server_process is not None and self.server_url:
+            model_name = Path(self.current_model_path).stem if self.current_model_path else "Unknown"
+            return f"Server: {model_name} @ {self.server_url}"
+
         if self.model is None:
             return "No model loaded"
 
@@ -484,6 +532,247 @@ class LlamaCppVLM:
         vision_status = "vision" if self.chat_handler else "text-only"
         model_type_str = f", {self.model_type}" if self.model_type and self.model_type != "generic" else ""
         return f"Loaded: {model_name} ({vision_status}{model_type_str})"
+
+    def load_model_server(
+        self,
+        model_name: str,
+        n_gpu_layers: int = -1,
+        n_ctx: int = 4096,
+        tensor_split: Optional[str] = None,
+        flash_attn: bool = False,
+        main_gpu: int = 0,
+        type_k: Optional[str] = None,
+        type_v: Optional[str] = None,
+        override_tensor: Optional[str] = None,
+        server_port: int = 8080,
+        extra_args: Optional[str] = None,
+        progress=gr.Progress(),
+    ) -> str:
+        """
+        Load a GGUF model using native llama-server subprocess.
+
+        This allows using advanced options like --override-tensor for MoE optimization.
+        """
+        # Find the model
+        models = self.get_available_models()
+        model_info = next((m for m in models if m["name"] == model_name), None)
+
+        if model_info is None:
+            return f"Error: Model '{model_name}' not found"
+
+        model_path = model_info["model_path"]
+
+        # Unload current model if any
+        if self.model is not None or self.server_process is not None:
+            self.unload_model()
+
+        progress(0.1, desc="Building server command...")
+
+        # Build llama-server command
+        cmd = [
+            self.llama_server_path,
+            "-m", model_path,
+            "--port", str(server_port),
+            "--host", "127.0.0.1",
+            "-ngl", str(n_gpu_layers),
+            "-c", str(n_ctx),
+            "--main-gpu", str(main_gpu),
+        ]
+
+        # Add tensor split if provided
+        if tensor_split and tensor_split.strip():
+            cmd.extend(["--tensor-split", tensor_split.strip()])
+
+        # Add flash attention
+        if flash_attn:
+            cmd.append("-fa")
+
+        # Add KV cache types
+        if type_k:
+            cmd.extend(["--cache-type-k", type_k])
+        if type_v:
+            cmd.extend(["--cache-type-v", type_v])
+
+        # Add override tensor (the key MoE optimization!)
+        if override_tensor and override_tensor.strip():
+            # Support multiple patterns separated by semicolons
+            patterns = [p.strip() for p in override_tensor.split(";") if p.strip()]
+            for pattern in patterns:
+                cmd.extend(["-ot", pattern])
+
+        # Add any extra arguments
+        if extra_args and extra_args.strip():
+            cmd.extend(extra_args.strip().split())
+
+        print(f"[llama-server] Command: {' '.join(cmd)}")
+        progress(0.2, desc="Starting llama-server...")
+
+        try:
+            # Start the server process
+            self.server_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            # Start a thread to read and print server output
+            def read_output():
+                if self.server_process and self.server_process.stdout:
+                    for line in self.server_process.stdout:
+                        print(f"[llama-server] {line.rstrip()}")
+
+            output_thread = threading.Thread(target=read_output, daemon=True)
+            output_thread.start()
+
+            # Wait for server to be ready (poll health endpoint)
+            self.server_url = f"http://127.0.0.1:{server_port}"
+            health_url = f"{self.server_url}/health"
+
+            progress(0.3, desc="Waiting for server to load model...")
+
+            max_wait = 300  # 5 minutes max wait
+            start_time = time.time()
+            server_ready = False
+
+            while time.time() - start_time < max_wait:
+                # Check if process died
+                if self.server_process.poll() is not None:
+                    return f"Error: llama-server exited with code {self.server_process.returncode}"
+
+                try:
+                    resp = requests.get(health_url, timeout=2)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        status = data.get("status", "")
+                        if status == "ok":
+                            server_ready = True
+                            break
+                        elif status == "loading model":
+                            progress(0.5, desc="Server loading model...")
+                except requests.exceptions.RequestException:
+                    pass
+
+                time.sleep(1)
+
+            if not server_ready:
+                self.server_process.terminate()
+                self.server_process = None
+                return "Error: Server failed to become ready within timeout"
+
+            self.current_model_path = model_path
+            self.use_server_backend = True
+            self.is_text_only_model = True  # Server mode is text-only for now
+
+            progress(1.0, desc="Server ready!")
+            return f"Server started: {model_name} @ {self.server_url}"
+
+        except FileNotFoundError:
+            return f"Error: llama-server not found at '{self.llama_server_path}'. Set the correct path."
+        except Exception as e:
+            if self.server_process:
+                self.server_process.terminate()
+                self.server_process = None
+            return f"Error starting server: {str(e)}"
+
+    def generate_via_api(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        stream: bool = False,
+    ):
+        """Generate response via llama-server OpenAI-compatible API."""
+        if not self.server_url:
+            return "Error: Server not running"
+
+        api_url = f"{self.server_url}/v1/chat/completions"
+
+        # Convert messages to simple text format for API
+        api_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            # Extract text from complex content
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+                content = " ".join(text_parts)
+
+            api_messages.append({"role": role, "content": str(content)})
+
+        payload = {
+            "messages": api_messages,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature if temperature > 0 else 0.001,
+            "stream": stream,
+        }
+
+        start_time = time.perf_counter()
+
+        if stream:
+            # Streaming mode
+            try:
+                response = requests.post(
+                    api_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    stream=True,
+                    timeout=300,
+                )
+                response.raise_for_status()
+
+                accumulated = ""
+                token_count = 0
+
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode("utf-8")
+                        if line.startswith("data: "):
+                            data = line[6:]
+                            if data.strip() == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    accumulated += content
+                                    token_count += 1
+                                    elapsed = time.perf_counter() - start_time
+                                    tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
+                                    yield accumulated, accumulated, f"{tokens_per_sec:.1f} tok/s"
+                            except json.JSONDecodeError:
+                                pass
+
+                end_time = time.perf_counter()
+                generation_time = end_time - start_time
+                final_speed = token_count / generation_time if generation_time > 0 else 0
+                print(f"[llama-server] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
+
+            except Exception as e:
+                yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
+        else:
+            # Non-streaming mode
+            try:
+                response = requests.post(
+                    api_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=300,
+                )
+                response.raise_for_status()
+                data = response.json()
+                result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return result
+            except Exception as e:
+                return f"Error: {str(e)}"
 
     def generate(
         self,
@@ -508,6 +797,15 @@ class LlamaCppVLM:
         Returns:
             Generated response string, or generator if stream=True
         """
+        # Route to API if using server backend
+        if self.use_server_backend and self.server_process is not None:
+            return self.generate_via_api(
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stream=stream,
+            )
+
         if self.model is None:
             return "Error: No model loaded. Please load a model first."
 
@@ -759,18 +1057,68 @@ def load_model_handler(
     n_ctx: int,
     tensor_split: str,
     flash_attn: bool,
+    main_gpu: int,
+    kv_cache_type: str,
     progress=gr.Progress()
 ):
     """Handle model loading."""
     if vlm_manager is None:
         return "Manager not initialized"
+
+    # Parse KV cache type (same type for both k and v)
+    type_k = kv_cache_type if kv_cache_type and kv_cache_type != "f16" else None
+    type_v = kv_cache_type if kv_cache_type and kv_cache_type != "f16" else None
+
     return vlm_manager.load_model(
         model_name,
         n_gpu_layers,
         n_ctx,
         tensor_split,
         flash_attn,
+        main_gpu,
+        type_k,
+        type_v,
         progress
+    )
+
+
+def load_model_server_handler(
+    model_name: str,
+    n_gpu_layers: int,
+    n_ctx: int,
+    tensor_split: str,
+    flash_attn: bool,
+    main_gpu: int,
+    kv_cache_type: str,
+    override_tensor: str,
+    server_port: int,
+    llama_server_path: str,
+    progress=gr.Progress()
+):
+    """Handle model loading via llama-server subprocess."""
+    if vlm_manager is None:
+        return "Manager not initialized"
+
+    # Set server path if provided
+    if llama_server_path and llama_server_path.strip():
+        vlm_manager.llama_server_path = llama_server_path.strip()
+
+    # Parse KV cache type
+    type_k = kv_cache_type if kv_cache_type and kv_cache_type != "f16" else None
+    type_v = kv_cache_type if kv_cache_type and kv_cache_type != "f16" else None
+
+    return vlm_manager.load_model_server(
+        model_name=model_name,
+        n_gpu_layers=n_gpu_layers,
+        n_ctx=n_ctx,
+        tensor_split=tensor_split,
+        flash_attn=flash_attn,
+        main_gpu=main_gpu,
+        type_k=type_k,
+        type_v=type_v,
+        override_tensor=override_tensor,
+        server_port=server_port,
+        progress=progress,
     )
 
 
@@ -1174,18 +1522,65 @@ def create_ui():
                     )
 
             with gr.Row():
+                with gr.Column(scale=1):
+                    backend_type = gr.Dropdown(
+                        label="Backend",
+                        choices=["llama-cpp-python", "llama-server"],
+                        value="llama-cpp-python",
+                        info="llama-server enables MoE --override-tensor",
+                    )
                 with gr.Column(scale=2):
                     tensor_split = gr.Textbox(
                         label="Tensor Split (Multi-GPU)",
-                        placeholder="e.g., 0.5,0.5 for 2 GPUs or 0.4,0.6 for uneven split",
+                        placeholder="e.g., 2,1 for 48GB+24GB GPUs (ratio-based distribution)",
                         value="",
                         info="Comma-separated ratios for distributing layers across GPUs",
                     )
                 with gr.Column(scale=1):
+                    main_gpu = gr.Slider(
+                        minimum=0,
+                        maximum=7,
+                        value=0,
+                        step=1,
+                        label="Main GPU",
+                        info="GPU for small tensors/scratch buffer",
+                    )
+                with gr.Column(scale=1):
+                    kv_cache_type = gr.Dropdown(
+                        label="KV Cache Type",
+                        choices=["f16", "q8_0", "q4_0"],
+                        value="q8_0",
+                        info="Quantize KV cache to save VRAM",
+                    )
+                with gr.Column(scale=1):
                     flash_attn = gr.Checkbox(
                         label="Flash Attention",
-                        value=False,
-                        info="Faster attention (requires all layers on GPU)",
+                        value=True,
+                        info="Faster attention (requires layers on GPU)",
+                    )
+
+            # Server-mode specific options
+            with gr.Row(visible=False) as server_options_row:
+                with gr.Column(scale=3):
+                    override_tensor = gr.Textbox(
+                        label="Override Tensor (-ot)",
+                        placeholder=r"\.ffn_.*_exps\.weight=CPU",
+                        value=r"\.ffn_.*_exps\.weight=CPU",
+                        info="MoE optimization: offload expert FFN to CPU. Use ; for multiple patterns.",
+                    )
+                with gr.Column(scale=1):
+                    server_port = gr.Number(
+                        label="Server Port",
+                        value=8080,
+                        precision=0,
+                        info="Port for llama-server",
+                    )
+                with gr.Column(scale=2):
+                    llama_server_path = gr.Textbox(
+                        label="llama-server Path",
+                        placeholder="llama-server.exe",
+                        value="llama-server.exe",
+                        info="Path to llama-server executable",
                     )
 
             with gr.Row():
@@ -1197,6 +1592,16 @@ def create_ui():
                     interactive=False,
                     scale=3,
                 )
+
+            # Toggle server options visibility based on backend selection
+            def toggle_server_options(backend):
+                return gr.update(visible=(backend == "llama-server"))
+
+            backend_type.change(
+                fn=toggle_server_options,
+                inputs=[backend_type],
+                outputs=[server_options_row],
+            )
 
         with gr.Accordion("Generation Settings", open=False):
             with gr.Row():
@@ -1244,9 +1649,31 @@ def create_ui():
             outputs=[model_dropdown],
         )
 
+        def load_model_dispatcher(
+            backend, model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
+            main_gpu, kv_cache_type, override_tensor, server_port, llama_server_path,
+            progress=gr.Progress()
+        ):
+            """Route to appropriate load handler based on backend selection."""
+            if backend == "llama-server":
+                return load_model_server_handler(
+                    model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
+                    main_gpu, kv_cache_type, override_tensor, int(server_port),
+                    llama_server_path, progress
+                )
+            else:
+                return load_model_handler(
+                    model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
+                    main_gpu, kv_cache_type, progress
+                )
+
         load_model_btn.click(
-            fn=load_model_handler,
-            inputs=[model_dropdown, n_gpu_layers, n_ctx, tensor_split, flash_attn],
+            fn=load_model_dispatcher,
+            inputs=[
+                backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
+                flash_attn, main_gpu, kv_cache_type, override_tensor, server_port,
+                llama_server_path
+            ],
             outputs=[status_display],
         )
 

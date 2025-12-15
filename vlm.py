@@ -669,6 +669,8 @@ class LlamaCppVLM:
             self.use_server_backend = True
             self.is_text_only_model = True  # Server mode is text-only for now
 
+            print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, server_process={self.server_process is not None}")
+
             progress(1.0, desc="Server ready!")
             return f"Server started: {model_name} @ {self.server_url}"
 
@@ -801,6 +803,9 @@ class LlamaCppVLM:
         Returns:
             Generated response string, or generator if stream=True
         """
+        # Debug: show current state
+        print(f"[vlm.py] generate() called: use_server_backend={self.use_server_backend}, server_process={self.server_process is not None}, model={self.model is not None}")
+
         # Route to API if using server backend
         if self.use_server_backend and self.server_process is not None:
             print(f"[vlm.py] Using server backend at {self.server_url}")

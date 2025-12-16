@@ -269,6 +269,7 @@ class LlamaCppVLM:
         main_gpu: int = 0,
         type_k: Optional[str] = None,
         type_v: Optional[str] = None,
+        use_mmap: bool = True,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -283,6 +284,7 @@ class LlamaCppVLM:
             main_gpu: Index of the main GPU for small tensors (default: 0)
             type_k: KV cache quantization type for keys (e.g., "q8_0", "q4_0", "f16")
             type_v: KV cache quantization type for values (e.g., "q8_0", "q4_0", "f16")
+            use_mmap: If True (default), use memory-mapped files; if False, load fully into RAM
             progress: Gradio progress callback
 
         Returns:
@@ -442,7 +444,11 @@ class LlamaCppVLM:
                 "n_gpu_layers": n_gpu_layers,
                 "main_gpu": main_gpu,
                 "verbose": True,
+                "use_mmap": use_mmap,  # If False, forces loading into RAM instead of memory-mapping from disk
             }
+
+            if not use_mmap:
+                print("[llama.cpp] Memory mapping disabled - loading model fully into RAM")
 
             # Add optional parameters
             if tensor_split_list:
@@ -549,6 +555,7 @@ class LlamaCppVLM:
         main_gpu: int = 0,
         type_k: Optional[str] = None,
         type_v: Optional[str] = None,
+        use_mmap: bool = True,
         override_tensor: Optional[str] = None,
         server_port: int = 8080,
         extra_args: Optional[str] = None,
@@ -585,6 +592,11 @@ class LlamaCppVLM:
             "-c", str(n_ctx),
             "--main-gpu", str(main_gpu),
         ]
+
+        # Disable mmap if requested (forces loading into RAM)
+        if not use_mmap:
+            cmd.append("--no-mmap")
+            print("[llama-server] Memory mapping disabled - loading model fully into RAM")
 
         # Add mmproj/clip model for vision support
         if mmproj_path and os.path.exists(mmproj_path):
@@ -1179,6 +1191,7 @@ def load_model_handler(
     flash_attn: bool,
     main_gpu: int,
     kv_cache_type: str,
+    use_mmap: bool,
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -1198,6 +1211,7 @@ def load_model_handler(
         main_gpu,
         type_k,
         type_v,
+        use_mmap,
         progress
     )
 
@@ -1210,6 +1224,7 @@ def load_model_server_handler(
     flash_attn: bool,
     main_gpu: int,
     kv_cache_type: str,
+    use_mmap: bool,
     override_tensor: str,
     extra_args: str,
     server_port: int,
@@ -1237,6 +1252,7 @@ def load_model_server_handler(
         main_gpu=main_gpu,
         type_k=type_k,
         type_v=type_v,
+        use_mmap=use_mmap,
         override_tensor=override_tensor,
         server_port=server_port,
         extra_args=extra_args,
@@ -1693,6 +1709,12 @@ def create_ui():
                         value=False,
                         info="Faster attention (requires layers on GPU)",
                     )
+                with gr.Column(scale=1):
+                    use_mmap = gr.Checkbox(
+                        label="Use MMap",
+                        value=True,
+                        info="Uncheck to load fully into RAM (no SSD access)",
+                    )
 
             # Server-mode specific options
             with gr.Row(visible=False) as server_options_row:
@@ -1793,27 +1815,27 @@ def create_ui():
 
         def load_model_dispatcher(
             backend, model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-            main_gpu, kv_cache_type, override_tensor, extra_args_val, server_port, llama_server_path,
+            main_gpu, kv_cache_type, use_mmap_val, override_tensor, extra_args_val, server_port, llama_server_path,
             progress=gr.Progress()
         ):
             """Route to appropriate load handler based on backend selection."""
             if backend == "llama-server":
                 return load_model_server_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-                    main_gpu, kv_cache_type, override_tensor, extra_args_val, int(server_port),
+                    main_gpu, kv_cache_type, use_mmap_val, override_tensor, extra_args_val, int(server_port),
                     llama_server_path, progress
                 )
             else:
                 return load_model_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-                    main_gpu, kv_cache_type, progress
+                    main_gpu, kv_cache_type, use_mmap_val, progress
                 )
 
         load_model_btn.click(
             fn=load_model_dispatcher,
             inputs=[
                 backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
-                flash_attn, main_gpu, kv_cache_type, override_tensor, extra_args, server_port,
+                flash_attn, main_gpu, kv_cache_type, use_mmap, override_tensor, extra_args, server_port,
                 llama_server_path
             ],
             outputs=[status_display],

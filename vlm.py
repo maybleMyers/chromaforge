@@ -849,7 +849,7 @@ class LlamaCppVLM:
                 json=payload,
                 headers={"Content-Type": "application/json"},
                 stream=stream,
-                timeout=300,
+                timeout=3600,  # 1 hour timeout for long video processing
             )
 
             print(f"[llama-server] Response status: {response.status_code}")
@@ -898,10 +898,10 @@ class LlamaCppVLM:
                 print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
 
                 if accumulated:
-                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s"
+                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s total"
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
-                    yield "No response generated", "No response generated", "0 tok/s"
+                    yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s total"
             else:
                 # Non-streaming mode
                 data = response.json()
@@ -909,8 +909,11 @@ class LlamaCppVLM:
                 result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 end_time = time.perf_counter()
                 elapsed = end_time - start_time
-                print(f"[llama-server] Done in {elapsed:.2f}s")
-                yield result, result, f"{elapsed:.2f}s"
+                # Estimate token count from response length (rough approximation)
+                est_tokens = len(result.split())
+                est_speed = est_tokens / elapsed if elapsed > 0 else 0
+                print(f"[llama-server] Done in {elapsed:.2f}s (~{est_tokens} tokens, {est_speed:.1f} tok/s)")
+                yield result, result, f"~{est_speed:.1f} tok/s | {elapsed:.1f}s total"
 
         except requests.exceptions.Timeout:
             print(f"[llama-server] Request timed out")
@@ -1157,6 +1160,8 @@ class LlamaCppVLM:
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
                 print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
+                # Yield final stats with total time
+                yield display_text, raw_for_thinking, f"{final_speed:.1f} tok/s | {generation_time:.1f}s total"
 
             else:
                 # Non-streaming mode
@@ -1168,10 +1173,19 @@ class LlamaCppVLM:
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
-                print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
 
                 # Extract response content
                 result = response["choices"][0]["message"]["content"]
+
+                # Get token count from response if available
+                usage = response.get("usage", {})
+                completion_tokens = usage.get("completion_tokens", 0)
+                if completion_tokens > 0:
+                    speed = completion_tokens / generation_time if generation_time > 0 else 0
+                    print(f"[llama.cpp] Generated {completion_tokens} tokens in {generation_time:.2f}s ({speed:.1f} tok/s)")
+                else:
+                    speed = 0
+                    print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
 
                 # Clean up thinking tags if present
                 if "</think>" in result:
@@ -1189,8 +1203,11 @@ class LlamaCppVLM:
                         result = re.sub(r'<\|(start|end|return|call)\|>', '', result)
                         result = result.strip()
 
-                # Non-streaming mode - yield the final result as a tuple
-                yield result, result, f"{generation_time:.2f}s"
+                # Non-streaming mode - yield the final result as a tuple with speed and total time
+                if completion_tokens > 0:
+                    yield result, result, f"{speed:.1f} tok/s | {generation_time:.1f}s total"
+                else:
+                    yield result, result, f"{generation_time:.1f}s total"
                 return
 
         except Exception as e:

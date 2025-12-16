@@ -270,6 +270,7 @@ class LlamaCppVLM:
         type_k: Optional[str] = None,
         type_v: Optional[str] = None,
         use_mmap: bool = True,
+        use_mlock: bool = False,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -285,6 +286,7 @@ class LlamaCppVLM:
             type_k: KV cache quantization type for keys (e.g., "q8_0", "q4_0", "f16")
             type_v: KV cache quantization type for values (e.g., "q8_0", "q4_0", "f16")
             use_mmap: If True (default), use memory-mapped files; if False, load fully into RAM
+            use_mlock: If True, lock model in RAM to prevent disk access after initial load
             progress: Gradio progress callback
 
         Returns:
@@ -445,10 +447,13 @@ class LlamaCppVLM:
                 "main_gpu": main_gpu,
                 "verbose": True,
                 "use_mmap": use_mmap,  # If False, forces loading into RAM instead of memory-mapping from disk
+                "use_mlock": use_mlock,  # Lock model in RAM to prevent repeated disk access
             }
 
             if not use_mmap:
                 print("[llama.cpp] Memory mapping disabled - loading model fully into RAM")
+            if use_mlock:
+                print("[llama.cpp] Memory locking enabled - model will be locked in RAM after loading")
 
             # Add optional parameters
             if tensor_split_list:
@@ -556,6 +561,7 @@ class LlamaCppVLM:
         type_k: Optional[str] = None,
         type_v: Optional[str] = None,
         use_mmap: bool = True,
+        use_mlock: bool = False,
         override_tensor: Optional[str] = None,
         server_port: int = 8080,
         extra_args: Optional[str] = None,
@@ -597,6 +603,11 @@ class LlamaCppVLM:
         if not use_mmap:
             cmd.append("--no-mmap")
             print("[llama-server] Memory mapping disabled - loading model fully into RAM")
+
+        # Enable mlock if requested (locks model in RAM)
+        if use_mlock:
+            cmd.append("--mlock")
+            print("[llama-server] Memory locking enabled - model will be locked in RAM after loading")
 
         # Add mmproj/clip model for vision support
         if mmproj_path and os.path.exists(mmproj_path):
@@ -713,6 +724,7 @@ class LlamaCppVLM:
         messages: List[Dict[str, Any]],
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        video_max_frames: int = 81,
         stream: bool = False,
     ):
         """Generate response via llama-server OpenAI-compatible API using requests only."""
@@ -757,6 +769,31 @@ class LlamaCppVLM:
                             # Already in correct format, pass through
                             content_parts.append(item)
                             has_images = True
+
+                        elif item_type == "video" and "video" in item:
+                            # Extract frames from video and convert to images
+                            video_path = item["video"]
+                            if isinstance(video_path, str) and os.path.exists(video_path):
+                                try:
+                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                    print(f"[llama-server] Extracted {len(frames)} frames from video: {video_path}")
+                                    for frame in frames:
+                                        b64_url = image_to_base64(frame)
+                                        content_parts.append({
+                                            "type": "image_url",
+                                            "image_url": {"url": b64_url}
+                                        })
+                                    content_parts.append({
+                                        "type": "text",
+                                        "text": f"[Video with {len(frames)} frames]"
+                                    })
+                                    has_images = True
+                                except Exception as e:
+                                    print(f"[llama-server] Video extraction error: {e}")
+                                    content_parts.append({
+                                        "type": "text",
+                                        "text": f"[Video error: {e}]"
+                                    })
 
                     elif isinstance(item, str):
                         if item:
@@ -922,6 +959,7 @@ class LlamaCppVLM:
                 messages=messages,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                video_max_frames=video_max_frames,
                 stream=stream,
             )
             return
@@ -1192,6 +1230,7 @@ def load_model_handler(
     main_gpu: int,
     kv_cache_type: str,
     use_mmap: bool,
+    use_mlock: bool,
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -1212,6 +1251,7 @@ def load_model_handler(
         type_k,
         type_v,
         use_mmap,
+        use_mlock,
         progress
     )
 
@@ -1225,6 +1265,7 @@ def load_model_server_handler(
     main_gpu: int,
     kv_cache_type: str,
     use_mmap: bool,
+    use_mlock: bool,
     override_tensor: str,
     extra_args: str,
     server_port: int,
@@ -1253,6 +1294,7 @@ def load_model_server_handler(
         type_k=type_k,
         type_v=type_v,
         use_mmap=use_mmap,
+        use_mlock=use_mlock,
         override_tensor=override_tensor,
         server_port=server_port,
         extra_args=extra_args,
@@ -1713,7 +1755,13 @@ def create_ui():
                     use_mmap = gr.Checkbox(
                         label="Use MMap",
                         value=True,
-                        info="Uncheck to load fully into RAM (no SSD access)",
+                        info="Uncheck to load fully into RAM (requires enough RAM)",
+                    )
+                with gr.Column(scale=1):
+                    use_mlock = gr.Checkbox(
+                        label="Lock in RAM (mlock)",
+                        value=False,
+                        info="Lock model in RAM after loading - prevents SSD access after warmup",
                     )
 
             # Server-mode specific options
@@ -1815,27 +1863,27 @@ def create_ui():
 
         def load_model_dispatcher(
             backend, model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-            main_gpu, kv_cache_type, use_mmap_val, override_tensor, extra_args_val, server_port, llama_server_path,
+            main_gpu, kv_cache_type, use_mmap_val, use_mlock_val, override_tensor, extra_args_val, server_port, llama_server_path,
             progress=gr.Progress()
         ):
             """Route to appropriate load handler based on backend selection."""
             if backend == "llama-server":
                 return load_model_server_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-                    main_gpu, kv_cache_type, use_mmap_val, override_tensor, extra_args_val, int(server_port),
+                    main_gpu, kv_cache_type, use_mmap_val, use_mlock_val, override_tensor, extra_args_val, int(server_port),
                     llama_server_path, progress
                 )
             else:
                 return load_model_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
-                    main_gpu, kv_cache_type, use_mmap_val, progress
+                    main_gpu, kv_cache_type, use_mmap_val, use_mlock_val, progress
                 )
 
         load_model_btn.click(
             fn=load_model_dispatcher,
             inputs=[
                 backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
-                flash_attn, main_gpu, kv_cache_type, use_mmap, override_tensor, extra_args, server_port,
+                flash_attn, main_gpu, kv_cache_type, use_mmap, use_mlock, override_tensor, extra_args, server_port,
                 llama_server_path
             ],
             outputs=[status_display],

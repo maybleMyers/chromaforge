@@ -248,6 +248,9 @@ class LlamaCppVLM:
         self.use_server_backend = False
         self.llama_server_path = self.DEFAULT_LLAMA_SERVER_PATH
 
+        # Context tracking
+        self.n_ctx: int = 0  # Store context size for usage display
+
     def get_available_models(self) -> List[Dict[str, str]]:
         """Get list of available GGUF models."""
         return find_gguf_models(self.models_dir)
@@ -473,11 +476,12 @@ class LlamaCppVLM:
 
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path
+            self.n_ctx = n_ctx  # Store context size for usage tracking
 
             progress(1.0, desc="Model loaded!")
 
             vision_status = "with vision" if self.chat_handler else "text-only"
-            return f"Loaded: {model_name} ({vision_status})"
+            return f"Loaded: {model_name} ({vision_status}, ctx={n_ctx})"
 
         except Exception as e:
             import traceback
@@ -520,6 +524,7 @@ class LlamaCppVLM:
             self.current_mmproj_path = None
             self.is_text_only_model = False
             self.model_type = None
+            self.n_ctx = 0
 
             # Force garbage collection
             gc.collect()
@@ -670,30 +675,37 @@ class LlamaCppVLM:
             max_wait = 300  # 5 minutes max wait
             start_time = time.time()
             server_ready = False
+            last_status = None
+            check_count = 0
 
             while time.time() - start_time < max_wait:
                 # Check if process died
                 if self.server_process.poll() is not None:
                     return f"Error: llama-server exited with code {self.server_process.returncode}"
 
+                check_count += 1
                 try:
                     resp = requests.get(health_url, timeout=2)
                     if resp.status_code == 200:
                         data = resp.json()
                         status = data.get("status", "")
-                        print(f"[llama-server] Health check: {resp.status_code}, status='{status}'")
+                        if status != last_status:
+                            print(f"[llama-server] Health check: {resp.status_code}, status='{status}'")
+                            last_status = status
                         if status == "ok":
                             server_ready = True
                             print("[llama-server] Server is ready!")
                             break
                         elif status == "loading model":
                             progress(0.5, desc="Server loading model...")
-                    else:
+                    elif resp.status_code != last_status:
                         print(f"[llama-server] Health check: {resp.status_code}")
+                        last_status = resp.status_code
                 except requests.exceptions.RequestException as e:
-                    print(f"[llama-server] Health check failed: {e}")
+                    if check_count == 1:
+                        print(f"[llama-server] Waiting for server to start...")
 
-                time.sleep(1)
+                time.sleep(5)
 
             if not server_ready:
                 self.server_process.terminate()
@@ -704,12 +716,13 @@ class LlamaCppVLM:
             self.current_mmproj_path = mmproj_path
             self.use_server_backend = True
             self.is_text_only_model = not (mmproj_path and os.path.exists(mmproj_path))
+            self.n_ctx = n_ctx  # Store context size for usage tracking
 
             vision_status = "with vision" if not self.is_text_only_model else "text-only"
             print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, vision={not self.is_text_only_model}")
 
             progress(1.0, desc="Server ready!")
-            return f"Server started: {model_name} ({vision_status}) @ {self.server_url}"
+            return f"Server started: {model_name} ({vision_status}, ctx={n_ctx}) @ {self.server_url}"
 
         except FileNotFoundError:
             return f"Error: llama-server not found at '{self.llama_server_path}'. Set the correct path."
@@ -863,6 +876,7 @@ class LlamaCppVLM:
             if stream:
                 accumulated = ""
                 token_count = 0
+                prompt_tokens = 0
                 print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
@@ -879,6 +893,10 @@ class LlamaCppVLM:
                                 break
                             try:
                                 chunk = json.loads(data_str)
+                                # Check for usage info (sometimes in final chunk)
+                                usage = chunk.get("usage", {})
+                                if usage:
+                                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                                 choices = chunk.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})
@@ -895,13 +913,22 @@ class LlamaCppVLM:
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
-                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
+
+                # Build context info string
+                total_tokens = prompt_tokens + token_count if prompt_tokens else token_count
+                if self.n_ctx > 0:
+                    ctx_pct = (total_tokens / self.n_ctx) * 100
+                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
+                else:
+                    ctx_info = f" | ~{total_tokens} tokens" if total_tokens else ""
+
+                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s){ctx_info}")
 
                 if accumulated:
-                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s total"
+                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
-                    yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s total"
+                    yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s{ctx_info}"
             else:
                 # Non-streaming mode
                 data = response.json()
@@ -909,11 +936,31 @@ class LlamaCppVLM:
                 result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 end_time = time.perf_counter()
                 elapsed = end_time - start_time
-                # Estimate token count from response length (rough approximation)
-                est_tokens = len(result.split())
-                est_speed = est_tokens / elapsed if elapsed > 0 else 0
-                print(f"[llama-server] Done in {elapsed:.2f}s (~{est_tokens} tokens, {est_speed:.1f} tok/s)")
-                yield result, result, f"~{est_speed:.1f} tok/s | {elapsed:.1f}s total"
+
+                # Get usage info from response
+                usage = data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
+                if completion_tokens > 0:
+                    speed = completion_tokens / elapsed if elapsed > 0 else 0
+                else:
+                    # Estimate from word count
+                    completion_tokens = len(result.split())
+                    speed = completion_tokens / elapsed if elapsed > 0 else 0
+
+                # Build context info string
+                if self.n_ctx > 0 and total_tokens > 0:
+                    ctx_pct = (total_tokens / self.n_ctx) * 100
+                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
+                elif total_tokens > 0:
+                    ctx_info = f" | {total_tokens} tokens"
+                else:
+                    ctx_info = ""
+
+                print(f"[llama-server] Done in {elapsed:.2f}s ({completion_tokens} tokens, {speed:.1f} tok/s){ctx_info}")
+                yield result, result, f"{speed:.1f} tok/s | {elapsed:.1f}s{ctx_info}"
 
         except requests.exceptions.Timeout:
             print(f"[llama-server] Request timed out")
@@ -1159,9 +1206,17 @@ class LlamaCppVLM:
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
-                print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
-                # Yield final stats with total time
-                yield display_text, raw_for_thinking, f"{final_speed:.1f} tok/s | {generation_time:.1f}s total"
+
+                # Build context info (estimate prompt tokens from message content)
+                # Note: In streaming mode we don't get exact prompt_tokens, so estimate
+                if self.n_ctx > 0:
+                    ctx_info = f" | ctx: ~{token_count}/{self.n_ctx}"
+                else:
+                    ctx_info = ""
+
+                print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s){ctx_info}")
+                # Yield final stats with total time and context info
+                yield display_text, raw_for_thinking, f"{final_speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
 
             else:
                 # Non-streaming mode
@@ -1179,13 +1234,25 @@ class LlamaCppVLM:
 
                 # Get token count from response if available
                 usage = response.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
                 if completion_tokens > 0:
                     speed = completion_tokens / generation_time if generation_time > 0 else 0
-                    print(f"[llama.cpp] Generated {completion_tokens} tokens in {generation_time:.2f}s ({speed:.1f} tok/s)")
                 else:
                     speed = 0
-                    print(f"[llama.cpp] Generated response in {generation_time:.2f}s")
+
+                # Build context info string
+                if self.n_ctx > 0 and total_tokens > 0:
+                    ctx_pct = (total_tokens / self.n_ctx) * 100
+                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
+                elif total_tokens > 0:
+                    ctx_info = f" | {total_tokens} tokens"
+                else:
+                    ctx_info = ""
+
+                print(f"[llama.cpp] Generated {completion_tokens} tokens in {generation_time:.2f}s ({speed:.1f} tok/s){ctx_info}")
 
                 # Clean up thinking tags if present
                 if "</think>" in result:
@@ -1203,11 +1270,11 @@ class LlamaCppVLM:
                         result = re.sub(r'<\|(start|end|return|call)\|>', '', result)
                         result = result.strip()
 
-                # Non-streaming mode - yield the final result as a tuple with speed and total time
-                if completion_tokens > 0:
-                    yield result, result, f"{speed:.1f} tok/s | {generation_time:.1f}s total"
+                # Non-streaming mode - yield the final result with speed, time, and context info
+                if speed > 0:
+                    yield result, result, f"{speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
                 else:
-                    yield result, result, f"{generation_time:.1f}s total"
+                    yield result, result, f"{generation_time:.1f}s{ctx_info}"
                 return
 
         except Exception as e:
@@ -1660,10 +1727,10 @@ def create_ui():
                     clear_btn = gr.Button("Clear Chat", scale=1)
                     stop_btn = gr.Button("Stop", variant="stop", scale=1, elem_classes=["red-btn"])
                     stats_display = gr.Textbox(
-                        label="Speed",
+                        label="Stats",
                         value="",
                         interactive=False,
-                        scale=2,
+                        scale=3,
                     )
 
             # Batch Caption Tab

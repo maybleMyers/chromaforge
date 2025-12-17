@@ -732,6 +732,32 @@ class LlamaCppVLM:
                 self.server_process = None
             return f"Error starting server: {str(e)}"
 
+    def get_server_context_usage(self) -> Tuple[int, int]:
+        """
+        Query llama-server's /slots endpoint to get actual context usage.
+        Returns (tokens_used, total_context).
+        """
+        if not self.server_url:
+            return 0, self.n_ctx
+
+        try:
+            slots_url = f"{self.server_url}/slots"
+            resp = requests.get(slots_url, timeout=2)
+            if resp.status_code == 200:
+                slots_data = resp.json()
+                # slots_data is a list of slot objects
+                if slots_data and isinstance(slots_data, list):
+                    # Get the first slot (typically only one for single-user)
+                    slot = slots_data[0]
+                    n_ctx = slot.get("n_ctx", self.n_ctx)
+                    # n_past is the number of tokens in context
+                    n_past = slot.get("n_past", 0)
+                    return n_past, n_ctx
+        except Exception as e:
+            print(f"[llama-server] Failed to query /slots: {e}")
+
+        return 0, self.n_ctx
+
     def generate_via_api(
         self,
         messages: List[Dict[str, Any]],
@@ -740,9 +766,11 @@ class LlamaCppVLM:
         video_max_frames: int = 81,
         stream: bool = False,
     ):
-        """Generate response via llama-server OpenAI-compatible API using requests only."""
+        """Generate response via llama-server OpenAI-compatible API using requests only.
+        Yields: (display_text, raw_text, speed_stats, context_info)
+        """
         if not self.server_url:
-            yield "Error: Server not running", "Error: Server not running", "0 tok/s"
+            yield "Error: Server not running", "Error: Server not running", "0 tok/s", ""
             return
 
         api_url = f"{self.server_url}/v1/chat/completions"
@@ -829,7 +857,7 @@ class LlamaCppVLM:
                 api_messages.append({"role": role, "content": str(content)})
 
         if not api_messages:
-            yield "Error: No message content", "Error: No message content", "0 tok/s"
+            yield "Error: No message content", "Error: No message content", "0 tok/s", ""
             return
 
         print(f"[llama-server] API request to {api_url}")
@@ -870,13 +898,14 @@ class LlamaCppVLM:
             if response.status_code != 200:
                 error_text = response.text[:500]
                 print(f"[llama-server] Error response: {error_text}")
-                yield f"Error {response.status_code}: {error_text}", f"Error {response.status_code}", "0 tok/s"
+                yield f"Error {response.status_code}: {error_text}", f"Error {response.status_code}", "0 tok/s", ""
                 return
 
             if stream:
                 accumulated = ""
                 token_count = 0
                 prompt_tokens = 0
+                ctx_info = ""  # Initialize context info for streaming
                 print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
@@ -906,7 +935,12 @@ class LlamaCppVLM:
                                         token_count += 1
                                         elapsed = time.perf_counter() - start_time
                                         tps = token_count / elapsed if elapsed > 0 else 0
-                                        yield accumulated, accumulated, f"{tps:.1f} tok/s"
+                                        # Query context usage periodically (every 100 tokens to avoid overhead)
+                                        if token_count % 100 == 1:
+                                            ctx_used, ctx_total = self.get_server_context_usage()
+                                            ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
+                                            ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
+                                        yield accumulated, accumulated, f"{tps:.1f} tok/s", ctx_info
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
 
@@ -914,21 +948,18 @@ class LlamaCppVLM:
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
 
-                # Build context info string
-                total_tokens = prompt_tokens + token_count if prompt_tokens else token_count
-                if self.n_ctx > 0:
-                    ctx_pct = (total_tokens / self.n_ctx) * 100
-                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
-                else:
-                    ctx_info = f" | ~{total_tokens} tokens" if total_tokens else ""
+                # Get final context usage from server
+                ctx_used, ctx_total = self.get_server_context_usage()
+                ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
+                final_ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
 
-                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s){ctx_info}")
+                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s) | ctx: {ctx_used}/{ctx_total}")
 
                 if accumulated:
-                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
+                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
-                    yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s{ctx_info}"
+                    yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s", final_ctx_info
             else:
                 # Non-streaming mode
                 data = response.json()
@@ -939,9 +970,7 @@ class LlamaCppVLM:
 
                 # Get usage info from response
                 usage = data.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
-                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
 
                 if completion_tokens > 0:
                     speed = completion_tokens / elapsed if elapsed > 0 else 0
@@ -950,29 +979,25 @@ class LlamaCppVLM:
                     completion_tokens = len(result.split())
                     speed = completion_tokens / elapsed if elapsed > 0 else 0
 
-                # Build context info string
-                if self.n_ctx > 0 and total_tokens > 0:
-                    ctx_pct = (total_tokens / self.n_ctx) * 100
-                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
-                elif total_tokens > 0:
-                    ctx_info = f" | {total_tokens} tokens"
-                else:
-                    ctx_info = ""
+                # Get context usage from server
+                ctx_used, ctx_total = self.get_server_context_usage()
+                ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
+                ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
 
-                print(f"[llama-server] Done in {elapsed:.2f}s ({completion_tokens} tokens, {speed:.1f} tok/s){ctx_info}")
-                yield result, result, f"{speed:.1f} tok/s | {elapsed:.1f}s{ctx_info}"
+                print(f"[llama-server] Done in {elapsed:.2f}s ({completion_tokens} tokens, {speed:.1f} tok/s) | ctx: {ctx_used}/{ctx_total}")
+                yield result, result, f"{speed:.1f} tok/s | {elapsed:.1f}s", ctx_info
 
         except requests.exceptions.Timeout:
             print(f"[llama-server] Request timed out")
-            yield "Error: Request timed out", "Error: Request timed out", "0 tok/s"
+            yield "Error: Request timed out", "Error: Request timed out", "0 tok/s", ""
         except requests.exceptions.ConnectionError as e:
             print(f"[llama-server] Connection error: {e}")
-            yield f"Error: Connection failed - {e}", f"Error: Connection failed", "0 tok/s"
+            yield f"Error: Connection failed - {e}", f"Error: Connection failed", "0 tok/s", ""
         except Exception as e:
             print(f"[llama-server] Unexpected error: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-            yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s"
+            yield f"Error: {str(e)}", f"Error: {str(e)}", "0 tok/s", ""
 
     def generate(
         self,
@@ -1016,13 +1041,13 @@ class LlamaCppVLM:
 
         if self.model is None and not self.use_server_backend:
             error_msg = "Error: No model loaded. Please load a model first."
-            yield error_msg, error_msg, "0 tok/s"
+            yield error_msg, error_msg, "0 tok/s", ""
             return
 
         if self.model is None and self.use_server_backend:
             # Server mode but server_process is None - server may have crashed
             error_msg = f"Error: Server backend enabled but server not running. server_process={self.server_process}, url={self.server_url}"
-            yield error_msg, error_msg, "0 tok/s"
+            yield error_msg, error_msg, "0 tok/s", ""
             return
 
         try:
@@ -1200,23 +1225,28 @@ class LlamaCppVLM:
                             raw_for_thinking = re.sub(r'<\|(start|end|return|call)\|>', '', raw_for_thinking)
                             raw_for_thinking = raw_for_thinking.strip()
 
-                        # Yield display_text, raw_text (with thinking formatted), and stats
-                        yield display_text, raw_for_thinking, f"{tokens_per_sec:.1f} tok/s"
+                        # Build context info for local llama-cpp-python (estimate)
+                        # For local backend, we estimate based on completion tokens
+                        if self.n_ctx > 0:
+                            ctx_info = f"~{token_count:,} / {self.n_ctx:,}"
+                        else:
+                            ctx_info = f"~{token_count:,} tokens"
+                        # Yield display_text, raw_text (with thinking formatted), speed, and context
+                        yield display_text, raw_for_thinking, f"{tokens_per_sec:.1f} tok/s", ctx_info
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
 
-                # Build context info (estimate prompt tokens from message content)
-                # Note: In streaming mode we don't get exact prompt_tokens, so estimate
+                # Build final context info
                 if self.n_ctx > 0:
-                    ctx_info = f" | ctx: ~{token_count}/{self.n_ctx}"
+                    final_ctx_info = f"~{token_count:,} / {self.n_ctx:,}"
                 else:
-                    ctx_info = ""
+                    final_ctx_info = f"~{token_count:,} tokens"
 
-                print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s){ctx_info}")
+                print(f"[llama.cpp] Streamed {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s)")
                 # Yield final stats with total time and context info
-                yield display_text, raw_for_thinking, f"{final_speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
+                yield display_text, raw_for_thinking, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
 
             else:
                 # Non-streaming mode
@@ -1246,13 +1276,13 @@ class LlamaCppVLM:
                 # Build context info string
                 if self.n_ctx > 0 and total_tokens > 0:
                     ctx_pct = (total_tokens / self.n_ctx) * 100
-                    ctx_info = f" | ctx: {total_tokens}/{self.n_ctx} ({ctx_pct:.0f}%)"
+                    ctx_info = f"{total_tokens:,} / {self.n_ctx:,} ({ctx_pct:.0f}%)"
                 elif total_tokens > 0:
-                    ctx_info = f" | {total_tokens} tokens"
+                    ctx_info = f"{total_tokens:,} tokens"
                 else:
                     ctx_info = ""
 
-                print(f"[llama.cpp] Generated {completion_tokens} tokens in {generation_time:.2f}s ({speed:.1f} tok/s){ctx_info}")
+                print(f"[llama.cpp] Generated {completion_tokens} tokens in {generation_time:.2f}s ({speed:.1f} tok/s) | ctx: {total_tokens}/{self.n_ctx}")
 
                 # Clean up thinking tags if present
                 if "</think>" in result:
@@ -1272,16 +1302,16 @@ class LlamaCppVLM:
 
                 # Non-streaming mode - yield the final result with speed, time, and context info
                 if speed > 0:
-                    yield result, result, f"{speed:.1f} tok/s | {generation_time:.1f}s{ctx_info}"
+                    yield result, result, f"{speed:.1f} tok/s | {generation_time:.1f}s", ctx_info
                 else:
-                    yield result, result, f"{generation_time:.1f}s{ctx_info}"
+                    yield result, result, f"{generation_time:.1f}s", ctx_info
                 return
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             error_msg = f"Error during generation: {str(e)}"
-            yield error_msg, error_msg, "0 tok/s"
+            yield error_msg, error_msg, "0 tok/s", ""
             return
 
 
@@ -1424,7 +1454,7 @@ def chat_handler(
         error_history = list(history) if history else []
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
-        yield error_history, "", ""
+        yield error_history, "", "", ""
         return
 
     # Build messages list for the model
@@ -1512,7 +1542,8 @@ def chat_handler(
 
     # Stream the response
     stats = ""
-    for display_text, raw_text, stats in vlm_manager.generate(
+    ctx_info = ""
+    for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
         messages=messages,
         max_new_tokens=max_tokens,
         temperature=temperature,
@@ -1523,7 +1554,7 @@ def chat_handler(
         if stop_generation:
             new_history[-1]["content"] += "\n\n[Generation stopped]"
             stop_generation = False
-            yield new_history, "", stats
+            yield new_history, "", stats, ctx_info
             return
 
         # Show thinking if enabled, otherwise show cleaned text
@@ -1531,7 +1562,7 @@ def chat_handler(
             new_history[-1]["content"] = raw_text
         else:
             new_history[-1]["content"] = display_text
-        yield new_history, "", stats
+        yield new_history, "", stats, ctx_info
 
 
 def clear_chat_handler():
@@ -1727,10 +1758,16 @@ def create_ui():
                     clear_btn = gr.Button("Clear Chat", scale=1)
                     stop_btn = gr.Button("Stop", variant="stop", scale=1, elem_classes=["red-btn"])
                     stats_display = gr.Textbox(
-                        label="Stats",
+                        label="Speed",
                         value="",
                         interactive=False,
-                        scale=3,
+                        scale=2,
+                    )
+                    context_display = gr.Textbox(
+                        label="Context",
+                        value="",
+                        interactive=False,
+                        scale=2,
                     )
 
             # Batch Caption Tab
@@ -1980,15 +2017,15 @@ def create_ui():
 
         def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, thinking):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
-                yield history, "", None, None, None, None, None, ""
+                yield history, "", None, None, None, None, None, "", ""
                 return
 
             # Stream responses from chat_handler generator
-            for new_history, _, stats in chat_handler(
+            for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid,
                 max_tok, temp, vid_frames, thinking
             ):
-                yield new_history, "", None, None, None, None, None, stats
+                yield new_history, "", None, None, None, None, None, stats, ctx_info
 
         send_btn.click(
             fn=send_message,
@@ -1997,7 +2034,7 @@ def create_ui():
                 image_input_1, image_input_2, image_input_3, image_input_4,
                 video_input, max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
 
         msg_input.submit(
@@ -2007,7 +2044,7 @@ def create_ui():
                 image_input_1, image_input_2, image_input_3, image_input_4,
                 video_input, max_tokens, temperature, video_max_frames, show_thinking
             ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
 
         clear_btn.click(

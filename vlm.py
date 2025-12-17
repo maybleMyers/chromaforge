@@ -908,6 +908,12 @@ class LlamaCppVLM:
                 ctx_info = ""  # Initialize context info for streaming
                 print(f"[llama-server] Reading streaming response...")
 
+                # Query context at start to get prompt tokens before streaming begins
+                ctx_used_start, ctx_total = self.get_server_context_usage()
+                if ctx_used_start > 0:
+                    prompt_tokens = ctx_used_start
+                    print(f"[llama-server] Initial context: {ctx_used_start}/{ctx_total}")
+
                 for line in response.iter_lines():
                     if line:
                         line_str = line.decode("utf-8")
@@ -935,11 +941,13 @@ class LlamaCppVLM:
                                         token_count += 1
                                         elapsed = time.perf_counter() - start_time
                                         tps = token_count / elapsed if elapsed > 0 else 0
-                                        # Query context usage periodically (every 100 tokens to avoid overhead)
-                                        if token_count % 100 == 1:
-                                            ctx_used, ctx_total = self.get_server_context_usage()
-                                            ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
-                                            ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
+                                        # Update context info periodically (every 100 tokens)
+                                        # Use calculated values: prompt_tokens + current completion tokens
+                                        if token_count % 100 == 1 or token_count == 1:
+                                            current_ctx = prompt_tokens + token_count
+                                            ctx_total_display = self.n_ctx if self.n_ctx > 0 else 32768
+                                            ctx_pct = (current_ctx / ctx_total_display * 100) if ctx_total_display > 0 else 0
+                                            ctx_info = f"{current_ctx:,} / {ctx_total_display:,} ({ctx_pct:.0f}%)"
                                         yield accumulated, accumulated, f"{tps:.1f} tok/s", ctx_info
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
@@ -948,12 +956,14 @@ class LlamaCppVLM:
                 generation_time = end_time - start_time
                 final_speed = token_count / generation_time if generation_time > 0 else 0
 
-                # Get final context usage from server
-                ctx_used, ctx_total = self.get_server_context_usage()
-                ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
-                final_ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
+                # Calculate final context usage from accumulated values
+                # Don't query /slots here - slot is already released and n_past will be 0
+                total_ctx_used = prompt_tokens + token_count
+                ctx_total = self.n_ctx if self.n_ctx > 0 else ctx_total
+                ctx_pct = (total_ctx_used / ctx_total * 100) if ctx_total > 0 else 0
+                final_ctx_info = f"{total_ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
 
-                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s) | ctx: {ctx_used}/{ctx_total}")
+                print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s) | ctx: {total_ctx_used}/{ctx_total}")
 
                 if accumulated:
                     yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
@@ -968,23 +978,26 @@ class LlamaCppVLM:
                 end_time = time.perf_counter()
                 elapsed = end_time - start_time
 
-                # Get usage info from response
+                # Get usage info from response (most reliable source)
                 usage = data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
 
                 if completion_tokens > 0:
                     speed = completion_tokens / elapsed if elapsed > 0 else 0
                 else:
                     # Estimate from word count
                     completion_tokens = len(result.split())
+                    total_tokens = prompt_tokens + completion_tokens
                     speed = completion_tokens / elapsed if elapsed > 0 else 0
 
-                # Get context usage from server
-                ctx_used, ctx_total = self.get_server_context_usage()
-                ctx_pct = (ctx_used / ctx_total * 100) if ctx_total > 0 else 0
-                ctx_info = f"{ctx_used:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
+                # Calculate context usage from usage info
+                ctx_total = self.n_ctx if self.n_ctx > 0 else 32768
+                ctx_pct = (total_tokens / ctx_total * 100) if ctx_total > 0 else 0
+                ctx_info = f"{total_tokens:,} / {ctx_total:,} ({ctx_pct:.0f}%)"
 
-                print(f"[llama-server] Done in {elapsed:.2f}s ({completion_tokens} tokens, {speed:.1f} tok/s) | ctx: {ctx_used}/{ctx_total}")
+                print(f"[llama-server] Done in {elapsed:.2f}s ({completion_tokens} tokens, {speed:.1f} tok/s) | ctx: {total_tokens}/{ctx_total}")
                 yield result, result, f"{speed:.1f} tok/s | {elapsed:.1f}s", ctx_info
 
         except requests.exceptions.Timeout:

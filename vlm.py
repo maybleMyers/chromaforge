@@ -881,6 +881,10 @@ class LlamaCppVLM:
             "stream": stream,
         }
 
+        # Request usage info in streaming responses (OpenAI-compatible extension)
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+
         start_time = time.perf_counter()
 
         try:
@@ -908,12 +912,6 @@ class LlamaCppVLM:
                 ctx_info = ""  # Initialize context info for streaming
                 print(f"[llama-server] Reading streaming response...")
 
-                # Query context at start to get prompt tokens before streaming begins
-                ctx_used_start, ctx_total = self.get_server_context_usage()
-                if ctx_used_start > 0:
-                    prompt_tokens = ctx_used_start
-                    print(f"[llama-server] Initial context: {ctx_used_start}/{ctx_total}")
-
                 for line in response.iter_lines():
                     if line:
                         line_str = line.decode("utf-8")
@@ -928,10 +926,17 @@ class LlamaCppVLM:
                                 break
                             try:
                                 chunk = json.loads(data_str)
-                                # Check for usage info (sometimes in final chunk)
-                                usage = chunk.get("usage", {})
+                                # Check for usage info (with stream_options.include_usage=true)
+                                usage = chunk.get("usage")
                                 if usage:
                                     prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                                    # Update context info with accurate values from usage
+                                    total_tokens = usage.get("total_tokens", prompt_tokens + token_count)
+                                    ctx_total_display = self.n_ctx if self.n_ctx > 0 else 32768
+                                    ctx_pct = (total_tokens / ctx_total_display * 100) if ctx_total_display > 0 else 0
+                                    ctx_info = f"{total_tokens:,} / {ctx_total_display:,} ({ctx_pct:.0f}%)"
+                                    print(f"[llama-server] Usage info received: prompt={prompt_tokens}, total={total_tokens}")
+
                                 choices = chunk.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})

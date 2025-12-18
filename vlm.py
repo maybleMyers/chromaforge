@@ -1343,32 +1343,83 @@ SETTINGS_FILE = "vlm_settings.json"
 
 # Default settings values
 DEFAULT_SETTINGS = {
+    # Model Settings
+    "model_name": None,  # Will use first available if None
+    "n_gpu_layers": -1,
+    "n_ctx": 32768,
+    "backend_type": "llama-cpp-python",
+    "tensor_split": "",
+    "main_gpu": 0,
+    "kv_cache_type": "f16",
+    "flash_attn": False,
+    "use_mmap": True,
+    "use_mlock": False,
+    "override_tensor": r"\.ffn_.*_exps\.weight=CPU",
+    "extra_args": "",
+    "server_port": 8080,
+    "llama_server_path": "llama.cpp/build/bin/llama-server",
+    # Generation Settings
     "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
     "max_tokens": 8096,
     "temperature": 0.7,
     "video_max_frames": 8,
     "show_thinking": True,
+    # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
     "batch_prompt": "Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
 }
 
 
 def save_settings(
+    # Model Settings
+    model_name: str,
+    n_gpu_layers: int,
+    n_ctx: int,
+    backend_type: str,
+    tensor_split: str,
+    main_gpu: int,
+    kv_cache_type: str,
+    flash_attn: bool,
+    use_mmap: bool,
+    use_mlock: bool,
+    override_tensor: str,
+    extra_args: str,
+    server_port: int,
+    llama_server_path: str,
+    # Generation Settings
     system_prompt: str,
     max_tokens: int,
     temperature: float,
     video_max_frames: int,
     show_thinking: bool,
+    # Batch Caption Settings
     batch_system_prompt: str,
     batch_prompt: str,
 ) -> str:
     """Save all settings to a JSON file."""
     settings = {
+        # Model Settings
+        "model_name": model_name,
+        "n_gpu_layers": n_gpu_layers,
+        "n_ctx": n_ctx,
+        "backend_type": backend_type,
+        "tensor_split": tensor_split,
+        "main_gpu": main_gpu,
+        "kv_cache_type": kv_cache_type,
+        "flash_attn": flash_attn,
+        "use_mmap": use_mmap,
+        "use_mlock": use_mlock,
+        "override_tensor": override_tensor,
+        "extra_args": extra_args,
+        "server_port": server_port,
+        "llama_server_path": llama_server_path,
+        # Generation Settings
         "system_prompt": system_prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "video_max_frames": video_max_frames,
         "show_thinking": show_thinking,
+        # Batch Caption Settings
         "batch_system_prompt": batch_system_prompt,
         "batch_prompt": batch_prompt,
     }
@@ -1886,6 +1937,17 @@ def create_ui():
                 )
 
         # Settings section below chat - in accordions
+        # Determine initial model selection from saved settings
+        saved_model = saved_settings.get("model_name")
+        if saved_model and saved_model in initial_models:
+            initial_model_value = saved_model
+        else:
+            initial_model_value = initial_models[0] if initial_models else None
+
+        # Determine if server options should be visible based on saved backend
+        saved_backend = saved_settings.get("backend_type", DEFAULT_SETTINGS["backend_type"])
+        server_options_visible = saved_backend == "llama-server"
+
         with gr.Accordion("Model Settings", open=True):
             with gr.Row():
                 with gr.Column(scale=2):
@@ -1893,7 +1955,7 @@ def create_ui():
                         model_dropdown = gr.Dropdown(
                             label="Select Model",
                             choices=initial_models,
-                            value=initial_models[0] if initial_models else None,
+                            value=initial_model_value,
                             interactive=True,
                             scale=4,
                         )
@@ -1903,7 +1965,7 @@ def create_ui():
                     n_gpu_layers = gr.Slider(
                         minimum=-1,
                         maximum=100,
-                        value=-1,
+                        value=saved_settings.get("n_gpu_layers", DEFAULT_SETTINGS["n_gpu_layers"]),
                         step=1,
                         label="GPU Layers (-1 = all)",
                         info="Layers to offload to GPU",
@@ -1913,7 +1975,7 @@ def create_ui():
                     n_ctx = gr.Slider(
                         minimum=512,
                         maximum=200000,
-                        value=32768,
+                        value=saved_settings.get("n_ctx", DEFAULT_SETTINGS["n_ctx"]),
                         step=512,
                         label="Context Length",
                     )
@@ -1923,21 +1985,21 @@ def create_ui():
                     backend_type = gr.Dropdown(
                         label="Backend",
                         choices=["llama-cpp-python", "llama-server"],
-                        value="llama-cpp-python",
+                        value=saved_settings.get("backend_type", DEFAULT_SETTINGS["backend_type"]),
                         info="llama-server enables MoE --override-tensor",
                     )
                 with gr.Column(scale=2):
                     tensor_split = gr.Textbox(
                         label="Tensor Split (Multi-GPU)",
                         placeholder="e.g., 2,1 for 48GB+24GB GPUs (ratio-based distribution)",
-                        value="",
+                        value=saved_settings.get("tensor_split", DEFAULT_SETTINGS["tensor_split"]),
                         info="Comma-separated ratios for distributing layers across GPUs",
                     )
                 with gr.Column(scale=1):
                     main_gpu = gr.Slider(
                         minimum=0,
                         maximum=7,
-                        value=0,
+                        value=saved_settings.get("main_gpu", DEFAULT_SETTINGS["main_gpu"]),
                         step=1,
                         label="Main GPU",
                         info="GPU for small tensors/scratch buffer",
@@ -1946,48 +2008,48 @@ def create_ui():
                     kv_cache_type = gr.Dropdown(
                         label="KV Cache Type",
                         choices=["f16", "q8_0", "q4_0"],
-                        value="f16",
+                        value=saved_settings.get("kv_cache_type", DEFAULT_SETTINGS["kv_cache_type"]),
                         info="Quantize KV cache to save VRAM",
                     )
                 with gr.Column(scale=1):
                     flash_attn = gr.Checkbox(
                         label="Flash Attention",
-                        value=False,
+                        value=saved_settings.get("flash_attn", DEFAULT_SETTINGS["flash_attn"]),
                         info="Faster attention (requires layers on GPU)",
                     )
                 with gr.Column(scale=1):
                     use_mmap = gr.Checkbox(
                         label="Use MMap",
-                        value=True,
+                        value=saved_settings.get("use_mmap", DEFAULT_SETTINGS["use_mmap"]),
                         info="Uncheck to load fully into RAM (requires enough RAM)",
                     )
                 with gr.Column(scale=1):
                     use_mlock = gr.Checkbox(
                         label="Lock in RAM (mlock)",
-                        value=False,
+                        value=saved_settings.get("use_mlock", DEFAULT_SETTINGS["use_mlock"]),
                         info="Lock model in RAM after loading - prevents SSD access after warmup",
                     )
 
             # Server-mode specific options
-            with gr.Row(visible=False) as server_options_row:
+            with gr.Row(visible=server_options_visible) as server_options_row:
                 with gr.Column(scale=3):
                     override_tensor = gr.Textbox(
                         label="Override Tensor (-ot)",
                         placeholder=r"\.ffn_.*_exps\.weight=CPU",
-                        value=r"\.ffn_.*_exps\.weight=CPU",
+                        value=saved_settings.get("override_tensor", DEFAULT_SETTINGS["override_tensor"]),
                         info="MoE optimization: offload expert FFN to CPU. Use ; for multiple patterns.",
                     )
                 with gr.Column(scale=2):
                     extra_args = gr.Textbox(
                         label="Extra Args",
                         placeholder="--cpu-moe or --n-cpu-moe 82",
-                        value="",
+                        value=saved_settings.get("extra_args", DEFAULT_SETTINGS["extra_args"]),
                         info="Additional llama-server args (e.g., --cpu-moe, --numa distribute)",
                     )
                 with gr.Column(scale=1):
                     server_port = gr.Number(
                         label="Server Port",
-                        value=8080,
+                        value=saved_settings.get("server_port", DEFAULT_SETTINGS["server_port"]),
                         precision=0,
                         info="Port for llama-server",
                     )
@@ -1995,7 +2057,7 @@ def create_ui():
                     llama_server_path = gr.Textbox(
                         label="llama-server Path",
                         placeholder="llama.cpp/build/bin/llama-server",
-                        value="llama.cpp/build/bin/llama-server",
+                        value=saved_settings.get("llama_server_path", DEFAULT_SETTINGS["llama_server_path"]),
                         info="Path to llama-server executable",
                     )
 
@@ -2160,8 +2222,16 @@ def create_ui():
         save_settings_btn.click(
             fn=save_settings,
             inputs=[
+                # Model Settings
+                model_dropdown, n_gpu_layers, n_ctx, backend_type,
+                tensor_split, main_gpu, kv_cache_type, flash_attn,
+                use_mmap, use_mlock, override_tensor, extra_args,
+                server_port, llama_server_path,
+                # Generation Settings
                 system_prompt, max_tokens, temperature, video_max_frames,
-                show_thinking, batch_system_prompt, batch_prompt
+                show_thinking,
+                # Batch Caption Settings
+                batch_system_prompt, batch_prompt
             ],
             outputs=[save_status],
         )

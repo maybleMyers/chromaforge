@@ -1338,6 +1338,68 @@ vlm_manager: Optional[LlamaCppVLM] = None
 # Global stop flag for generation
 stop_generation: bool = False
 
+# Default settings file path
+SETTINGS_FILE = "vlm_settings.json"
+
+# Default settings values
+DEFAULT_SETTINGS = {
+    "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
+    "max_tokens": 8096,
+    "temperature": 0.7,
+    "video_max_frames": 8,
+    "show_thinking": True,
+    "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
+    "batch_prompt": "Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
+}
+
+
+def save_settings(
+    system_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    video_max_frames: int,
+    show_thinking: bool,
+    batch_system_prompt: str,
+    batch_prompt: str,
+) -> str:
+    """Save all settings to a JSON file."""
+    settings = {
+        "system_prompt": system_prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "video_max_frames": video_max_frames,
+        "show_thinking": show_thinking,
+        "batch_system_prompt": batch_system_prompt,
+        "batch_prompt": batch_prompt,
+    }
+
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        print(f"[vlm.py] Settings saved to {SETTINGS_FILE}")
+        return f"Settings saved to {SETTINGS_FILE}"
+    except Exception as e:
+        print(f"[vlm.py] Error saving settings: {e}")
+        return f"Error saving settings: {e}"
+
+
+def load_settings() -> Dict[str, Any]:
+    """Load settings from JSON file. Returns defaults if file doesn't exist."""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            # Merge with defaults to handle missing keys
+            merged = {**DEFAULT_SETTINGS, **settings}
+            print(f"[vlm.py] Settings loaded from {SETTINGS_FILE}")
+            return merged
+        else:
+            print(f"[vlm.py] No settings file found, using defaults")
+            return DEFAULT_SETTINGS.copy()
+    except Exception as e:
+        print(f"[vlm.py] Error loading settings: {e}, using defaults")
+        return DEFAULT_SETTINGS.copy()
+
 
 def initialize_manager(models_dir: str = "models/LLM"):
     """Initialize the global VLM manager."""
@@ -1676,6 +1738,9 @@ def batch_caption_handler(
 
 def create_ui():
     """Create the Gradio interface."""
+    # Load saved settings
+    saved_settings = load_settings()
+
     # Theme
     vlm_theme = themes.Default(
         primary_hue=colors.Color(
@@ -1802,14 +1867,14 @@ def create_ui():
                     label="System Prompt",
                     placeholder="System instructions for captioning...",
                     lines=3,
-                    value="You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
+                    value=saved_settings.get("batch_system_prompt", DEFAULT_SETTINGS["batch_system_prompt"]),
                 )
 
                 batch_prompt = gr.Textbox(
                     label="Caption Prompt",
                     placeholder="Describe this image in detail.",
                     lines=2,
-                    value="Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
+                    value=saved_settings.get("batch_prompt", DEFAULT_SETTINGS["batch_prompt"]),
                 )
 
                 batch_start_btn = gr.Button("Start Batch Captioning", variant="primary", elem_classes=["green-btn"])
@@ -1960,7 +2025,7 @@ def create_ui():
                     label="System Prompt",
                     placeholder="Enter a system prompt to guide the model's behavior...",
                     lines=2,
-                    value="You are a helpful AI assistant that can understand and describe images and videos in detail.",
+                    value=saved_settings.get("system_prompt", DEFAULT_SETTINGS["system_prompt"]),
                     scale=3,
                 )
 
@@ -1968,21 +2033,21 @@ def create_ui():
                 max_tokens = gr.Slider(
                     minimum=64,
                     maximum=262048,
-                    value=8096,
+                    value=saved_settings.get("max_tokens", DEFAULT_SETTINGS["max_tokens"]),
                     step=64,
                     label="Max New Tokens",
                 )
                 temperature = gr.Slider(
                     minimum=0.0,
                     maximum=2.0,
-                    value=0.7,
+                    value=saved_settings.get("temperature", DEFAULT_SETTINGS["temperature"]),
                     step=0.1,
                     label="Temperature",
                 )
                 video_max_frames = gr.Slider(
                     minimum=1,
                     maximum=201,
-                    value=8,
+                    value=saved_settings.get("video_max_frames", DEFAULT_SETTINGS["video_max_frames"]),
                     step=1,
                     label="Max Video Frames",
                     info="Frames to extract from videos",
@@ -1991,7 +2056,15 @@ def create_ui():
             with gr.Row():
                 show_thinking = gr.Checkbox(
                     label="Show Thinking",
-                    value=True,
+                    value=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
+                )
+                save_settings_btn = gr.Button("Save Settings", variant="secondary")
+                save_status = gr.Textbox(
+                    label="",
+                    value="",
+                    interactive=False,
+                    scale=2,
+                    show_label=False,
                 )
 
         # Event handlers
@@ -2081,6 +2154,16 @@ def create_ui():
                 max_tokens, temperature
             ],
             outputs=[batch_output],
+        )
+
+        # Save settings handler
+        save_settings_btn.click(
+            fn=save_settings,
+            inputs=[
+                system_prompt, max_tokens, temperature, video_max_frames,
+                show_thinking, batch_system_prompt, batch_prompt
+            ],
+            outputs=[save_status],
         )
 
     return demo

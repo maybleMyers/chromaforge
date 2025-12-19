@@ -10,7 +10,11 @@ import huggingface_guess
 
 def patch_zimage_for_fp16(model):
     import torch.nn.functional as F
-    from diffusers.models.transformers.transformer_z_image import FeedForward, ZImageTransformerBlock
+    # Import from both modules to handle both model types
+    try:
+        from diffusers.models.transformers.transformer_z_image import FeedForward, ZImageTransformerBlock
+    except ImportError:
+        from diffusers.models.transformers.transformer_z_image_omni import FeedForward, ZImageTransformerBlock
 
     def clamp_fp16(x):
         if x.dtype == torch.float16:
@@ -26,12 +30,30 @@ def patch_zimage_for_fp16(model):
 
     original_block_forward = ZImageTransformerBlock.forward
 
-    def patched_block_forward(self, x, attn_mask, freqs_cis, adaln_input=None):
+    def patched_block_forward(self, x, attn_mask, freqs_cis, adaln_input=None, noise_mask=None, adaln_noisy=None, adaln_clean=None):
         if self.modulation:
-            assert adaln_input is not None
-            scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            if noise_mask is not None and adaln_noisy is not None and adaln_clean is not None:
+                # Per-token modulation for Omni model
+                batch_size, seq_len = x.shape[0], x.shape[1]
+                mod_noisy = self.adaLN_modulation(adaln_noisy)
+                mod_clean = self.adaLN_modulation(adaln_clean)
+                scale_msa_noisy, gate_msa_noisy, scale_mlp_noisy, gate_mlp_noisy = mod_noisy.chunk(4, dim=1)
+                scale_msa_clean, gate_msa_clean, scale_mlp_clean, gate_mlp_clean = mod_clean.chunk(4, dim=1)
+                gate_msa_noisy, gate_mlp_noisy = gate_msa_noisy.tanh(), gate_mlp_noisy.tanh()
+                gate_msa_clean, gate_mlp_clean = gate_msa_clean.tanh(), gate_mlp_clean.tanh()
+                scale_msa_noisy, scale_mlp_noisy = 1.0 + scale_msa_noisy, 1.0 + scale_mlp_noisy
+                scale_msa_clean, scale_mlp_clean = 1.0 + scale_msa_clean, 1.0 + scale_mlp_clean
+                noise_mask_expanded = noise_mask.unsqueeze(-1)
+                scale_msa = torch.where(noise_mask_expanded == 1, scale_msa_noisy.unsqueeze(1).expand(-1, seq_len, -1), scale_msa_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                scale_mlp = torch.where(noise_mask_expanded == 1, scale_mlp_noisy.unsqueeze(1).expand(-1, seq_len, -1), scale_mlp_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                gate_msa = torch.where(noise_mask_expanded == 1, gate_msa_noisy.unsqueeze(1).expand(-1, seq_len, -1), gate_msa_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                gate_mlp = torch.where(noise_mask_expanded == 1, gate_mlp_noisy.unsqueeze(1).expand(-1, seq_len, -1), gate_mlp_clean.unsqueeze(1).expand(-1, seq_len, -1))
+            else:
+                # Original global modulation
+                assert adaln_input is not None
+                scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
+                gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
+                scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 attention_mask=attn_mask,
@@ -149,9 +171,10 @@ from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.chroma import Chroma
 from backend.diffusion_engine.chroma_dct import ChromaDCT
 from backend.diffusion_engine.zimage import ZImage
+from backend.diffusion_engine.zimage_omni import ZImageOmni
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, ZImage, Flux]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, ZImage, ZImageOmni, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -347,7 +370,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             load_state_dict(model, state_dict, log_name=cls_name)
             return model
-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel']:
+        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel', 'ZImageOmniTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
 
             model_loader = None
@@ -370,6 +393,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 # Load ZImageTransformer2DModel directly from diffusers
                 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
                 model_loader = lambda c: ZImageTransformer2DModel(**c)
+            elif cls_name == 'ZImageOmniTransformer2DModel':
+                # Load ZImageOmniTransformer2DModel directly from diffusers
+                from diffusers.models.transformers.transformer_z_image_omni import ZImageOmniTransformer2DModel
+                model_loader = lambda c: ZImageOmniTransformer2DModel(**c)
             elif cls_name == 'SD3Transformer2DModel':
                 from backend.nn.mmditx import MMDiTX
                 model_loader = lambda c: MMDiTX(**c)
@@ -393,7 +420,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         beautiful_print_gguf_state_dict_statics(state_dict)
 
             # Z-Image specific precision settings (highest priority)
-            if cls_name == 'ZImageTransformer2DModel':
+            if cls_name in ['ZImageTransformer2DModel', 'ZImageOmniTransformer2DModel']:
                 try:
                     from modules import shared
                     z_transformer_dtype = getattr(shared.opts, 'z_transformer_dtype', 'Automatic')
@@ -413,7 +440,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             computation_dtype = memory_management.get_computation_dtype(load_device, parameters=state_dict_parameters, supported_dtypes=guess.supported_inference_dtypes)
 
             # For Z-Image, if user specified a precision, also use it for computation
-            if cls_name == 'ZImageTransformer2DModel':
+            if cls_name in ['ZImageTransformer2DModel', 'ZImageOmniTransformer2DModel']:
                 try:
                     from modules import shared
                     z_transformer_dtype = getattr(shared.opts, 'z_transformer_dtype', 'Automatic')
@@ -442,12 +469,12 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     model = model_loader(unet_config).to(**to_args)
 
             # Convert ComfyUI Z-Image format to Diffusers format if needed
-            if cls_name == 'ZImageTransformer2DModel':
+            if cls_name in ['ZImageTransformer2DModel', 'ZImageOmniTransformer2DModel']:
                 state_dict = convert_comfy_zimage_state_dict(state_dict)
 
             load_state_dict(model, state_dict)
 
-            if cls_name == 'ZImageTransformer2DModel':
+            if cls_name in ['ZImageTransformer2DModel', 'ZImageOmniTransformer2DModel']:
                 patch_zimage_for_fp16(model)
 
             # Enable FP8 optimizations for ChromaDCT if weights are FP8

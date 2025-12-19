@@ -6,8 +6,43 @@ import math
 import torch
 
 from torch import nn
-from einops import rearrange, repeat
 from backend.attention import attention_function
+
+
+def _patchify(x, patch_size):
+    """Convert image tensor to patches: [B, C, H, W] -> [B, num_patches, patch_dim]
+
+    Equivalent to: rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
+    """
+    B, C, H, W = x.shape
+    h_patches = H // patch_size
+    w_patches = W // patch_size
+    # [B, C, h_patches, patch_size, w_patches, patch_size]
+    x = x.view(B, C, h_patches, patch_size, w_patches, patch_size)
+    # [B, h_patches, w_patches, C, patch_size, patch_size]
+    x = x.permute(0, 2, 4, 1, 3, 5)
+    # [B, num_patches, patch_dim]
+    x = x.reshape(B, h_patches * w_patches, C * patch_size * patch_size)
+    return x
+
+
+def _unpatchify(x, h_len, w_len, patch_h, patch_w):
+    """Convert patches back to image: [B, num_patches, patch_dim] -> [B, C, H, W]
+
+    Equivalent to: rearrange(x, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=patch_h, pw=patch_w)
+    """
+    B = x.shape[0]
+    patch_dim = x.shape[2]
+    C = patch_dim // (patch_h * patch_w)
+    # [B, h_len, w_len, C, patch_h, patch_w]
+    x = x.view(B, h_len, w_len, C, patch_h, patch_w)
+    # [B, C, h_len, patch_h, w_len, patch_w]
+    x = x.permute(0, 3, 1, 4, 2, 5)
+    # [B, C, H, W]
+    x = x.reshape(B, C, h_len * patch_h, w_len * patch_w)
+    return x
+
+
 from backend.utils import fp16_fix, tensor2parameter
 from backend.nn.flux import attention, rope, timestep_embedding, EmbedND, MLPEmbedder, RMSNorm, QKNorm, SelfAttention
 
@@ -290,18 +325,21 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         pad_h = (patch_size - x.shape[-2] % patch_size) % patch_size
         pad_w = (patch_size - x.shape[-1] % patch_size) % patch_size
         x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="circular")
-        img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
+        # Use native PyTorch patchify (torch.compile compatible)
+        img = _patchify(x, patch_size)
         del x, pad_h, pad_w
         h_len = ((h + (patch_size // 2)) // patch_size)
         w_len = ((w + (patch_size // 2)) // patch_size)
         img_ids = torch.zeros((h_len, w_len, 3), device=input_device, dtype=input_dtype)
         img_ids[..., 1] = img_ids[..., 1] + torch.linspace(0, h_len - 1, steps=h_len, device=input_device, dtype=input_dtype)[:, None]
         img_ids[..., 2] = img_ids[..., 2] + torch.linspace(0, w_len - 1, steps=w_len, device=input_device, dtype=input_dtype)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
+        # Use native PyTorch repeat (torch.compile compatible)
+        img_ids = img_ids.reshape(1, h_len * w_len, 3).expand(bs, -1, -1)
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=input_device, dtype=input_dtype)
         del input_device, input_dtype
         out = self.inner_forward(img, img_ids, context, txt_ids, timestep)
         del img, img_ids, txt_ids, timestep, context
-        out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:, :, :h, :w]
+        # Use native PyTorch unpatchify (torch.compile compatible)
+        out = _unpatchify(out, h_len, w_len, 2, 2)[:, :, :h, :w]
         del h_len, w_len, bs
         return out

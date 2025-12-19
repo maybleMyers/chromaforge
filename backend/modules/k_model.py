@@ -11,6 +11,69 @@ except ImportError:
     verify_lora_weights = None
 
 
+def _get_torch_compile_settings():
+    """Get torch.compile settings from shared options."""
+    try:
+        from modules.shared import opts
+        compile_mode = getattr(opts, 'torch_compile_mode', 'Disabled')
+        return compile_mode if compile_mode != 'Disabled' else None
+    except Exception:
+        return None
+
+
+def _apply_torch_compile(model, mode, model_name="model"):
+    """Apply torch.compile to a model with error handling."""
+    if mode is None:
+        return model
+
+    try:
+        import torch._dynamo
+        import sys
+
+        # Check PyTorch version supports torch.compile
+        torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+        if torch_version < (2, 0):
+            print(f'[torch.compile] PyTorch {torch.__version__} does not support torch.compile (requires 2.0+)')
+            return model
+
+        # Determine backend based on platform
+        backend = "inductor"  # Default backend
+
+        # On Windows, inductor requires Triton which has compatibility issues
+        # Use cudagraphs backend instead which works natively
+        if sys.platform == "win32":
+            # Check if triton is properly available
+            try:
+                from triton.compiler.compiler import triton_key
+            except ImportError:
+                print(f'[torch.compile] Triton not fully available on Windows, using cudagraphs backend')
+                backend = "cudagraphs"
+
+        print(f'[torch.compile] Compiling {model_name} with backend="{backend}"...')
+
+        # Build compile kwargs based on backend
+        compile_kwargs = {
+            'fullgraph': False,  # Allow graph breaks for dynamic control flow
+            'backend': backend,
+        }
+
+        # 'mode' is only supported by inductor backend
+        if backend == "inductor":
+            compile_kwargs['mode'] = mode
+
+        # Use dynamic=True for PyTorch 2.3+ for better variable shape handling
+        if torch_version >= (2, 3):
+            compile_kwargs['dynamic'] = True
+
+        compiled_model = torch.compile(model, **compile_kwargs)
+        print(f'[torch.compile] {model_name} compilation scheduled (will compile on first forward pass)')
+        return compiled_model
+
+    except Exception as e:
+        print(f'[torch.compile] Failed to compile {model_name}: {e}')
+        return model
+
+
 class KModel(torch.nn.Module):
     def __init__(self, model, diffusers_scheduler, k_predictor=None, config=None):
         super().__init__()
@@ -22,7 +85,14 @@ class KModel(torch.nn.Module):
 
         print(f'K-Model Created: {dict(storage_dtype=self.storage_dtype, computation_dtype=self.computation_dtype)}')
 
-        self.diffusion_model = model
+        # Check if torch.compile is enabled
+        compile_mode = _get_torch_compile_settings()
+        if compile_mode:
+            self.diffusion_model = _apply_torch_compile(model, compile_mode, "diffusion_model")
+            self._is_compiled = True
+        else:
+            self.diffusion_model = model
+            self._is_compiled = False
 
         if k_predictor is None:
             self.predictor = k_prediction_from_diffusers_scheduler(diffusers_scheduler)

@@ -49,6 +49,25 @@ class PasteField(tuple):
 paste_fields: dict[str, dict] = {}
 registered_param_bindings: list[ParamBinding] = []
 
+# Mapping from function names to paste field names for direct copying
+_function_to_paste_name = {
+    'get_sampler_from_infotext': 'Sampler',
+    'get_scheduler_from_infotext': 'Schedule type',
+    'get_hr_sampler_from_infotext': 'Hires sampler',
+    'get_hr_scheduler_from_infotext': 'Hires schedule type',
+}
+
+
+def get_paste_field_name(paste_field):
+    """Get the effective name for matching in direct field copying."""
+    _, target = paste_field
+    if isinstance(target, str):
+        return target
+    # For function-based fields, look up the function name
+    if callable(target) and hasattr(target, '__name__'):
+        return _function_to_paste_name.get(target.__name__)
+    return None
+
 
 def reset():
     paste_fields.clear()
@@ -177,11 +196,15 @@ def connect_paste_params_buttons():
             connect_paste(binding.paste_button, fields, binding.source_text_component, override_settings_component, binding.tabname)
 
         if binding.source_tabname is not None and fields is not None:
-            paste_field_names = ['Prompt', 'Negative prompt', 'Steps', 'Face restoration'] + (["Seed"] if shared.opts.send_seed else []) + binding.paste_field_names
+            paste_field_names = [
+                'Prompt', 'Negative prompt', 'Steps', 'Face restoration',
+                'CFG scale', 'Distilled CFG Scale', 'Size-1', 'Size-2',
+                'Batch size', 'Denoising strength', 'Sampler', 'Schedule type',
+            ] + (["Seed"] if shared.opts.send_seed else []) + binding.paste_field_names
             binding.paste_button.click(
                 fn=lambda *x: x,
-                inputs=[field for field, name in paste_fields[binding.source_tabname]["fields"] if name in paste_field_names],
-                outputs=[field for field, name in fields if name in paste_field_names],
+                inputs=[pf[0] for pf in paste_fields[binding.source_tabname]["fields"] if get_paste_field_name(pf) in paste_field_names],
+                outputs=[pf[0] for pf in fields if get_paste_field_name(pf) in paste_field_names],
                 show_progress=False,
             )
 

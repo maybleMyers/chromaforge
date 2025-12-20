@@ -325,21 +325,28 @@ def print_analysis_report(analysis: Dict):
     print("\n" + "=" * 70)
 
 
-def quantize_to_int8(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_to_int8(tensor: torch.Tensor, device: str = "cpu") -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to INT8 using symmetric per-tensor quantization.
 
+    Args:
+        tensor: Input tensor to quantize
+        device: Device to use for computation ("cpu", "cuda", "cuda:0", etc.)
+
     Returns:
-        int8_tensor: Quantized tensor in int8
+        int8_tensor: Quantized tensor in int8 (on CPU for saving)
         scale: Scale factor for dequantization (original = int8 * scale)
     """
-    # Convert to float for computation
-    t_float = tensor.float()
+    # Move to device for faster computation
+    if device != "cpu" and torch.cuda.is_available():
+        t_float = tensor.to(device).float()
+    else:
+        t_float = tensor.float()
 
     # Symmetric quantization: scale = abs_max / 127
     abs_max = t_float.abs().max()
     if abs_max == 0:
-        abs_max = torch.tensor(1.0)
+        abs_max = torch.tensor(1.0, device=t_float.device)
 
     # Scale factor
     scale = (abs_max / 127.0).float()
@@ -347,20 +354,29 @@ def quantize_to_int8(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # Quantize: round(tensor / scale) clamped to [-127, 127]
     int8_tensor = torch.clamp(torch.round(t_float / scale), -127, 127).to(torch.int8)
 
-    return int8_tensor, scale
+    # Move back to CPU for saving
+    return int8_tensor.cpu(), scale.cpu()
 
 
 def convert_to_q8(
     model_path: str,
     output_path: str,
     analysis: Dict,
-    force: bool = False
+    force: bool = False,
+    device: str = "cpu"
 ) -> str:
     """
     Convert model to Q8 (INT8) format based on analysis.
 
     Creates a new model directory with INT8 weights for quantizable layers
     and bf16 weights for vision/sensitive layers.
+
+    Args:
+        model_path: Path to source model
+        output_path: Path for output Q8 model
+        analysis: Analysis dict from analyze_model()
+        force: Overwrite existing output
+        device: Device for quantization computation ("cpu", "cuda", "cuda:0", etc.)
     """
     if not SAFETENSORS_AVAILABLE:
         raise RuntimeError("safetensors is required for conversion")
@@ -377,7 +393,18 @@ def convert_to_q8(
     print(f"\nConverting model to Q8 (INT8)...")
     print(f"Input: {model_path}")
     print(f"Output: {output_path}")
+    print(f"Device: {device}")
     print(f"Vision layers will be kept in bf16")
+
+    # Check CUDA availability
+    if device != "cpu":
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+        else:
+            print("Warning: CUDA not available, falling back to CPU")
+            device = "cpu"
 
     # Copy config files
     for config_file in ["config.json", "tokenizer.json", "tokenizer_config.json",
@@ -431,8 +458,8 @@ def convert_to_q8(
                 )
 
                 if should_quantize:
-                    # Quantize to INT8
-                    int8_tensor, scale = quantize_to_int8(tensor)
+                    # Quantize to INT8 using GPU if available
+                    int8_tensor, scale = quantize_to_int8(tensor, device=device)
 
                     converted_tensors[name] = int8_tensor
                     scales[f"{name}._scale"] = scale.view(1)
@@ -444,6 +471,10 @@ def convert_to_q8(
                     q8_size = tensor.numel() * 1 + 4
                     total_q8_size += q8_size
                     converted_count += 1
+
+                    # Clear GPU cache periodically
+                    if device != "cpu" and converted_count % 50 == 0:
+                        torch.cuda.empty_cache()
                 else:
                     # Keep original precision (bf16 for vision layers)
                     # Ensure it's bf16 if it was bf16 originally
@@ -464,6 +495,8 @@ def convert_to_q8(
 
         del converted_tensors
         gc.collect()
+        if device != "cpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Create index file
     index = {
@@ -706,6 +739,12 @@ def main():
         action="store_true",
         help="Overwrite existing output directory"
     )
+    parser.add_argument(
+        "--device", "-d",
+        type=str,
+        default="cuda",
+        help="Device for quantization computation (default: cuda). Use 'cpu' for CPU-only."
+    )
 
     args = parser.parse_args()
 
@@ -725,7 +764,7 @@ def main():
 
     # Convert if not analyze-only
     if not args.analyze_only:
-        output_path = convert_to_q8(args.model, args.output, analysis, args.force)
+        output_path = convert_to_q8(args.model, args.output, analysis, args.force, args.device)
         generate_loader_code(output_path, analysis)
 
         print("\n" + "=" * 70)

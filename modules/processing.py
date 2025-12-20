@@ -942,8 +942,10 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 # Apply per-request checkpoint override if set (for tab isolation)
                 if p.checkpoint_override is not None:
                     from modules_forge import main_entry
-                    main_entry.checkpoint_change(p.checkpoint_override, save=False, refresh=False)
-                    main_entry.refresh_model_loading_parameters()
+                    # Only refresh model loading parameters if checkpoint actually changed
+                    # This prevents unnecessary model unloading during batch runs
+                    if main_entry.checkpoint_change(p.checkpoint_override, save=False, refresh=False):
+                        main_entry.refresh_model_loading_parameters()
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()

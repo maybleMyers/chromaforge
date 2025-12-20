@@ -888,7 +888,17 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.3 + memory_to_free, device, all_loaded_models)
+            # Check if we actually need to free memory
+            # Only free if we don't have enough for the models themselves (not the full inference buffer)
+            current_free = get_free_memory(device)
+            models_memory_needed = total_memory_required[device] * 1.3
+
+            # If we have enough memory for the models, skip aggressive freeing
+            # This prevents unloading the UNet when loading the small VAE
+            if current_free >= models_memory_needed:
+                continue
+
+            free_memory(models_memory_needed + memory_to_free, device, all_loaded_models)
 
     for idx, loaded_model in enumerate(models_to_load):
         model = loaded_model.model

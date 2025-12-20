@@ -23,9 +23,36 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import torch
 from tqdm import tqdm
+
+# Thread-local storage for GPU assignment
+_thread_local = threading.local()
+
+
+def get_available_gpus() -> List[str]:
+    """Get list of available CUDA devices."""
+    if not torch.cuda.is_available():
+        return []
+    return [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+
+
+def print_gpu_info():
+    """Print information about available GPUs."""
+    if not torch.cuda.is_available():
+        print("No CUDA GPUs available")
+        return
+
+    num_gpus = torch.cuda.device_count()
+    print(f"Found {num_gpus} GPU(s):")
+    for i in range(num_gpus):
+        name = torch.cuda.get_device_name(i)
+        mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        print(f"  GPU {i}: {name} ({mem:.1f} GB)")
+
 
 # Check for safetensors
 try:
@@ -75,10 +102,13 @@ def find_safetensor_files(model_path: str) -> List[str]:
     raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
 
-def analyze_tensor(name: str, tensor: torch.Tensor) -> Dict:
+def analyze_tensor(name: str, tensor: torch.Tensor, device: str = "cpu") -> Dict:
     """Analyze a tensor for INT8 quantization suitability."""
-    # Convert to float32 for analysis
-    t = tensor.float()
+    # Convert to float32 for analysis, use GPU if available
+    if device != "cpu" and torch.cuda.is_available():
+        t = tensor.to(device).float()
+    else:
+        t = tensor.float()
 
     # Basic stats
     abs_vals = t.abs()
@@ -153,14 +183,104 @@ def should_skip_layer(name: str, skip_patterns: List[str]) -> Tuple[bool, str]:
     return False, ""
 
 
-def analyze_model(model_path: str, skip_patterns: Optional[List[str]] = None) -> Dict:
+def analyze_shard(shard_file: str, skip_patterns: List[str], device: str) -> Dict:
+    """Analyze a single shard file on a specific GPU."""
+    results = {
+        "layers": {},
+        "total_layers": 0,
+        "quantizable_layers": 0,
+        "skipped_layers": 0,
+        "total_size_mb": 0,
+        "quantizable_size_mb": 0,
+        "skipped_size_mb": 0,
+        "categories": {"safe": [], "medium_risk": [], "high_risk": [], "skipped": []}
+    }
+
+    if not os.path.exists(shard_file):
+        return results
+
+    with safe_open(shard_file, framework="pt", device="cpu") as f:
+        for name in f.keys():
+            tensor = f.get_tensor(name)
+
+            # Only analyze weight tensors (not biases, which are small)
+            if tensor.numel() < 1000:
+                continue
+
+            # Analyze tensor using GPU
+            stats = analyze_tensor(name, tensor, device=device)
+            results["total_layers"] += 1
+            results["total_size_mb"] += stats["size_mb"]
+
+            # Check skip patterns
+            should_skip, skip_reason = should_skip_layer(name, skip_patterns)
+
+            if should_skip:
+                stats["quantizable"] = False
+                stats["skip_reason"] = skip_reason
+                stats["category"] = "skipped_pattern"
+                results["skipped_layers"] += 1
+                results["skipped_size_mb"] += stats["size_mb"]
+                results["categories"]["skipped"].append(name)
+            elif stats["risk_score"] >= 50:
+                stats["quantizable"] = False
+                stats["category"] = "high_risk"
+                results["skipped_layers"] += 1
+                results["skipped_size_mb"] += stats["size_mb"]
+                results["categories"]["high_risk"].append(name)
+            elif stats["risk_score"] >= 25:
+                stats["category"] = "medium_risk"
+                results["quantizable_layers"] += 1
+                results["quantizable_size_mb"] += stats["size_mb"]
+                results["categories"]["medium_risk"].append(name)
+            else:
+                stats["category"] = "safe"
+                results["quantizable_layers"] += 1
+                results["quantizable_size_mb"] += stats["size_mb"]
+                results["categories"]["safe"].append(name)
+
+            results["layers"][name] = stats
+            del tensor
+
+    gc.collect()
+    if device != "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return results
+
+
+def analyze_model(model_path: str, skip_patterns: Optional[List[str]] = None, device: str = "cuda") -> Dict:
     """
     Analyze a model for INT8 quantization.
+
+    Args:
+        model_path: Path to model directory
+        skip_patterns: Layer name patterns to skip (keep in bf16)
+        device: Device for analysis computation ("cpu", "cuda", "cuda:0", etc.)
 
     Returns detailed analysis of each layer and recommendations.
     """
     if not SAFETENSORS_AVAILABLE:
         raise RuntimeError("safetensors is required for analysis")
+
+    # Determine GPUs to use
+    gpus = []
+    if device != "cpu":
+        if torch.cuda.is_available():
+            if device == "cuda" or device == "all":
+                # Use all available GPUs
+                gpus = get_available_gpus()
+            else:
+                # Use specific GPU(s)
+                gpus = [device]
+            print_gpu_info()
+            print(f"Using {len(gpus)} GPU(s) for analysis: {gpus}")
+        else:
+            print("Warning: CUDA not available, falling back to CPU")
+            device = "cpu"
+
+    if not gpus:
+        gpus = ["cpu"]
 
     if skip_patterns is None:
         # Default patterns to skip (keep in bf16)
@@ -206,57 +326,60 @@ def analyze_model(model_path: str, skip_patterns: Optional[List[str]] = None) ->
     # Categories for reporting
     categories = defaultdict(list)
 
-    for shard_file in tqdm(safetensor_files, desc="Analyzing shards"):
-        if not os.path.exists(shard_file):
-            print(f"Warning: Shard file not found: {shard_file}")
-            continue
+    # Process shards in parallel across GPUs
+    num_workers = len(gpus)
 
-        with safe_open(shard_file, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                tensor = f.get_tensor(name)
+    if num_workers > 1:
+        print(f"Processing {len(safetensor_files)} shards in parallel across {num_workers} GPUs...")
 
-                # Only analyze weight tensors (not biases, which are small)
-                if tensor.numel() < 1000:  # Skip very small tensors
-                    continue
+        # Create work items: (shard_file, gpu_device)
+        work_items = [(shard_file, gpus[i % num_workers]) for i, shard_file in enumerate(safetensor_files)]
 
-                # Analyze tensor
-                stats = analyze_tensor(name, tensor)
-                analysis["summary"]["total_layers"] += 1
-                analysis["summary"]["total_size_mb"] += stats["size_mb"]
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_shard = {
+                executor.submit(analyze_shard, shard_file, skip_patterns, gpu): shard_file
+                for shard_file, gpu in work_items
+            }
 
-                # Check skip patterns
-                should_skip, skip_reason = should_skip_layer(name, skip_patterns)
+            # Collect results with progress bar
+            for future in tqdm(as_completed(future_to_shard), total=len(safetensor_files), desc="Analyzing shards"):
+                shard_file = future_to_shard[future]
+                try:
+                    result = future.result()
 
-                if should_skip:
-                    stats["quantizable"] = False
-                    stats["skip_reason"] = skip_reason
-                    stats["category"] = "skipped_pattern"
-                    analysis["summary"]["skipped_layers"] += 1
-                    analysis["summary"]["skipped_size_mb"] += stats["size_mb"]
-                    categories["skipped"].append(name)
-                elif stats["risk_score"] >= 50:
-                    stats["quantizable"] = False
-                    stats["category"] = "high_risk"
-                    analysis["summary"]["skipped_layers"] += 1
-                    analysis["summary"]["skipped_size_mb"] += stats["size_mb"]
-                    categories["high_risk"].append(name)
-                elif stats["risk_score"] >= 25:
-                    stats["category"] = "medium_risk"
-                    analysis["summary"]["quantizable_layers"] += 1
-                    analysis["summary"]["quantizable_size_mb"] += stats["size_mb"]
-                    categories["medium_risk"].append(name)
-                else:
-                    stats["category"] = "safe"
-                    analysis["summary"]["quantizable_layers"] += 1
-                    analysis["summary"]["quantizable_size_mb"] += stats["size_mb"]
-                    categories["safe"].append(name)
+                    # Merge results
+                    analysis["summary"]["total_layers"] += result["total_layers"]
+                    analysis["summary"]["quantizable_layers"] += result["quantizable_layers"]
+                    analysis["summary"]["skipped_layers"] += result["skipped_layers"]
+                    analysis["summary"]["total_size_mb"] += result["total_size_mb"]
+                    analysis["summary"]["quantizable_size_mb"] += result["quantizable_size_mb"]
+                    analysis["summary"]["skipped_size_mb"] += result["skipped_size_mb"]
 
-                analysis["layers"][name] = stats
+                    analysis["layers"].update(result["layers"])
 
-                # Free memory
-                del tensor
+                    for cat, names in result["categories"].items():
+                        categories[cat].extend(names)
 
-        gc.collect()
+                except Exception as e:
+                    print(f"Error processing {shard_file}: {e}")
+    else:
+        # Single GPU/CPU - process sequentially
+        for shard_file in tqdm(safetensor_files, desc="Analyzing shards"):
+            result = analyze_shard(shard_file, skip_patterns, gpus[0])
+
+            # Merge results
+            analysis["summary"]["total_layers"] += result["total_layers"]
+            analysis["summary"]["quantizable_layers"] += result["quantizable_layers"]
+            analysis["summary"]["skipped_layers"] += result["skipped_layers"]
+            analysis["summary"]["total_size_mb"] += result["total_size_mb"]
+            analysis["summary"]["quantizable_size_mb"] += result["quantizable_size_mb"]
+            analysis["summary"]["skipped_size_mb"] += result["skipped_size_mb"]
+
+            analysis["layers"].update(result["layers"])
+
+            for cat, names in result["categories"].items():
+                categories[cat].extend(names)
 
     # Calculate savings
     total_mb = analysis["summary"]["total_size_mb"]
@@ -358,6 +481,82 @@ def quantize_to_int8(tensor: torch.Tensor, device: str = "cpu") -> Tuple[torch.T
     return int8_tensor.cpu(), scale.cpu()
 
 
+def convert_shard(
+    shard_file: str,
+    output_shard: str,
+    analysis: Dict,
+    device: str
+) -> Dict:
+    """Convert a single shard file on a specific GPU."""
+    result = {
+        "weight_map": {},
+        "converted_count": 0,
+        "skipped_count": 0,
+        "original_size": 0,
+        "q8_size": 0,
+        "shard_name": os.path.basename(shard_file)
+    }
+
+    if not os.path.exists(shard_file):
+        return result
+
+    shard_name = result["shard_name"]
+    converted_tensors = {}
+    scales = {}
+
+    with safe_open(shard_file, framework="pt", device="cpu") as f:
+        for name in f.keys():
+            tensor = f.get_tensor(name)
+            original_size = tensor.numel() * tensor.element_size()
+            result["original_size"] += original_size
+
+            # Check if this layer should be quantized
+            layer_info = analysis["layers"].get(name, {})
+            should_quantize = (
+                layer_info.get("quantizable", False) and
+                layer_info.get("category") in ["safe", "medium_risk"] and
+                tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]
+            )
+
+            if should_quantize:
+                # Quantize to INT8 using GPU
+                int8_tensor, scale = quantize_to_int8(tensor, device=device)
+
+                converted_tensors[name] = int8_tensor
+                scales[f"{name}._scale"] = scale.view(1)
+
+                result["weight_map"][name] = shard_name
+                result["weight_map"][f"{name}._scale"] = shard_name
+
+                # INT8 = 1 byte per element + scale (4 bytes total)
+                q8_size = tensor.numel() * 1 + 4
+                result["q8_size"] += q8_size
+                result["converted_count"] += 1
+            else:
+                # Keep original precision (bf16 for vision layers)
+                if tensor.dtype == torch.float32:
+                    tensor = tensor.to(torch.bfloat16)
+                converted_tensors[name] = tensor
+                result["weight_map"][name] = shard_name
+                result["q8_size"] += tensor.numel() * tensor.element_size()
+                result["skipped_count"] += 1
+
+            del tensor
+
+    # Merge scales into tensors dict
+    converted_tensors.update(scales)
+
+    # Save shard
+    safetensors_save(converted_tensors, output_shard)
+
+    del converted_tensors
+    gc.collect()
+    if device != "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
+
+
 def convert_to_q8(
     model_path: str,
     output_path: str,
@@ -393,18 +592,23 @@ def convert_to_q8(
     print(f"\nConverting model to Q8 (INT8)...")
     print(f"Input: {model_path}")
     print(f"Output: {output_path}")
-    print(f"Device: {device}")
     print(f"Vision layers will be kept in bf16")
 
-    # Check CUDA availability
+    # Determine GPUs to use
+    gpus = []
     if device != "cpu":
         if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+            if device == "cuda" or device == "all":
+                gpus = get_available_gpus()
+            else:
+                gpus = [device]
+            print_gpu_info()
+            print(f"Using {len(gpus)} GPU(s) for conversion: {gpus}")
         else:
             print("Warning: CUDA not available, falling back to CPU")
-            device = "cpu"
+
+    if not gpus:
+        gpus = ["cpu"]
 
     # Copy config files
     for config_file in ["config.json", "tokenizer.json", "tokenizer_config.json",
@@ -425,78 +629,55 @@ def convert_to_q8(
     # Find safetensor files
     safetensor_files = find_safetensor_files(model_path)
 
-    # Process each shard
+    # Process shards
     weight_map = {}
     converted_count = 0
     skipped_count = 0
     total_original_size = 0
     total_q8_size = 0
 
-    for shard_idx, shard_file in enumerate(tqdm(safetensor_files, desc="Converting shards")):
-        if not os.path.exists(shard_file):
-            print(f"Warning: Shard file not found, skipping: {shard_file}")
-            continue
+    num_workers = len(gpus)
 
-        shard_name = os.path.basename(shard_file)
-        output_shard = os.path.join(output_path, shard_name)
+    if num_workers > 1:
+        print(f"Processing {len(safetensor_files)} shards in parallel across {num_workers} GPUs...")
 
-        converted_tensors = {}
-        scales = {}  # Store scales separately
+        # Create work items: (shard_file, output_shard, gpu)
+        work_items = []
+        for i, shard_file in enumerate(safetensor_files):
+            shard_name = os.path.basename(shard_file)
+            output_shard = os.path.join(output_path, shard_name)
+            gpu = gpus[i % num_workers]
+            work_items.append((shard_file, output_shard, gpu))
 
-        with safe_open(shard_file, framework="pt", device="cpu") as f:
-            for name in tqdm(f.keys(), desc=f"Processing {shard_name}", leave=False):
-                tensor = f.get_tensor(name)
-                original_size = tensor.numel() * tensor.element_size()
-                total_original_size += original_size
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_shard = {
+                executor.submit(convert_shard, shard_file, output_shard, analysis, gpu): shard_file
+                for shard_file, output_shard, gpu in work_items
+            }
 
-                # Check if this layer should be quantized
-                layer_info = analysis["layers"].get(name, {})
-                should_quantize = (
-                    layer_info.get("quantizable", False) and
-                    layer_info.get("category") in ["safe", "medium_risk"] and
-                    tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]
-                )
+            for future in tqdm(as_completed(future_to_shard), total=len(safetensor_files), desc="Converting shards"):
+                shard_file = future_to_shard[future]
+                try:
+                    result = future.result()
+                    weight_map.update(result["weight_map"])
+                    converted_count += result["converted_count"]
+                    skipped_count += result["skipped_count"]
+                    total_original_size += result["original_size"]
+                    total_q8_size += result["q8_size"]
+                except Exception as e:
+                    print(f"Error converting {shard_file}: {e}")
+    else:
+        # Single GPU/CPU - process sequentially
+        for shard_file in tqdm(safetensor_files, desc="Converting shards"):
+            shard_name = os.path.basename(shard_file)
+            output_shard = os.path.join(output_path, shard_name)
 
-                if should_quantize:
-                    # Quantize to INT8 using GPU if available
-                    int8_tensor, scale = quantize_to_int8(tensor, device=device)
-
-                    converted_tensors[name] = int8_tensor
-                    scales[f"{name}._scale"] = scale.view(1)
-
-                    weight_map[name] = shard_name
-                    weight_map[f"{name}._scale"] = shard_name
-
-                    # INT8 = 1 byte per element + scale (4 bytes total)
-                    q8_size = tensor.numel() * 1 + 4
-                    total_q8_size += q8_size
-                    converted_count += 1
-
-                    # Clear GPU cache periodically
-                    if device != "cpu" and converted_count % 50 == 0:
-                        torch.cuda.empty_cache()
-                else:
-                    # Keep original precision (bf16 for vision layers)
-                    # Ensure it's bf16 if it was bf16 originally
-                    if tensor.dtype == torch.float32:
-                        tensor = tensor.to(torch.bfloat16)
-                    converted_tensors[name] = tensor
-                    weight_map[name] = shard_name
-                    total_q8_size += tensor.numel() * tensor.element_size()
-                    skipped_count += 1
-
-                del tensor
-
-        # Merge scales into tensors dict
-        converted_tensors.update(scales)
-
-        # Save shard
-        safetensors_save(converted_tensors, output_shard)
-
-        del converted_tensors
-        gc.collect()
-        if device != "cpu" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            result = convert_shard(shard_file, output_shard, analysis, gpus[0])
+            weight_map.update(result["weight_map"])
+            converted_count += result["converted_count"]
+            skipped_count += result["skipped_count"]
+            total_original_size += result["original_size"]
+            total_q8_size += result["q8_size"]
 
     # Create index file
     index = {
@@ -743,7 +924,7 @@ def main():
         "--device", "-d",
         type=str,
         default="cuda",
-        help="Device for quantization computation (default: cuda). Use 'cpu' for CPU-only."
+        help="Device for computation. Options: 'cuda' or 'all' (use all GPUs in parallel), 'cuda:0' (specific GPU), 'cpu' (CPU-only)"
     )
 
     args = parser.parse_args()
@@ -753,7 +934,7 @@ def main():
         args.output = args.model.rstrip("/\\") + "-Q8"
 
     # Run analysis
-    analysis = analyze_model(args.model, args.skip_patterns)
+    analysis = analyze_model(args.model, args.skip_patterns, device=args.device)
     print_analysis_report(analysis)
 
     # Save analysis if requested

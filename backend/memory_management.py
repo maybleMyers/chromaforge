@@ -852,11 +852,15 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
         else:
             models_to_load.append(loaded_model)
 
+    # Build a list of ALL currently loaded models to preserve during memory operations
+    # This prevents unloading models that are still needed (e.g., VAE while loading UNet)
+    all_loaded_models = list(current_loaded_models)
+
     if len(models_to_load) == 0:
         devs = set(map(lambda a: a.device, models_already_loaded))
         for d in devs:
             if d != torch.device("cpu"):
-                free_memory(memory_to_free, d, models_already_loaded)
+                free_memory(memory_to_free, d, all_loaded_models)
 
         moving_time = time.perf_counter() - execution_start_time
         if moving_time > 0.1:
@@ -884,7 +888,7 @@ def load_models_gpu(models, memory_required=0, hard_memory_preservation=0):
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.3 + memory_to_free, device, models_already_loaded)
+            free_memory(total_memory_required[device] * 1.3 + memory_to_free, device, all_loaded_models)
 
     for idx, loaded_model in enumerate(models_to_load):
         model = loaded_model.model

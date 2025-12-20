@@ -15,6 +15,10 @@ class Chroma(ForgeDiffusionEngine):
         super().__init__(estimated_config, huggingface_components)
         self.is_inpaint = False
 
+        # Cache for prompt embeddings to avoid reloading text encoder for identical prompts
+        self._prompt_cache = {}
+        self._prompt_cache_max_size = 20  # Limit cache size to prevent memory bloat
+
         clip = CLIP(
             model_dict={
                 't5xxl': huggingface_components['text_encoder']
@@ -48,12 +52,47 @@ class Chroma(ForgeDiffusionEngine):
 
     def set_clip_skip(self, clip_skip):
         pass
-        
+
+    def clear_prompt_cache(self):
+        """Clear the prompt embedding cache."""
+        self._prompt_cache.clear()
+
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
+        # Create cache key from prompt list
+        cache_key = tuple(prompt)
+
+        # Check cache first
+        if cache_key in self._prompt_cache:
+            cached = self._prompt_cache[cache_key]
+            # Move to end (LRU behavior) and return clone on GPU
+            del self._prompt_cache[cache_key]
+            self._prompt_cache[cache_key] = cached
+            device = memory_management.text_encoder_device()
+            return {
+                'crossattn': cached['crossattn'].clone().to(device),
+                'attention_mask': cached['attention_mask'].clone().to(device)
+            }
+
+        # Cache miss - need to load text encoder and encode
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
         # Get embeddings with attention mask
         embeddings, attention_mask = self.text_processing_engine_t5(prompt, return_attention_mask=True)
+
+        # Cache the result (store on CPU to save GPU memory)
+        cached_embeddings = embeddings.cpu()
+        cached_mask = attention_mask.cpu()
+
+        # Evict oldest entry if cache is full
+        if len(self._prompt_cache) >= self._prompt_cache_max_size:
+            oldest_key = next(iter(self._prompt_cache))
+            del self._prompt_cache[oldest_key]
+
+        self._prompt_cache[cache_key] = {
+            'crossattn': cached_embeddings,
+            'attention_mask': cached_mask
+        }
+
         # Store attention mask in a dict along with embeddings
         # Use 'crossattn' key to match the conditioning system's expectations
         return {'crossattn': embeddings, 'attention_mask': attention_mask}

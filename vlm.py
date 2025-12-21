@@ -1764,7 +1764,7 @@ def batch_caption_handler(
 
             # Generate caption (generate() is a generator, consume it to get the final result)
             caption = ""
-            for display_text, raw_text, stats in vlm_manager.generate(
+            for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
                 messages=messages,
                 max_new_tokens=max_tokens,
                 temperature=temperature,

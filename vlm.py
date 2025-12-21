@@ -1775,8 +1775,10 @@ def batch_caption_handler(
             # Save caption to .txt file
             base_name = os.path.splitext(filename)[0]
             txt_path = os.path.join(folder_path, f"{base_name}.txt")
+            print(f"[batch_caption] Saving to: {txt_path}")
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(caption)
+            print(f"[batch_caption] Saved successfully, caption length: {len(caption)}")
 
             results.append(f"[OK] {filename} -> {base_name}.txt")
 

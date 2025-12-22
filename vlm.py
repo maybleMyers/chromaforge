@@ -1808,21 +1808,29 @@ def batch_caption_handler(
             ):
                 caption = display_text
 
-            # Save caption to .txt file
-            base_name = os.path.splitext(filename)[0]
-            txt_path = os.path.join(folder_path, f"{base_name}.txt")
-            print(f"[batch_caption] Saving to: {txt_path}")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(caption)
-            print(f"[batch_caption] Saved successfully, caption length: {len(caption)}")
+            # Check if caption is an error message (don't save errors as captions)
+            if caption.startswith("Error"):
+                print(f"[batch_caption] Generation failed for {filename}: {caption}")
+                results.append(f"[ERROR] {filename}: {caption[:100]}")
+            else:
+                # Save caption to .txt file
+                base_name = os.path.splitext(filename)[0]
+                txt_path = os.path.join(folder_path, f"{base_name}.txt")
+                print(f"[batch_caption] Saving to: {txt_path}")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(caption)
+                print(f"[batch_caption] Saved successfully, caption length: {len(caption)}")
+                results.append(f"[OK] {filename} -> {base_name}.txt")
 
-            results.append(f"[OK] {filename} -> {base_name}.txt")
+            # Brief delay between files to allow server memory cleanup (helps with vision encoder fragmentation)
+            if media_type == 'video' and i < total - 1:
+                time.sleep(1)
 
         except Exception as e:
             results.append(f"[ERROR] {filename}: {str(e)}")
 
     progress(1.0, desc="Complete!")
-    return f"Processed {total} images:\n\n" + "\n".join(results)
+    return f"Processed {total} files:\n\n" + "\n".join(results)
 
 
 def create_ui():

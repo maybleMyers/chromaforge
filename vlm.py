@@ -91,7 +91,7 @@ def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:{mime_type};base64,{b64_data}"
 
 
-def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448)) -> List[Image.Image]:
+def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448), every_other_frame: bool = False) -> List[Image.Image]:
     """
     Extract frames from a video file for VLM processing.
 
@@ -99,6 +99,7 @@ def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tupl
         video_path: Path to the video file
         max_frames: Maximum number of frames to extract
         target_size: Target size for frames (width, height)
+        every_other_frame: If True, only use every other frame from the video (useful for long videos)
 
     Returns:
         List of PIL Images
@@ -114,11 +115,23 @@ def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tupl
         if total_frames <= 0:
             return frames
 
-        # Calculate frame indices to extract (evenly spaced)
-        if total_frames <= max_frames:
-            frame_indices = list(range(total_frames))
+        # If every_other_frame is enabled, we effectively halve the available frames
+        if every_other_frame:
+            # Only consider even-indexed frames (0, 2, 4, 6, ...)
+            available_frames = (total_frames + 1) // 2
+            print(f"[extract_video_frames] Every other frame enabled: {total_frames} total -> {available_frames} available")
         else:
-            frame_indices = [int(i * (total_frames - 1) / (max_frames - 1)) for i in range(max_frames)]
+            available_frames = total_frames
+
+        # Calculate frame indices to extract (evenly spaced from available frames)
+        if available_frames <= max_frames:
+            frame_indices = list(range(available_frames))
+        else:
+            frame_indices = [int(i * (available_frames - 1) / (max_frames - 1)) for i in range(max_frames)]
+
+        # If every_other_frame is enabled, convert indices back to actual frame numbers
+        if every_other_frame:
+            frame_indices = [idx * 2 for idx in frame_indices]
 
         for idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -764,6 +777,7 @@ class LlamaCppVLM:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         video_max_frames: int = 81,
+        every_other_frame: bool = False,
         stream: bool = False,
     ):
         """Generate response via llama-server OpenAI-compatible API using requests only.
@@ -816,7 +830,7 @@ class LlamaCppVLM:
                             video_path = item["video"]
                             if isinstance(video_path, str) and os.path.exists(video_path):
                                 try:
-                                    frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                    frames = extract_video_frames(video_path, max_frames=video_max_frames, every_other_frame=every_other_frame)
                                     print(f"[llama-server] Extracted {len(frames)} frames from video: {video_path}")
                                     for frame in frames:
                                         b64_url = image_to_base64(frame)
@@ -1024,6 +1038,7 @@ class LlamaCppVLM:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         video_max_frames: int = 8,
+        every_other_frame: bool = False,
         stream: bool = False,
     ):
         """
@@ -1035,6 +1050,7 @@ class LlamaCppVLM:
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             video_max_frames: Max frames for video processing
+            every_other_frame: If True, use every other frame from videos
             stream: If True, yields partial responses as a generator
 
         Returns:
@@ -1053,6 +1069,7 @@ class LlamaCppVLM:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 video_max_frames=video_max_frames,
+                every_other_frame=every_other_frame,
                 stream=stream,
             )
             return
@@ -1143,7 +1160,7 @@ class LlamaCppVLM:
                                         video_path = item["video"]
                                         if isinstance(video_path, str) and os.path.exists(video_path):
                                             try:
-                                                frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                                                frames = extract_video_frames(video_path, max_frames=video_max_frames, every_other_frame=every_other_frame)
                                                 for frame in frames:
                                                     b64_url = image_to_base64(frame)
                                                     parts.append({
@@ -1363,6 +1380,7 @@ DEFAULT_SETTINGS = {
     "max_tokens": 8096,
     "temperature": 0.7,
     "video_max_frames": 8,
+    "every_other_frame": False,
     "show_thinking": True,
     # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
@@ -1391,6 +1409,7 @@ def save_settings(
     max_tokens: int,
     temperature: float,
     video_max_frames: int,
+    every_other_frame: bool,
     show_thinking: bool,
     # Batch Caption Settings
     batch_system_prompt: str,
@@ -1418,6 +1437,7 @@ def save_settings(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "video_max_frames": video_max_frames,
+        "every_other_frame": every_other_frame,
         "show_thinking": show_thinking,
         # Batch Caption Settings
         "batch_system_prompt": batch_system_prompt,
@@ -1573,6 +1593,7 @@ def chat_handler(
     max_tokens: int,
     temperature: float,
     video_max_frames: int = 8,
+    every_other_frame: bool = False,
     show_thinking: bool = False,
 ):
     """Handle chat messages from UI with streaming support."""
@@ -1679,6 +1700,7 @@ def chat_handler(
         max_new_tokens=max_tokens,
         temperature=temperature,
         video_max_frames=video_max_frames,
+        every_other_frame=every_other_frame,
         stream=True,
     ):
         # Check stop flag
@@ -1714,9 +1736,11 @@ def batch_caption_handler(
     system_prompt: str,
     max_tokens: int,
     temperature: float,
+    video_max_frames: int = 8,
+    every_other_frame: bool = False,
     progress=gr.Progress(),
 ):
-    """Process a folder of images and generate captions."""
+    """Process a folder of images and videos and generate captions."""
     model_ready = (
         vlm_manager is not None and
         (vlm_manager.model is not None or vlm_manager.use_server_backend)
@@ -1727,39 +1751,49 @@ def batch_caption_handler(
     if not folder_path or not os.path.isdir(folder_path):
         return f"Error: Invalid folder path: {folder_path}"
 
-    # Supported image extensions
+    # Supported extensions
     image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv'}
 
-    # Find all images in folder
-    image_files = []
+    # Find all media files in folder
+    media_files = []
     for f in os.listdir(folder_path):
         ext = os.path.splitext(f)[1].lower()
         if ext in image_extensions:
-            image_files.append(f)
+            media_files.append((f, 'image'))
+        elif ext in video_extensions:
+            media_files.append((f, 'video'))
 
-    if not image_files:
-        return f"No images found in {folder_path}"
+    if not media_files:
+        return f"No images or videos found in {folder_path}"
 
     results = []
-    total = len(image_files)
+    total = len(media_files)
 
-    for i, filename in enumerate(image_files):
+    for i, (filename, media_type) in enumerate(media_files):
         progress((i / total), desc=f"Processing {filename}...")
 
-        image_path = os.path.join(folder_path, filename)
+        file_path = os.path.join(folder_path, filename)
         try:
-            # Load image
-            img = Image.open(image_path).convert("RGB")
-
             # Build messages
             messages = []
             if system_prompt.strip():
                 messages.append({"role": "system", "content": system_prompt})
 
-            content = [
-                {"type": "image", "image": img},
-                {"type": "text", "text": prompt},
-            ]
+            if media_type == 'image':
+                # Load image
+                img = Image.open(file_path).convert("RGB")
+                content = [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": prompt},
+                ]
+            else:
+                # Video - use video type which will be processed by generate()
+                content = [
+                    {"type": "video", "video": file_path},
+                    {"type": "text", "text": prompt},
+                ]
+
             messages.append({"role": "user", "content": content})
 
             # Generate caption (generate() is a generator, consume it to get the final result)
@@ -1768,6 +1802,8 @@ def batch_caption_handler(
                 messages=messages,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
+                video_max_frames=video_max_frames,
+                every_other_frame=every_other_frame,
                 stream=False,
             ):
                 caption = display_text
@@ -1908,11 +1944,11 @@ def create_ui():
 
             # Batch Caption Tab
             with gr.TabItem("Batch Caption"):
-                gr.Markdown("Generate captions for all images in a folder. Outputs .txt files with matching names.")
+                gr.Markdown("Generate captions for all images and videos in a folder. Outputs .txt files with matching names.")
 
                 batch_folder = gr.Textbox(
                     label="Folder Path",
-                    placeholder="Enter the full path to folder containing images...",
+                    placeholder="Enter the full path to folder containing images/videos...",
                     lines=1,
                 )
 
@@ -2116,6 +2152,11 @@ def create_ui():
                     label="Max Video Frames",
                     info="Frames to extract from videos",
                 )
+                every_other_frame = gr.Checkbox(
+                    label="Every Other Frame",
+                    value=saved_settings.get("every_other_frame", DEFAULT_SETTINGS["every_other_frame"]),
+                    info="Use every other frame (for long videos)",
+                )
 
             with gr.Row():
                 show_thinking = gr.Checkbox(
@@ -2170,7 +2211,7 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, thinking):
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, every_other, thinking):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
                 yield history, "", None, None, None, None, None, "", ""
                 return
@@ -2178,7 +2219,7 @@ def create_ui():
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid,
-                max_tok, temp, vid_frames, thinking
+                max_tok, temp, vid_frames, every_other, thinking
             ):
                 yield new_history, "", None, None, None, None, None, stats, ctx_info
 
@@ -2187,7 +2228,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, show_thinking
+                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
@@ -2197,7 +2238,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, show_thinking
+                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
@@ -2215,7 +2256,7 @@ def create_ui():
             fn=batch_caption_handler,
             inputs=[
                 batch_folder, batch_prompt, batch_system_prompt,
-                max_tokens, temperature
+                max_tokens, temperature, video_max_frames, every_other_frame
             ],
             outputs=[batch_output],
         )
@@ -2231,7 +2272,7 @@ def create_ui():
                 server_port, llama_server_path,
                 # Generation Settings
                 system_prompt, max_tokens, temperature, video_max_frames,
-                show_thinking,
+                every_other_frame, show_thinking,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt
             ],

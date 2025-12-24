@@ -18,6 +18,7 @@ samplers_k_diffusion = [
     ('DPM++ 2M SDE Heun', 'sample_dpmpp_2m_sde', ['k_dpmpp_2m_sde_heun'], {'scheduler': 'exponential', "brownian_noise": True, "solver_type": "heun"}),
     ('DPM++ 2S a', 'sample_dpmpp_2s_ancestral', ['k_dpmpp_2s_a'], {'scheduler': 'karras', "uses_ensd": True, "second_order": True}),
     ('DPM++ 3M SDE', 'sample_dpmpp_3m_sde', ['k_dpmpp_3m_sde'], {'scheduler': 'exponential', 'discard_next_to_last_sigma': True, "brownian_noise": True}),
+    ('DPM++ 3M SDE RF', 'sample_dpmpp_3m_sde_RF', ['k_dpmpp_3m_sde_rf'], {'scheduler': 'simple', 'discard_next_to_last_sigma': True, "brownian_noise": True}),
     ('Euler a', 'sample_euler_ancestral', ['k_euler_a', 'k_euler_ancestral'], {"uses_ensd": True}),
     ('Euler', 'sample_euler', ['k_euler'], {}),
     ('LMS', 'sample_lms', ['k_lms'], {}),
@@ -50,6 +51,7 @@ sampler_extra_params = {
     'sample_dpmpp_sde': ['s_noise'],
     'sample_dpmpp_2m_sde': ['s_noise'],
     'sample_dpmpp_3m_sde': ['s_noise'],
+    'sample_dpmpp_3m_sde_RF': ['s_noise'],
 }
 
 k_diffusion_samplers_map = {x.name: x for x in samplers_data_k_diffusion}

@@ -722,7 +722,6 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
 @torch.no_grad()
 def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
     """DPM-Solver++(3M) SDE."""
-
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
@@ -763,6 +762,88 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
 
             if eta:
                 x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * sigmas[i + 1] * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+
+            h_1, h_2 = h, h_1
+
+        denoised_1, denoised_2 = denoised, denoised_1
+    return x
+
+
+@torch.no_grad()
+def sample_dpmpp_3m_sde_RF(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
+    """DPM-Solver++(3M) SDE for Rectified Flow models (Flux, Chroma, Z-Image).
+
+    Uses linear sigma space instead of log-space, with proper RF stepping formula:
+    x_next = (sigma_next/sigma) * x + (1 - sigma_next/sigma) * denoised
+
+    Third-order multi-step corrections improve accuracy over many steps.
+    SDE noise injection helps with fine details and reduces artifacts.
+    """
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+
+    denoised_1, denoised_2 = None, None
+    h_1, h_2 = None, None
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
+        if sigmas[i + 1] == 0:
+            # Final step - return denoised directly
+            x = denoised
+        else:
+            # Step size in linear sigma space (not log space)
+            h = sigmas[i] - sigmas[i + 1]
+
+            # For RF: alpha = 1 - sigma represents the "clean" component
+            # Basic RF step: x_next = (sigma_next/sigma_i) * x + (1 - sigma_next/sigma_i) * denoised
+            # With eta > 0, we denoise more aggressively then add noise back
+            # Matching the formula from other RF samplers for consistency
+            downstep_ratio = 1 + (sigmas[i + 1] / sigmas[i] - 1) * eta
+            sigma_down = sigmas[i + 1] * downstep_ratio
+            sigma_down_i_ratio = sigma_down / sigmas[i]
+
+            # RF step: interpolate between current x and denoised based on sigma ratio
+            x = sigma_down_i_ratio * x + (1 - sigma_down_i_ratio) * denoised
+
+            # Third-order multi-step corrections using polynomial extrapolation
+            # This improves accuracy significantly when using many steps
+            if h_2 is not None:
+                # We have 3 denoised estimates - use 3rd order correction
+                r0 = h_1 / h
+                r1 = h_2 / h
+                # First derivative estimates
+                d1_0 = (denoised - denoised_1) / r0
+                d1_1 = (denoised_1 - denoised_2) / r1
+                # Extrapolated first derivative
+                d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+                # Second derivative estimate
+                d2 = (d1_0 - d1_1) / (r0 + r1)
+                # Correction weights for linear sigma space
+                step_factor = 1 - sigma_down_i_ratio
+                phi_2 = step_factor * 0.5
+                phi_3 = step_factor * step_factor / 6
+                x = x + phi_2 * d1 - phi_3 * d2
+            elif h_1 is not None:
+                # We have 2 denoised estimates - use 2nd order correction
+                r = h_1 / h
+                d = (denoised - denoised_1) / r
+                step_factor = 1 - sigma_down_i_ratio
+                phi_2 = step_factor * 0.5
+                x = x + phi_2 * d
+
+            # SDE noise injection for RF (matching other RF samplers)
+            if eta > 0:
+                # alpha = 1 - sigma in RF formulation
+                alpha_next = 1 - sigmas[i + 1]
+                alpha_down = 1 - sigma_down
+
+                # Noise coefficient for variance preservation in RF
+                renoise_coeff = (sigmas[i + 1] ** 2 - sigma_down ** 2 * alpha_next ** 2 / alpha_down ** 2).sqrt()
+                x = (alpha_next / alpha_down) * x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * renoise_coeff
 
             h_1, h_2 = h, h_1
 

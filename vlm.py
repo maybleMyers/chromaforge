@@ -955,9 +955,31 @@ class LlamaCppVLM:
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     content = delta.get("content", "")
+                                    # GLM-4.7 sends thinking in reasoning_content field
+                                    reasoning_content = delta.get("reasoning_content", "")
+
+                                    # Handle reasoning_content (GLM-4.7 thinking mode)
+                                    if reasoning_content:
+                                        # Wrap in <think> tags for compatibility with existing display logic
+                                        if not accumulated or not accumulated.rstrip().endswith(">"):
+                                            # First reasoning token - open the think tag
+                                            if not accumulated:
+                                                accumulated = "<think>"
+                                            elif "</think>" not in accumulated:
+                                                accumulated += "<think>"
+                                        accumulated += reasoning_content
+                                        token_count += 1
+
+                                    # Handle regular content
                                     if content:
+                                        # Close think tag if we were in reasoning mode
+                                        if accumulated and "<think>" in accumulated and "</think>" not in accumulated:
+                                            accumulated += "</think>"
                                         accumulated += content
                                         token_count += 1
+
+                                    # Yield if we got any content (regular or reasoning)
+                                    if content or reasoning_content:
                                         elapsed = time.perf_counter() - start_time
                                         tps = token_count / elapsed if elapsed > 0 else 0
                                         # Update context info periodically (every 100 tokens)
@@ -967,7 +989,11 @@ class LlamaCppVLM:
                                             ctx_total_display = self.n_ctx if self.n_ctx > 0 else 32768
                                             ctx_pct = (current_ctx / ctx_total_display * 100) if ctx_total_display > 0 else 0
                                             ctx_info = f"{current_ctx:,} / {ctx_total_display:,} ({ctx_pct:.0f}%)"
-                                        yield accumulated, accumulated, f"{tps:.1f} tok/s", ctx_info
+                                        # Create display_text with thinking stripped (for show_thinking=False)
+                                        display_text = accumulated
+                                        if "</think>" in display_text:
+                                            display_text = display_text.split("</think>")[-1].strip()
+                                        yield display_text, accumulated, f"{tps:.1f} tok/s", ctx_info
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
 
@@ -984,8 +1010,16 @@ class LlamaCppVLM:
 
                 print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s) | ctx: {total_ctx_used}/{ctx_total}")
 
+                # Ensure think tag is closed if model only produced reasoning content
+                if accumulated and "<think>" in accumulated and "</think>" not in accumulated:
+                    accumulated += "</think>"
+
                 if accumulated:
-                    yield accumulated, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
+                    # Create final display_text with thinking stripped
+                    final_display = accumulated
+                    if "</think>" in final_display:
+                        final_display = final_display.split("</think>")[-1].strip()
+                    yield final_display, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
                     yield "No response generated", "No response generated", f"0 tok/s | {generation_time:.1f}s", final_ctx_info

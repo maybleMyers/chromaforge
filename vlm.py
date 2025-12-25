@@ -685,7 +685,7 @@ class LlamaCppVLM:
 
             progress(0.3, desc="Waiting for server to load model...")
 
-            max_wait = 300  # 5 minutes max wait
+            max_wait = 1200  # 20 minutes max wait (large models on CPU need more time)
             start_time = time.time()
             server_ready = False
             last_status = None

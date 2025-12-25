@@ -24,9 +24,7 @@ set the CFG scale to something like 3.5-7
 forge doesn't seem to work with all quantized model, Q4_K_S fail, but Q4_1 work  
 refer to screenshot for working settings.  
 
-there's a bunch of extra samplers/schedulers at these places:  
-https://github.com/DenOfEquity/webUI_ExtraSchedulers  
-https://github.com/MisterChief95/sd-forge-extra-samplers
+Please see levzzz chroma guide for more information about chroma: https://github.com/maybleMyers/chromaforge/blob/main/levzzz_chroma_guide.md  
 
 ## To use the Z-Image model
 

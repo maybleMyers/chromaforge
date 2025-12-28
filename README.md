@@ -1,5 +1,8 @@
 # P7 Branch
 
+To switch branches, after you git clone and cd into the chromaforge folder,  
+git switch p7  
+
 To get this to work, download https://huggingface.co/purplesmartai/pony-v7-base/blob/main/safetensor/pony-v7-base.safetensors and put it in the stable diffusion folder.  
 Download the text encoder from https://huggingface.co/purplesmartai/pony-v7-base/blob/main/text_encoder/model.fp16.safetensors  
 and put it in the text encoder subfolder.  

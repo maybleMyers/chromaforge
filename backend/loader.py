@@ -26,27 +26,79 @@ def patch_zimage_for_fp16(model):
 
     original_block_forward = ZImageTransformerBlock.forward
 
-    def patched_block_forward(self, x, attn_mask, freqs_cis, adaln_input=None):
+    def patched_block_forward(self, x, attn_mask, freqs_cis, adaln_input=None, *args, **kwargs):
+        # Extract additional arguments that might be passed
+        noise_mask = kwargs.get('noise_mask')
+        adaln_noisy = kwargs.get('adaln_noisy')
+        adaln_clean = kwargs.get('adaln_clean')
+
+        # Handle positional args if they're passed as such
+        if len(args) >= 3:
+            noise_mask = args[0]
+            adaln_noisy = args[1]
+            adaln_clean = args[2]
+
         if self.modulation:
-            assert adaln_input is not None
-            scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            if noise_mask is not None and adaln_noisy is not None and adaln_clean is not None:
+                # Per-token modulation based on noise_mask
+                # noise_mask: (batch, seq_len), 1 for noisy, 0 for clean
+                # adaln_noisy: (batch, embed_dim) for noisy tokens
+                # adaln_clean: (batch, embed_dim) for clean tokens
+                batch_size, seq_len = x.shape[0], x.shape[1]
+
+                # Generate modulation for noisy and clean tokens separately
+                mod_noisy = self.adaLN_modulation(adaln_noisy)  # (batch, 4*dim)
+                mod_clean = self.adaLN_modulation(adaln_clean)  # (batch, 4*dim)
+
+                # Split into scale and gate
+                scale_msa_noisy, gate_msa_noisy, scale_mlp_noisy, gate_mlp_noisy = mod_noisy.chunk(4, dim=1)
+                scale_msa_clean, gate_msa_clean, scale_mlp_clean, gate_mlp_clean = mod_clean.chunk(4, dim=1)
+
+                # Apply tanh to gates
+                gate_msa_noisy, gate_mlp_noisy = gate_msa_noisy.tanh(), gate_mlp_noisy.tanh()
+                gate_msa_clean, gate_mlp_clean = gate_msa_clean.tanh(), gate_mlp_clean.tanh()
+
+                # Add 1 to scales
+                scale_msa_noisy, scale_mlp_noisy = 1.0 + scale_msa_noisy, 1.0 + scale_mlp_noisy
+                scale_msa_clean, scale_mlp_clean = 1.0 + scale_msa_clean, 1.0 + scale_mlp_clean
+
+                # Expand to (batch, seq_len, dim) and select based on noise_mask
+                noise_mask_expanded = noise_mask.unsqueeze(-1)  # (batch, seq_len, 1)
+                scale_msa = torch.where(noise_mask_expanded == 1,
+                                       scale_msa_noisy.unsqueeze(1).expand(-1, seq_len, -1),
+                                       scale_msa_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                scale_mlp = torch.where(noise_mask_expanded == 1,
+                                       scale_mlp_noisy.unsqueeze(1).expand(-1, seq_len, -1),
+                                       scale_mlp_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                gate_msa = torch.where(noise_mask_expanded == 1,
+                                      gate_msa_noisy.unsqueeze(1).expand(-1, seq_len, -1),
+                                      gate_msa_clean.unsqueeze(1).expand(-1, seq_len, -1))
+                gate_mlp = torch.where(noise_mask_expanded == 1,
+                                      gate_mlp_noisy.unsqueeze(1).expand(-1, seq_len, -1),
+                                      gate_mlp_clean.unsqueeze(1).expand(-1, seq_len, -1))
+            else:
+                # Original global modulation
+                assert adaln_input is not None
+                scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
+                gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
+                scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+
+            # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
-                attention_mask=attn_mask,
-                freqs_cis=freqs_cis,
+                self.attention_norm1(x) * scale_msa, attention_mask=attn_mask, freqs_cis=freqs_cis
             )
             x = x + gate_msa * self.attention_norm2(clamp_fp16(attn_out))
+
+            # FFN block
             x = x + gate_mlp * self.ffn_norm2(clamp_fp16(self.feed_forward(self.ffn_norm1(x) * scale_mlp)))
         else:
-            attn_out = self.attention(
-                self.attention_norm1(x),
-                attention_mask=attn_mask,
-                freqs_cis=freqs_cis,
-            )
+            # No modulation
+            attn_out = self.attention(self.attention_norm1(x), attention_mask=attn_mask, freqs_cis=freqs_cis)
             x = x + self.attention_norm2(clamp_fp16(attn_out))
+
+            # FFN block
             x = x + self.ffn_norm2(clamp_fp16(self.feed_forward(self.ffn_norm1(x))))
+
         return x
 
     for module in model.modules():

@@ -51,6 +51,7 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+12/29/2025  Add DPM++ 3M SDE RF sampler for chroma. Works best with simple and high steps, like 67+.  
 12/8/2025 support x0 radiance model.  
 12/5/2025  
     Better prompt expansion support, supports expanding negative as well.  

@@ -127,6 +127,21 @@ def beta_scheduler(n, sigma_min, sigma_max, inner_model, device):
     return torch.FloatTensor(sigmas).to(device)
 
 
+def beta57_scheduler(n, sigma_min, sigma_max, inner_model, device):
+    """Beta57 preset scheduler with fixed alpha=0.5, beta=0.7.
+
+    A commonly used preset from RES4LYF that provides good results
+    for flow-matching models like Z-Image DCT.
+    """
+    alpha = 0.5
+    beta = 0.7
+    timesteps = 1 - np.linspace(0, 1, n)
+    timesteps = [stats.beta.ppf(x, alpha, beta) for x in timesteps]
+    sigmas = [sigma_min + (x * (sigma_max - sigma_min)) for x in timesteps]
+    sigmas += [0.0]
+    return torch.FloatTensor(sigmas).to(device)
+
+
 def turbo_scheduler(n, sigma_min, sigma_max, inner_model, device):
     unet = inner_model.inner_model.forge_objects.unet
     timesteps = torch.flip(torch.arange(1, n + 1) * float(1000.0 / n) - 1, (0,)).round().long().clip(0, 999)
@@ -280,6 +295,7 @@ schedulers = [
     Scheduler('normal', 'Normal', normal_scheduler, need_inner_model=True),
     Scheduler('ddim', 'DDIM', ddim_scheduler, need_inner_model=True),
     Scheduler('beta', 'Beta', beta_scheduler, need_inner_model=True),
+    Scheduler('beta57', 'Beta 5-7', beta57_scheduler, need_inner_model=True),
     Scheduler('turbo', 'Turbo', turbo_scheduler, need_inner_model=True),
     Scheduler('align_your_steps_GITS', 'Align Your Steps GITS', get_align_your_steps_sigmas_GITS),
     Scheduler('align_your_steps_11', 'Align Your Steps 11', ays_11_sigmas),

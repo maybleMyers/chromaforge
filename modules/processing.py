@@ -142,6 +142,12 @@ class StableDiffusionProcessing:
     cfg_scale: float = 7.0
     distilled_cfg_scale: float = 3.5
     zimage_shift: float = 0.0
+    sigma_rescale_start: float = 1.0
+    sigma_rescale_end: float = 0.0
+    apg_enabled: bool = False
+    apg_eta: float = 1.0
+    apg_momentum: float = -0.5
+    apg_threshold: float = 0.0
     width: int = 512
     height: int = 512
     restore_faces: bool = None

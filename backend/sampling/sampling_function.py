@@ -308,6 +308,18 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
         args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep,
                 "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
+    elif model_options.get('apg_enabled', False):
+        # Apply Adaptive Projected Guidance
+        from backend.sampling.apg import apg_guidance, get_apg_context
+        apg_ctx = get_apg_context()
+        if apg_ctx is not None and apg_ctx.enabled:
+            cfg_result = apg_ctx.apply(cond_pred, uncond_pred, cond_scale)
+        else:
+            # Use direct APG function with model options
+            eta = model_options.get('apg_eta', 1.0)
+            threshold = model_options.get('apg_threshold', 0.0)
+            momentum_buffer = model_options.get('apg_momentum_buffer', None)
+            cfg_result = apg_guidance(cond_pred, uncond_pred, cond_scale, eta=eta, momentum_buffer=momentum_buffer, threshold=threshold)
     elif not math.isclose(edit_strength, 1.0):
         cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
     else:
@@ -432,23 +444,31 @@ def _zimage_cfg_normalization_post(args):
 def sampling_prepare(unet, x, p=None):
     B, C, H, W = x.shape
 
-    # Update dynamic shift (mu) for Z-Image models based on latent resolution
-    # Z-Image uses Flux-style resolution-dependent time shifting
+    from modules.shared import opts
+
+    noise_type = getattr(opts, 'noise_type', 'gaussian')
+    if noise_type != 'gaussian':
+        try:
+            from backend.sampling.advanced_noise import NOISE_PRESETS
+            if noise_type in NOISE_PRESETS:
+                seed = p.seed if p is not None and hasattr(p, 'seed') else 0
+                generator = NOISE_PRESETS[noise_type](x=x, seed=seed)
+                unet.model_options['custom_noise_generator'] = generator
+        except ImportError:
+            pass
+
     real_model = unet.model
     is_zimage = getattr(getattr(real_model, 'config', None), 'is_zimage', False)
 
     if is_zimage and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
-        # Check if user specified a manual shift value (from UI slider via p, or settings fallback)
         manual_shift = 0.0
         if p is not None and hasattr(p, 'zimage_shift'):
             manual_shift = p.zimage_shift
         else:
-            from modules.shared import opts
-            manual_shift = getattr(opts, 'zimage_shift', 0.0)
+            manual_shift = getattr(opts, 'zimage_shift_override', 0.0)
 
         if manual_shift > 0:
-            # Use manual shift value directly
-            real_model.predictor.apply_mu_transform(mu=manual_shift)
+            real_model.predictor.apply_mu_transform(shift_override=manual_shift)
             print(f"Z-Image: Using manual mu={manual_shift:.4f} for {H}x{W} latents")
         else:
             # Calculate dynamic shift based on resolution
@@ -462,6 +482,37 @@ def sampling_prepare(unet, x, p=None):
                 max_shift=1.15,
             )
             print(f"Z-Image: Auto mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+
+    # Set up APG (Adaptive Projected Guidance) if enabled
+    # Read from p first, fall back to opts
+    apg_enabled = getattr(p, 'apg_enabled', None) if p else None
+    if apg_enabled is None:
+        apg_enabled = getattr(opts, 'apg_enabled', False)
+    if apg_enabled:
+        apg_eta = getattr(p, 'apg_eta', None) if p else None
+        apg_momentum = getattr(p, 'apg_momentum', None) if p else None
+        apg_threshold = getattr(p, 'apg_threshold', None) if p else None
+        if apg_eta is None:
+            apg_eta = getattr(opts, 'apg_eta', 1.0)
+        if apg_momentum is None:
+            apg_momentum = getattr(opts, 'apg_momentum', -0.5)
+        if apg_threshold is None:
+            apg_threshold = getattr(opts, 'apg_threshold', 0.0)
+
+        # Only enable APG if eta < 1.0 (otherwise it's just standard CFG)
+        if apg_eta < 1.0:
+            from backend.sampling.apg import MomentumBuffer, create_apg_context
+            unet.model_options['apg_enabled'] = True
+            unet.model_options['apg_eta'] = apg_eta
+            unet.model_options['apg_threshold'] = apg_threshold
+            # Create momentum buffer for this sampling run
+            if apg_momentum != 0:
+                unet.model_options['apg_momentum_buffer'] = MomentumBuffer(apg_momentum)
+            else:
+                unet.model_options['apg_momentum_buffer'] = None
+            # Also set up global context for compatibility
+            create_apg_context(enabled=True, eta=apg_eta, momentum=apg_momentum, threshold=apg_threshold)
+            print(f"APG: enabled (eta={apg_eta}, momentum={apg_momentum}, threshold={apg_threshold})")
 
     # Set up Z-Image CFG handlers
     if is_zimage:
@@ -530,4 +581,22 @@ def sampling_cleanup(unet):
     for cnet in unet.list_controlnets():
         cnet.cleanup()
     cleanup_cache()
+
+    # Clean up APG context
+    try:
+        from backend.sampling.apg import set_apg_context
+        set_apg_context(None)
+    except ImportError:
+        pass
+
+    # Clean up APG from model_options
+    if 'apg_enabled' in unet.model_options:
+        del unet.model_options['apg_enabled']
+    if 'apg_eta' in unet.model_options:
+        del unet.model_options['apg_eta']
+    if 'apg_threshold' in unet.model_options:
+        del unet.model_options['apg_threshold']
+    if 'apg_momentum_buffer' in unet.model_options:
+        del unet.model_options['apg_momentum_buffer']
+
     return

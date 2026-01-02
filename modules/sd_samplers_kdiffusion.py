@@ -5,6 +5,7 @@ import k_diffusion.external
 from modules import sd_samplers_common, sd_samplers_extra, sd_samplers_cfg_denoiser, sd_schedulers, devices
 from modules.sd_samplers_cfg_denoiser import CFGDenoiser  # noqa: F401
 from modules.script_callbacks import ExtraNoiseParams, extra_noise_callback
+from backend.sampling import advanced_samplers
 
 from modules.shared import opts
 import modules.shared as shared
@@ -32,6 +33,11 @@ samplers_k_diffusion = [
     ('IPNDM', 'sample_ipndm', ['ipndm'], {}),
     ('IPNDM_V', 'sample_ipndm_v', ['ipndm_v'], {}),
     ('DEIS', 'sample_deis', ['deis'], {}),
+    ('RES 2M', advanced_samplers.sample_res_2m, ['res_2m'], {'scheduler': 'beta57'}),
+    ('RES 2S', advanced_samplers.sample_res_2s, ['res_2s'], {'scheduler': 'beta57', 'second_order': True}),
+    ('RES 2M SDE', advanced_samplers.sample_res_2m_sde, ['res_2m_sde'], {'scheduler': 'beta57', 'brownian_noise': True}),
+    ('RES 2S SDE', advanced_samplers.sample_res_2s_sde, ['res_2s_sde'], {'scheduler': 'beta57', 'second_order': True, 'brownian_noise': True}),
+    ('ER SDE', advanced_samplers.sample_er_sde, ['er_sde'], {'scheduler': 'beta57', 'brownian_noise': True}),
 ]
 
 
@@ -52,6 +58,11 @@ sampler_extra_params = {
     'sample_dpmpp_2m_sde': ['s_noise'],
     'sample_dpmpp_3m_sde': ['s_noise'],
     'sample_dpmpp_3m_sde_RF': ['s_noise'],
+    'sample_res_2m': ['s_noise', 'eta'],
+    'sample_res_2s': ['s_noise', 'eta', 'c2'],
+    'sample_res_2m_sde': ['s_noise', 'eta'],
+    'sample_res_2s_sde': ['s_noise', 'eta', 'c2'],
+    'sample_er_sde': ['s_noise', 'max_stage'],
 }
 
 k_diffusion_samplers_map = {x.name: x for x in samplers_data_k_diffusion}
@@ -133,6 +144,26 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
                 p.extra_generation_params["Sigmoid Offset schedule square k"] = opts.sigmoid_square_k
                 
             sigmas = scheduler.function(n=steps, **sigmas_kwargs, device=devices.cpu)
+
+        # Sigma rescaling: read from p first, fall back to opts
+        rescale_start = getattr(p, 'sigma_rescale_start', None)
+        rescale_end = getattr(p, 'sigma_rescale_end', None)
+        if rescale_start is None:
+            rescale_start = getattr(opts, 'sigma_rescale_start', 1.0)
+        if rescale_end is None:
+            rescale_end = getattr(opts, 'sigma_rescale_end', 0.0)
+        rescale_factor = getattr(opts, 'sigma_rescale_factor', 1.0)
+
+        if rescale_start != 1.0 or rescale_end != 0.0:
+            # Use start/end mode (ComfyUI style)
+            from backend.sampling.advanced_schedulers import rescale_sigmas
+            sigmas = rescale_sigmas(sigmas, start=rescale_start, end=rescale_end)
+            p.extra_generation_params["Sigma rescale"] = f"start={rescale_start}, end={rescale_end}"
+        elif rescale_factor != 1.0:
+            # Use factor mode (simple)
+            from backend.sampling.advanced_schedulers import rescale_sigmas
+            sigmas = rescale_sigmas(sigmas, start=rescale_factor, end=0.0)
+            p.extra_generation_params["Sigma rescale"] = rescale_factor
 
         if discard_next_to_last_sigma:
             sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])

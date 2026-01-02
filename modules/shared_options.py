@@ -426,6 +426,15 @@ options_templates.update(options_section(('sampler-params', "Sampler parameters"
     'beta_dist_beta': OptionInfo(0.6, "Beta scheduler - beta", gr.Slider, {"minimum": 0.01, "maximum": 1.0, "step": 0.01}, infotext='Beta scheduler beta').info('Default = 0.6; the beta parameter of the beta distribution used in Beta sampling'),
     'sigmoid_base_c': OptionInfo(0.5, "Sigmoid offset scheduler - base c", gr.Slider, {"minimum": -50.0, "maximum": 50.0, "step": 0.01}, infotext='Sigmoid offset scheduler - base c').info('Default = 0.5; the base c parameter of the Sigmoid offset scheduler sampling'),
     'sigmoid_square_k': OptionInfo(1.0, "Sigmoid offset scheduler - square k", gr.Slider, {"minimum": 0.01, "maximum": 10.0, "step": 0.01}, infotext='Sigmoid offset scheduler - square k').info('Default = 1.0; the square k parameter of the Sigmoid offset scheduler sampling'),
+    'sigma_rescale_factor': OptionInfo(1.0, "Sigma Rescale Factor", gr.Slider, {"minimum": 0.9, "maximum": 1.1, "step": 0.001}, infotext='Sigma rescale').info('Rescale sigma schedule (1.0 = no change; <1.0 = reduce denoise range)'),
+    'sigma_rescale_start': OptionInfo(1.0, "Sigma Rescale Start", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.01}, infotext='Sigma rescale start').info('Start value for sigma rescaling (use with end for ComfyUI-style rescale)'),
+    'sigma_rescale_end': OptionInfo(0.0, "Sigma Rescale End", gr.Slider, {"minimum": 0.0, "maximum": 0.5, "step": 0.01}, infotext='Sigma rescale end').info('End value for sigma rescaling (0 = default)'),
+    'zimage_shift_override': OptionInfo(0.0, "Z-Image Flow Shift Override (0=auto)", gr.Slider, {"minimum": 0.0, "maximum": 5.0, "step": 0.1}, infotext='Z-Image shift').info('Override automatic flow shift calculation (0 = use automatic resolution-based shift)'),
+    'noise_type': OptionInfo("gaussian", "Noise Type", gr.Dropdown, {"choices": ["gaussian", "pink", "brown", "blue", "violet", "pyramid"]}, infotext='Noise type').info('Type of noise to use for sampling initialization'),
+    'apg_enabled': OptionInfo(False, "Enable APG (Adaptive Projected Guidance)", infotext='APG enabled').info('Reduces oversaturation at high CFG scales by projecting updates orthogonally'),
+    'apg_eta': OptionInfo(1.0, "APG Eta", gr.Slider, {"minimum": 0.0, "maximum": 2.0, "step": 0.05}, infotext='APG eta').info('Parallel component weight (1.0 = standard CFG, 0.0 = fully orthogonal, lower = less saturation)'),
+    'apg_momentum': OptionInfo(-0.5, "APG Momentum", gr.Slider, {"minimum": -1.0, "maximum": 1.0, "step": 0.05}, infotext='APG momentum').info('Running average momentum for smoother guidance (-0.5 recommended)'),
+    'apg_threshold': OptionInfo(0.0, "APG Threshold", gr.Slider, {"minimum": 0.0, "maximum": 10.0, "step": 0.1}, infotext='APG threshold').info('Norm threshold for update scaling (0 = disabled)'),
  }))
 
 options_templates.update(options_section(('postprocessing', "Postprocessing", "postprocessing"), {

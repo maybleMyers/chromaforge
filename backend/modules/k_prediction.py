@@ -319,21 +319,22 @@ class PredictionZImage(AbstractPrediction):
 
 
 class PredictionFlux(AbstractPrediction):
-    def __init__(self, seq_len=4096, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15, pseudo_timestep_range=10000, mu=None):
+    def __init__(self, seq_len=4096, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15, pseudo_timestep_range=10000, mu=None, shift_override=None):
         super().__init__(sigma_data=1.0, prediction_type='const')
         self.mu = mu
+        self.shift_override = shift_override
         self.pseudo_timestep_range = pseudo_timestep_range
-        self.apply_mu_transform(seq_len=seq_len, base_seq_len=base_seq_len, max_seq_len=max_seq_len, base_shift=base_shift, max_shift=max_shift, mu=mu)
+        self.apply_mu_transform(seq_len=seq_len, base_seq_len=base_seq_len, max_seq_len=max_seq_len, base_shift=base_shift, max_shift=max_shift, mu=mu, shift_override=shift_override)
 
-    def apply_mu_transform(self, seq_len=4096, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15, mu=None):
-        # TODO: Add an UI option to let user choose whether to call this in each generation to bind latent size to sigmas
-        # And some cases may want their own mu values or other parameters
-        if mu is None:
+    def apply_mu_transform(self, seq_len=4096, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15, mu=None, shift_override=None):
+        if shift_override is not None and shift_override > 0:
+            self.mu = shift_override
+            self.shift_override = shift_override
+        elif mu is None:
             self.mu = calculate_shift(image_seq_len=seq_len, base_seq_len=base_seq_len, max_seq_len=max_seq_len, base_shift=base_shift, max_shift=max_shift)
         else:
             self.mu = mu
         sigmas = torch.arange(1, self.pseudo_timestep_range + 1, 1) / self.pseudo_timestep_range
-        # Create a temporary scheduler instance for time_shift
         temp_scheduler = FlowMatchEulerDiscreteScheduler()
         sigmas = temp_scheduler.time_shift(self.mu, 1.0, sigmas)
         self.register_buffer('sigmas', sigmas)

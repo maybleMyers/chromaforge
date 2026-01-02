@@ -889,6 +889,14 @@ def create_ui():
                             zimage_shift = gr.Slider(minimum=0.0, maximum=30.0, step=0.05, label='Z-Image Shift', value=0.0, elem_id="txt2img_zimage_shift")
                             main_entry.ui_txt2img_zimage_shift = zimage_shift
                             cfg_scale.change(lambda x: gr.update(interactive=(x != 1)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
+                        with gr.Row():
+                            sigma_rescale_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Sigma Rescale Start', value=1.0, elem_id="txt2img_sigma_rescale_start")
+                            sigma_rescale_end = gr.Slider(minimum=0.0, maximum=0.5, step=0.01, label='Sigma Rescale End', value=0.0, elem_id="txt2img_sigma_rescale_end")
+                        with gr.Row():
+                            apg_enabled = gr.Checkbox(label='APG (Adaptive Projected Guidance)', value=False, elem_id="txt2img_apg_enabled")
+                            apg_eta = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, label='APG Eta', value=1.0, elem_id="txt2img_apg_eta")
+                            apg_momentum = gr.Slider(minimum=-1.0, maximum=1.0, step=0.05, label='APG Momentum', value=-0.5, elem_id="txt2img_apg_momentum")
+                            apg_threshold = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, label='APG Threshold', value=0.0, elem_id="txt2img_apg_threshold")
 
                     elif category == "checkboxes":
                         with FormRow(elem_classes="checkboxes-row", variant="compact"):
@@ -1000,6 +1008,12 @@ def create_ui():
                 cfg_scale,
                 distilled_cfg_scale,
                 zimage_shift,
+                sigma_rescale_start,
+                sigma_rescale_end,
+                apg_enabled,
+                apg_eta,
+                apg_momentum,
+                apg_threshold,
                 height,
                 width,
                 enable_hr,
@@ -1327,6 +1341,14 @@ def create_ui():
                             main_entry.ui_img2img_zimage_shift = zimage_shift
                             image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label='Image CFG Scale', value=1.5, elem_id="img2img_image_cfg_scale", visible=False)
                             cfg_scale.change(lambda x: gr.update(interactive=(x != 1)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
+                        with gr.Row():
+                            sigma_rescale_start = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Sigma Rescale Start', value=1.0, elem_id="img2img_sigma_rescale_start")
+                            sigma_rescale_end = gr.Slider(minimum=0.0, maximum=0.5, step=0.01, label='Sigma Rescale End', value=0.0, elem_id="img2img_sigma_rescale_end")
+                        with gr.Row():
+                            apg_enabled = gr.Checkbox(label='APG (Adaptive Projected Guidance)', value=False, elem_id="img2img_apg_enabled")
+                            apg_eta = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, label='APG Eta', value=1.0, elem_id="img2img_apg_eta")
+                            apg_momentum = gr.Slider(minimum=-1.0, maximum=1.0, step=0.05, label='APG Momentum', value=-0.5, elem_id="img2img_apg_momentum")
+                            apg_threshold = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, label='APG Threshold', value=0.0, elem_id="img2img_apg_threshold")
 
                     elif category == "checkboxes":
                         with FormRow(elem_classes="checkboxes-row", variant="compact"):
@@ -1407,6 +1429,12 @@ def create_ui():
                 cfg_scale,
                 distilled_cfg_scale,
                 zimage_shift,
+                sigma_rescale_start,
+                sigma_rescale_end,
+                apg_enabled,
+                apg_eta,
+                apg_momentum,
+                apg_threshold,
                 image_cfg_scale,
                 denoising_strength,
                 selected_scale_tab,

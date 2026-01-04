@@ -158,12 +158,11 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             # Use start/end mode (ComfyUI style)
             from backend.sampling.advanced_schedulers import rescale_sigmas
             sigmas = rescale_sigmas(sigmas, start=rescale_start, end=rescale_end)
-            p.extra_generation_params["Sigma rescale"] = f"start={rescale_start}, end={rescale_end}"
         elif rescale_factor != 1.0:
             # Use factor mode (simple)
             from backend.sampling.advanced_schedulers import rescale_sigmas
             sigmas = rescale_sigmas(sigmas, start=rescale_factor, end=0.0)
-            p.extra_generation_params["Sigma rescale"] = rescale_factor
+            p.extra_generation_params["Sigma rescale factor"] = rescale_factor
 
         if discard_next_to_last_sigma:
             sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])

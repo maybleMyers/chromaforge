@@ -750,6 +750,29 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
     if firstpass_use_distilled_cfg_scale:
         generation_params['Distilled CFG Scale'] = p.distilled_cfg_scale
 
+    # Z-Image shift
+    zimage_shift = getattr(p, 'zimage_shift', 0.0)
+    if zimage_shift > 0:
+        generation_params['Z-Image Shift'] = zimage_shift
+
+    # APG (Adaptive Projected Guidance)
+    apg_enabled = getattr(p, 'apg_enabled', False)
+    if apg_enabled:
+        apg_eta = getattr(p, 'apg_eta', 1.0)
+        if apg_eta < 1.0:  # Only save if APG is actually active
+            generation_params['APG Eta'] = apg_eta
+            generation_params['APG Momentum'] = getattr(p, 'apg_momentum', -0.5)
+            apg_threshold = getattr(p, 'apg_threshold', 0.0)
+            if apg_threshold > 0:
+                generation_params['APG Threshold'] = apg_threshold
+
+    # Sigma rescale (only save if non-default)
+    sigma_rescale_start = getattr(p, 'sigma_rescale_start', 1.0)
+    sigma_rescale_end = getattr(p, 'sigma_rescale_end', 0.0)
+    if sigma_rescale_start != 1.0 or sigma_rescale_end != 0.0:
+        generation_params['Sigma Rescale Start'] = sigma_rescale_start
+        generation_params['Sigma Rescale End'] = sigma_rescale_end
+
     noise_source_type = get_noise_source_type()
 
     generation_params.update({

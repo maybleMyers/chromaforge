@@ -1108,6 +1108,13 @@ def create_ui():
                 PasteField(hr_cfg, "Hires CFG Scale", api="hr_cfg"),
                 PasteField(hr_distilled_cfg, "Hires Distilled CFG Scale", api="hr_distilled_cfg"),
                 PasteField(hr_prompts_container, lambda d: gr.update(visible=True) if d.get("Hires prompt", "") != "" or d.get("Hires negative prompt", "") != "" else gr.update()),
+                PasteField(zimage_shift, "Z-Image Shift", api="zimage_shift"),
+                PasteField(sigma_rescale_start, "Sigma Rescale Start", api="sigma_rescale_start"),
+                PasteField(sigma_rescale_end, "Sigma Rescale End", api="sigma_rescale_end"),
+                PasteField(apg_enabled, lambda d: "APG Eta" in d, api="apg_enabled"),
+                PasteField(apg_eta, "APG Eta", api="apg_eta"),
+                PasteField(apg_momentum, "APG Momentum", api="apg_momentum"),
+                PasteField(apg_threshold, "APG Threshold", api="apg_threshold"),
                 *scripts.scripts_txt2img.infotext_fields
             ]
             parameters_copypaste.add_paste_fields("txt2img", None, txt2img_paste_fields, override_settings)
@@ -1584,6 +1591,13 @@ def create_ui():
                 (inpainting_fill, 'Masked content'),
                 (inpaint_full_res, 'Inpaint area'),
                 (inpaint_full_res_padding, 'Masked area padding'),
+                (zimage_shift, "Z-Image Shift"),
+                (sigma_rescale_start, "Sigma Rescale Start"),
+                (sigma_rescale_end, "Sigma Rescale End"),
+                (apg_enabled, lambda d: "APG Eta" in d),
+                (apg_eta, "APG Eta"),
+                (apg_momentum, "APG Momentum"),
+                (apg_threshold, "APG Threshold"),
                 *scripts.scripts_img2img.infotext_fields
             ]
             parameters_copypaste.add_paste_fields("img2img", init_img.background, img2img_paste_fields, override_settings)

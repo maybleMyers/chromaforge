@@ -90,7 +90,11 @@ def image_from_url_text(filedata):
         filename = filedata["name"]
 
     elif isinstance(filedata, tuple) and len(filedata) == 2:  # gradio 4.16 sends images from gallery as a list of tuples
-        return filedata[0]
+        elem = filedata[0]
+        if isinstance(elem, Image.Image):
+            return elem
+        # If it's a filepath string, continue to load it below
+        filedata = elem
 
     if filename:
         is_in_right_dir = ui_tempdir.check_tmp_file(shared.demo, filename)
@@ -100,12 +104,26 @@ def image_from_url_text(filedata):
         return images.read(filename)
 
     if isinstance(filedata, str):
+        # Handle base64 encoded images
         if filedata.startswith("data:image/png;base64,"):
             filedata = filedata[len("data:image/png;base64,"):]
+            filedata = base64.decodebytes(filedata.encode('utf-8'))
+            image = images.read(io.BytesIO(filedata))
+            return image
 
-        filedata = base64.decodebytes(filedata.encode('utf-8'))
-        image = images.read(io.BytesIO(filedata))
-        return image
+        # Handle filepath strings (e.g., from Gradio gallery serialization)
+        if os.path.exists(filedata):
+            is_in_right_dir = ui_tempdir.check_tmp_file(shared.demo, filedata)
+            if is_in_right_dir:
+                return images.read(filedata)
+
+        # Try to decode as raw base64 (legacy format)
+        try:
+            filedata = base64.decodebytes(filedata.encode('utf-8'))
+            image = images.read(io.BytesIO(filedata))
+            return image
+        except Exception:
+            pass
 
     return None
 
@@ -200,7 +218,13 @@ def send_image_and_dimensions(x):
         if img.mode == 'RGBA':
             img = img.convert('RGB')
     elif isinstance(x, list) and isinstance(x[0], tuple):
+        # Gradio gallery items are tuples (image_or_filepath, caption)
         img = x[0][0]
+        # In newer Gradio versions, gallery items may be serialized as filepaths
+        if not isinstance(img, Image.Image):
+            img = image_from_url_text(img)
+        if img is not None and img.mode == 'RGBA':
+            img = img.convert('RGB')
     else:
         img = image_from_url_text(x)
         if img is not None and img.mode == 'RGBA':

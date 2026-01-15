@@ -27,6 +27,56 @@ import gradio as gr
 from gradio import themes
 from gradio.themes.utils import colors
 from PIL import Image
+from dataclasses import dataclass
+import copy
+
+# Try to import jinja2 for PaCoRe template rendering
+try:
+    import jinja2
+    JINJA2_AVAILABLE = True
+except ImportError:
+    JINJA2_AVAILABLE = False
+    print("Warning: jinja2 not installed. PaCoRe inference will be limited.")
+
+
+# PaCoRe (Parallel Coordinated Reasoning) Configuration
+@dataclass
+class PaCoreConfig:
+    """Configuration for PaCoRe parallel inference."""
+    mode: str = "low"  # "low", "medium", "high"
+    temperature: float = 1.0
+    max_tokens: int = 4096
+    top_p: float = 0.9
+    top_k: int = 50
+
+    @property
+    def num_responses_per_round(self) -> List[int]:
+        """Get responses per round based on mode."""
+        modes = {
+            "low": [4],      # 4 parallel responses + 1 synthesis = 5 total
+            "medium": [16],  # 16 parallel responses + 1 synthesis = 17 total
+            "high": [32, 4], # 32 + 4 + 1 = 37 total responses
+        }
+        # Always append 1 for final synthesis round
+        return modes.get(self.mode, [4]) + [1]
+
+
+# PaCoRe Controller Prompt Template for synthesis
+PACORE_CONTROLLER_PROMPT = """\
+You are given a problem and a list of reference responses. Your job is to analyze these references and provide your own response.
+
+Original Problem:
+{{ original_prompt }}
+
+Reference Responses:
+{% for response in ref_responses %}
+Reference {{ loop.index }}:
+{{ response }}
+{% endfor %}
+
+Now, based on the original problem and reference responses above, please provide your own comprehensive solution.
+"""
+
 
 # Try to import psutil for memory detection
 try:
@@ -389,11 +439,15 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                         model_type = "glm-vl"
                     else:
                         model_type = "glm"
+                # Detect Step3-VL models
+                elif "step3" in arch or "step3" in model_type_str:
+                    if config.get("vision_config") or "vl" in model_type_str or "vl" in arch:
+                        model_type = "step3-vl"
         except Exception:
             pass
 
-        # Include Qwen, GLM, and InternVL models
-        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl", "internvl"]:
+        # Include Qwen, GLM, InternVL, and Step3-VL models
+        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl", "internvl", "step3-vl"]:
             models.append({
                 "name": model_dir.name,
                 "path": str(model_dir),
@@ -579,7 +633,7 @@ class Qwen3VLMBackend:
             progress(0.2, desc="Loading processor/tokenizer...")
 
             # Load processor or tokenizer based on model type
-            if model_type in ["qwen-vl", "glm-vl", "internvl"]:
+            if model_type in ["qwen-vl", "glm-vl", "internvl", "step3-vl"]:
                 if model_type == "internvl":
                     # InternVL uses AutoTokenizer with trust_remote_code
                     # The model has its own chat() method that handles image processing
@@ -768,7 +822,7 @@ class Qwen3VLMBackend:
                 model_kwargs["dtype"] = torch_dtype
 
             # Use appropriate model class based on type
-            if model_type in ["qwen-vl", "glm-vl", "internvl"]:
+            if model_type in ["qwen-vl", "glm-vl", "internvl", "step3-vl"]:
                 # Detect model architecture from config to choose the right class
                 config_path = os.path.join(model_path, "config.json")
                 model_type_from_config = None
@@ -882,6 +936,28 @@ class Qwen3VLMBackend:
                         loaded = True
                     except Exception:
                         pass
+
+                # For Step3-VL models (uses AutoModelForCausalLM with key_mapping)
+                if not loaded and (model_type_from_config == "step3_vl" or "step3" in str(model_type_from_config).lower()):
+                    print("Loading as Step3-VL model using AutoModelForCausalLM...")
+                    # Step3-VL requires BF16 only
+                    if model_kwargs.get("dtype") != torch.bfloat16:
+                        print("[Step3-VL] Forcing bfloat16 (required by Step3-VL)")
+                        model_kwargs["dtype"] = torch.bfloat16
+                    # Step3-VL key mapping for weight transformation
+                    step3_key_mapping = {
+                        "^vision_model": "model.vision_model",
+                        r"^model(?!\.(language_model|vision_model))": "model.language_model",
+                        "vit_large_projector": "model.vit_large_projector",
+                    }
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        **model_kwargs,
+                        key_mapping=step3_key_mapping,
+                    )
+                    # Load processor for Step3-VL
+                    self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                    print("Loaded as Step3-VL model")
+                    loaded = True
 
                 # Legacy Qwen2-VL fallback
                 if not loaded:
@@ -1304,8 +1380,8 @@ class Qwen3VLMBackend:
                     messages, images, video_path,
                     max_new_tokens, temperature, top_p, top_k, video_max_frames
                 )
-            # Handle vision-language model (Qwen-VL, GLM-VL, etc.)
-            elif self.current_model_type in ["qwen-vl", "glm-vl"] and self.processor is not None:
+            # Handle vision-language model (Qwen-VL, GLM-VL, Step3-VL, etc.)
+            elif self.current_model_type in ["qwen-vl", "glm-vl", "step3-vl"] and self.processor is not None:
                 return self._generate_vl(
                     messages, images, video_path,
                     max_new_tokens, temperature, top_p, top_k, video_max_frames
@@ -2017,6 +2093,210 @@ class Qwen3VLMBackend:
         image.save(temp_path)
         return temp_path
 
+    # ==================== PaCoRe Methods ====================
+
+    def pacore_generate(
+        self,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Image.Image]] = None,
+        video_path: Optional[str] = None,
+        config: Optional[PaCoreConfig] = None,
+        video_max_frames: int = 8,
+        progress=gr.Progress(),
+    ) -> Dict[str, Any]:
+        """
+        PaCoRe multi-round synthesis inference (sequential on 1 GPU).
+
+        PaCoRe generates multiple diverse responses and synthesizes them into
+        a refined final answer using a controller prompt.
+
+        Flow for low mode [4, 1]:
+          Round 0: Generate 4 responses sequentially
+          Synthesis: Create controller prompt with 4 answers as references
+          Round 1: Generate 1 final synthesized response
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            images: Optional list of PIL Images
+            video_path: Optional path to video file
+            config: PaCoreConfig with mode, temperature, etc.
+            video_max_frames: Max frames for video processing
+            progress: Gradio progress callback
+
+        Returns:
+            Dict with keys:
+                - final_response: str - The synthesized final response
+                - round_responses: List[List[Dict]] - All responses per round
+                - stats: Dict - Timing and token statistics
+        """
+        if config is None:
+            config = PaCoreConfig()
+
+        if self.model is None and self.lmdeploy_pipe is None:
+            return {
+                "final_response": "Error: No model loaded. Please load a model first.",
+                "round_responses": [],
+                "stats": {},
+            }
+
+        if not JINJA2_AVAILABLE:
+            return {
+                "final_response": "Error: jinja2 is required for PaCoRe. Install with: pip install jinja2",
+                "round_responses": [],
+                "stats": {},
+            }
+
+        start_time = time.perf_counter()
+        original_prompt = self._extract_original_prompt(messages)
+
+        all_rounds: List[List[Dict[str, Any]]] = []
+        total_tokens = 0
+
+        num_rounds = len(config.num_responses_per_round)
+        print(f"[PaCoRe] Starting {config.mode} mode inference: {config.num_responses_per_round}")
+
+        for round_idx, num_responses in enumerate(config.num_responses_per_round):
+            round_responses = []
+
+            # Prepare messages for this round
+            if round_idx == 0:
+                # First round: use original messages
+                current_messages = messages
+            else:
+                # Subsequent rounds: inject controller prompt with previous responses
+                prev_answers = [
+                    self._parse_answer(r.get("content", ""))
+                    for r in all_rounds[-1]
+                ]
+                current_messages = self._inject_controller_prompt(
+                    messages, original_prompt, prev_answers
+                )
+
+            # Generate N responses SEQUENTIALLY (1 GPU constraint)
+            for i in range(num_responses):
+                progress(
+                    (round_idx + i / num_responses) / num_rounds,
+                    f"Round {round_idx + 1}/{num_rounds}: response {i + 1}/{num_responses}"
+                )
+
+                try:
+                    response_text, stats = self.generate(
+                        messages=current_messages,
+                        images=images,
+                        video_path=video_path,
+                        max_new_tokens=config.max_tokens,
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        video_max_frames=video_max_frames,
+                    )
+                    round_responses.append({
+                        "content": response_text,
+                        "tokens": stats.get("tokens", 0),
+                    })
+                    total_tokens += stats.get("tokens", 0)
+                except Exception as e:
+                    print(f"[PaCoRe] Generation {i+1} in round {round_idx+1} failed: {e}")
+                    round_responses.append({
+                        "content": f"Error: {str(e)}",
+                        "tokens": 0,
+                        "error": str(e),
+                    })
+
+            all_rounds.append(round_responses)
+            print(f"[PaCoRe] Round {round_idx + 1}/{num_rounds}: {num_responses} response(s) complete")
+
+        total_time = time.perf_counter() - start_time
+        progress(1.0, "Complete!")
+
+        # Extract final response from last round
+        final_response = ""
+        if all_rounds and all_rounds[-1]:
+            final_response = all_rounds[-1][0].get("content", "")
+
+        print(f"[PaCoRe] Complete: {total_tokens} tokens in {total_time:.2f}s ({total_tokens/total_time:.2f} tok/s)")
+
+        return {
+            "final_response": final_response,
+            "round_responses": all_rounds,
+            "stats": {
+                "total_tokens": total_tokens,
+                "total_time": total_time,
+                "tokens_per_sec": total_tokens / total_time if total_time > 0 else 0,
+                "num_rounds": len(all_rounds),
+                "mode": config.mode,
+                "responses_per_round": config.num_responses_per_round,
+            },
+        }
+
+    def _extract_original_prompt(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract the original user prompt text from messages."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                elif isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                    return " ".join(text_parts)
+        return ""
+
+    @staticmethod
+    def _parse_answer(response: str) -> str:
+        """
+        Extract answer from response, removing thinking tags.
+        Picks everything after last </think> tag (for thinking models).
+        """
+        boa_string = "</think>"
+        splits = response.split(boa_string)
+        if len(splits) > 1:
+            return splits[-1].strip()
+        return response.strip()
+
+    def _inject_controller_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        original_prompt: str,
+        ref_responses: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Inject controller prompt with reference responses into messages.
+        Replaces the user message text with synthesized context.
+        """
+        template = jinja2.Template(PACORE_CONTROLLER_PROMPT)
+        controller_text = template.render(
+            original_prompt=original_prompt,
+            ref_responses=ref_responses,
+        )
+
+        # Deep copy messages and replace last user message text
+        new_messages = copy.deepcopy(messages)
+
+        for i in range(len(new_messages) - 1, -1, -1):
+            if new_messages[i].get("role") == "user":
+                content = new_messages[i].get("content")
+                if isinstance(content, list):
+                    # Multimodal: update text part only, keep images
+                    for j, item in enumerate(content):
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            new_messages[i]["content"][j]["text"] = controller_text
+                            break
+                    else:
+                        # No text part found, append one
+                        new_messages[i]["content"].append({
+                            "type": "text",
+                            "text": controller_text
+                        })
+                else:
+                    # Text-only message
+                    new_messages[i]["content"] = controller_text
+                break
+
+        return new_messages
+
 
 # Global backend instance
 vlm_backend: Optional[Qwen3VLMBackend] = None
@@ -2258,6 +2538,51 @@ def batch_caption_handler(
     return f"Processed {total} images:\n\n" + "\n".join(results)
 
 
+def pacore_handler(
+    mode: str,
+    temperature: float,
+    max_tokens: int,
+    image,
+    prompt: str,
+    system_prompt: str,
+    progress=gr.Progress(),
+):
+    """Handle PaCoRe inference request from UI."""
+    if vlm_backend is None or (vlm_backend.model is None and vlm_backend.lmdeploy_pipe is None):
+        return "Error: No model loaded. Please load a model first.", {}, []
+
+    # Build messages list
+    messages = []
+
+    # Add system prompt if provided
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+
+    # Build user message content
+    content = []
+    if image is not None:
+        content.append({"type": "image", "image": image})
+    content.append({"type": "text", "text": prompt or "Describe this image."})
+    messages.append({"role": "user", "content": content})
+
+    # Create PaCoRe config
+    config = PaCoreConfig(
+        mode=mode,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    # Run PaCoRe inference
+    result = vlm_backend.pacore_generate(
+        messages=messages,
+        images=[image] if image else None,
+        config=config,
+        progress=progress,
+    )
+
+    return result["final_response"], result["stats"], result["round_responses"]
+
+
 def create_ui():
     """Create the Gradio interface."""
     # Theme
@@ -2399,6 +2724,85 @@ def create_ui():
                     lines=15,
                     interactive=False,
                 )
+
+            # PaCoRe Tab - Parallel Coordinated Reasoning
+            with gr.TabItem("PaCoRe"):
+                gr.Markdown("""
+                ## PaCoRe: Parallel Coordinated Reasoning
+
+                Generate multiple diverse responses and synthesize them into a refined answer.
+
+                **Modes:**
+                - **Low** (4+1): 4 initial responses + 1 synthesis = 5 total generations
+                - **Medium** (16+1): 16 initial responses + 1 synthesis = 17 total generations
+                - **High** (32+4+1): 32 + 4 refinement + 1 final = 37 total generations
+
+                *Note: On single GPU, responses are generated sequentially.*
+                """)
+
+                with gr.Row():
+                    pacore_mode = gr.Dropdown(
+                        label="Mode",
+                        choices=["low", "medium", "high"],
+                        value="low",
+                        info="Higher modes = more responses, better synthesis, longer time",
+                    )
+                    pacore_temp = gr.Slider(
+                        minimum=0.1,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                        label="Temperature",
+                        info="Higher = more diverse responses",
+                    )
+                    pacore_max_tokens = gr.Slider(
+                        minimum=256,
+                        maximum=8192,
+                        value=2048,
+                        step=256,
+                        label="Max Tokens per Response",
+                    )
+
+                with gr.Row():
+                    pacore_image = gr.Image(
+                        label="Image (optional)",
+                        type="pil",
+                        height=200,
+                    )
+                    with gr.Column(scale=2):
+                        pacore_prompt = gr.Textbox(
+                            label="Prompt",
+                            lines=4,
+                            placeholder="Enter your question or problem here...",
+                        )
+                        pacore_system = gr.Textbox(
+                            label="System Prompt (optional)",
+                            lines=2,
+                            value="",
+                            placeholder="Optional system instructions...",
+                        )
+
+                pacore_btn = gr.Button(
+                    "Generate with PaCoRe",
+                    variant="primary",
+                    elem_classes=["green-btn"],
+                )
+
+                pacore_output = gr.Textbox(
+                    label="Final Synthesized Response",
+                    lines=12,
+                    interactive=False,
+                )
+
+                with gr.Row():
+                    pacore_stats = gr.JSON(
+                        label="Statistics",
+                    )
+
+                with gr.Accordion("Round Details (Debug)", open=False):
+                    pacore_rounds = gr.JSON(
+                        label="All Round Responses",
+                    )
 
         # Settings section below chat - in accordions
         with gr.Accordion("Model Settings", open=True):
@@ -2590,6 +2994,16 @@ def create_ui():
                 max_tokens, temperature
             ],
             outputs=[batch_output],
+        )
+
+        # PaCoRe event handler
+        pacore_btn.click(
+            fn=pacore_handler,
+            inputs=[
+                pacore_mode, pacore_temp, pacore_max_tokens,
+                pacore_image, pacore_prompt, pacore_system
+            ],
+            outputs=[pacore_output, pacore_stats, pacore_rounds],
         )
 
     return demo

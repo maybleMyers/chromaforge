@@ -97,6 +97,7 @@ DEFAULT_SETTINGS = {
     "cpu_offload": False,
     "cpu_offload_ram": 0,  # 0 = auto
     "backend": "transformers",
+    "flash_attention": False,
     "context_len": 8192,
     # Generation Settings
     "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
@@ -126,6 +127,7 @@ def save_settings(
     cpu_offload: bool,
     cpu_offload_ram: int,
     backend: str,
+    flash_attention: bool,
     context_len: int,
     # Generation Settings
     system_prompt: str,
@@ -154,6 +156,7 @@ def save_settings(
         "cpu_offload": cpu_offload,
         "cpu_offload_ram": cpu_offload_ram,
         "backend": backend,
+        "flash_attention": flash_attention,
         "context_len": context_len,
         # Generation Settings
         "system_prompt": system_prompt,
@@ -594,6 +597,7 @@ class Qwen3VLMBackend:
         self.current_model_path: Optional[str] = None
         self.current_model_type: Optional[str] = None
         self.device_map = None
+        self.use_flash_attention = False
 
         # lmdeploy backend support
         self.lmdeploy_pipe = None
@@ -639,6 +643,7 @@ class Qwen3VLMBackend:
         cpu_offload: bool = False,
         cpu_offload_ram: Optional[int] = None,
         backend: str = "transformers",
+        flash_attention: bool = False,
         context_len: int = 8192,
         progress=gr.Progress(),
     ) -> str:
@@ -653,12 +658,14 @@ class Qwen3VLMBackend:
             cpu_offload: Enable CPU offloading for large models
             cpu_offload_ram: Max CPU RAM to use for offloading in GB
             backend: Inference backend ("transformers" or "lmdeploy")
+            flash_attention: Use Flash Attention 2 for faster inference
             context_len: Context/session length for lmdeploy
             progress: Gradio progress callback
 
         Returns:
             Status message
         """
+        self.use_flash_attention = flash_attention
         # Check backend availability
         if backend == "lmdeploy":
             if not LMDEPLOY_AVAILABLE:
@@ -879,14 +886,18 @@ class Qwen3VLMBackend:
             print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
             # Load the model
-            # Detect best attention implementation
+            # Determine attention implementation
             attn_impl = "sdpa"  # Default to PyTorch's scaled dot product attention
-            try:
-                import flash_attn
-                attn_impl = "flash_attention_2"
-                print(f"[Model] Using Flash Attention 2 for faster inference")
-            except ImportError:
-                print(f"[Model] Flash Attention not installed, using SDPA (pip install flash-attn for 2-3x speedup)")
+            if self.use_flash_attention:
+                try:
+                    import flash_attn
+                    attn_impl = "flash_attention_2"
+                    print(f"[Model] Using Flash Attention 2 for faster inference")
+                except ImportError:
+                    print(f"[Model] Flash Attention requested but not installed, falling back to SDPA")
+                    print(f"[Model] Install with: pip install flash-attn --no-build-isolation")
+            else:
+                print(f"[Model] Using SDPA (enable Flash Attention 2 for 2-3x speedup)")
 
             model_kwargs = {
                 "pretrained_model_name_or_path": model_path,
@@ -2577,6 +2588,7 @@ def load_model_handler(
     cpu_offload: bool = False,
     cpu_offload_ram: Optional[int] = None,
     backend: str = "transformers",
+    flash_attention: bool = False,
     context_len: int = 8192,
     progress=gr.Progress()
 ):
@@ -2596,6 +2608,7 @@ def load_model_handler(
         cpu_offload=cpu_offload,
         cpu_offload_ram=cpu_ram,
         backend=backend,
+        flash_attention=flash_attention,
         context_len=context_len,
         progress=progress,
     )
@@ -3147,6 +3160,11 @@ def create_ui():
                         value="lmdeploy" if LMDEPLOY_AVAILABLE else "transformers",
                         info="lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install lmdeploy for AWQ support",
                     )
+                    flash_attn_checkbox = gr.Checkbox(
+                        label="Flash Attention 2",
+                        value=saved_settings.get("flash_attention", False),
+                        info="2-3x faster (requires flash-attn package)",
+                    )
 
                 with gr.Column(scale=1):
                     num_gpus_slider = gr.Slider(
@@ -3274,7 +3292,7 @@ def create_ui():
 
         load_model_btn.click(
             fn=load_model_handler,
-            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, context_len_slider],
+            inputs=[model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider, cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, flash_attn_checkbox, context_len_slider],
             outputs=[model_status],
         )
 
@@ -3340,7 +3358,7 @@ def create_ui():
             inputs=[
                 # Model Settings
                 model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider,
-                cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, context_len_slider,
+                cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, flash_attn_checkbox, context_len_slider,
                 # Generation Settings
                 system_prompt, max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames,
                 # Batch Caption Settings

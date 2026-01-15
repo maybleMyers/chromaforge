@@ -43,15 +43,20 @@ except ImportError:
 @dataclass
 class PaCoreConfig:
     """Configuration for PaCoRe parallel inference."""
-    mode: str = "low"  # "low", "medium", "high"
+    mode: str = "low"  # "low", "medium", "high", "custom"
     temperature: float = 1.0
     max_tokens: int = 4096
     top_p: float = 0.9
     top_k: int = 50
+    custom_rounds: Optional[List[int]] = None  # For custom mode, e.g. [8, 2]
 
     @property
     def num_responses_per_round(self) -> List[int]:
         """Get responses per round based on mode."""
+        if self.mode == "custom" and self.custom_rounds:
+            # Custom mode: user specifies rounds, we append 1 for final synthesis
+            return self.custom_rounds + [1]
+
         modes = {
             "low": [4],      # 4 parallel responses + 1 synthesis = 5 total
             "medium": [16],  # 16 parallel responses + 1 synthesis = 17 total
@@ -107,6 +112,7 @@ DEFAULT_SETTINGS = {
     "pacore_mode": "low",
     "pacore_temperature": 1.0,
     "pacore_max_tokens": 4096,
+    "pacore_custom_rounds": "4,2",  # For custom mode: comma-separated response counts
 }
 
 
@@ -135,6 +141,7 @@ def save_settings(
     pacore_mode: str,
     pacore_temperature: float,
     pacore_max_tokens: int,
+    pacore_custom_rounds: str,
 ) -> str:
     """Save all settings to a JSON file."""
     settings = {
@@ -162,6 +169,7 @@ def save_settings(
         "pacore_mode": pacore_mode,
         "pacore_temperature": pacore_temperature,
         "pacore_max_tokens": pacore_max_tokens,
+        "pacore_custom_rounds": pacore_custom_rounds,
     }
 
     try:
@@ -2754,6 +2762,7 @@ def batch_caption_handler(
 
 def pacore_handler(
     mode: str,
+    custom_rounds: str,
     temperature: float,
     max_tokens: int,
     image,
@@ -2764,6 +2773,16 @@ def pacore_handler(
     """Handle PaCoRe inference request from UI."""
     if vlm_backend is None or (vlm_backend.model is None and vlm_backend.lmdeploy_pipe is None):
         return "Error: No model loaded. Please load a model first.", {}, []
+
+    # Parse custom rounds if in custom mode
+    parsed_custom_rounds = None
+    if mode == "custom" and custom_rounds:
+        try:
+            parsed_custom_rounds = [int(x.strip()) for x in custom_rounds.split(",") if x.strip()]
+            if not parsed_custom_rounds:
+                return "Error: Invalid custom rounds format. Use comma-separated numbers (e.g., '4,2').", {}, []
+        except ValueError:
+            return "Error: Invalid custom rounds format. Use comma-separated numbers (e.g., '4,2').", {}, []
 
     # Build messages list
     messages = []
@@ -2784,6 +2803,7 @@ def pacore_handler(
         mode=mode,
         temperature=temperature,
         max_tokens=max_tokens,
+        custom_rounds=parsed_custom_rounds,
     )
 
     # Run PaCoRe inference
@@ -2953,6 +2973,7 @@ def create_ui():
                 - **Low** (4+1): 4 initial responses + 1 synthesis = 5 total generations
                 - **Medium** (16+1): 16 initial responses + 1 synthesis = 17 total generations
                 - **High** (32+4+1): 32 + 4 refinement + 1 final = 37 total generations
+                - **Custom**: Specify your own rounds (e.g., "8,2" = 8 responses + 2 refinements + 1 final)
 
                 *Note: On single GPU, responses are generated sequentially.*
                 """)
@@ -2960,9 +2981,16 @@ def create_ui():
                 with gr.Row():
                     pacore_mode = gr.Dropdown(
                         label="Mode",
-                        choices=["low", "medium", "high"],
+                        choices=["low", "medium", "high", "custom"],
                         value=saved_settings.get("pacore_mode", DEFAULT_SETTINGS["pacore_mode"]),
                         info="Higher modes = more responses, better synthesis, longer time",
+                    )
+                    pacore_custom_rounds = gr.Textbox(
+                        label="Custom Rounds",
+                        value=saved_settings.get("pacore_custom_rounds", "4,2"),
+                        placeholder="e.g. 4,2 = 4 responses + 2 refinements + 1 final",
+                        info="Comma-separated response counts per round",
+                        visible=saved_settings.get("pacore_mode", "low") == "custom",
                     )
                     pacore_temp = gr.Slider(
                         minimum=0.1,
@@ -2979,6 +3007,13 @@ def create_ui():
                         step=256,
                         label="Max Tokens per Response",
                     )
+
+                # Show/hide custom rounds input based on mode
+                pacore_mode.change(
+                    fn=lambda m: gr.update(visible=(m == "custom")),
+                    inputs=[pacore_mode],
+                    outputs=[pacore_custom_rounds],
+                )
 
                 with gr.Row():
                     pacore_image = gr.Image(
@@ -3233,7 +3268,7 @@ def create_ui():
         pacore_btn.click(
             fn=pacore_handler,
             inputs=[
-                pacore_mode, pacore_temp, pacore_max_tokens,
+                pacore_mode, pacore_custom_rounds, pacore_temp, pacore_max_tokens,
                 pacore_image, pacore_prompt, pacore_system
             ],
             outputs=[pacore_output, pacore_stats, pacore_rounds],
@@ -3251,7 +3286,7 @@ def create_ui():
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt,
                 # PaCoRe Settings
-                pacore_mode, pacore_temp, pacore_max_tokens,
+                pacore_mode, pacore_temp, pacore_max_tokens, pacore_custom_rounds,
             ],
             outputs=[settings_status],
         )

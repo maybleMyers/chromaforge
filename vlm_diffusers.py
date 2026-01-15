@@ -17,6 +17,7 @@ import time
 import json
 import argparse
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Union
 from io import BytesIO
@@ -878,10 +879,20 @@ class Qwen3VLMBackend:
             print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
             # Load the model
+            # Detect best attention implementation
+            attn_impl = "sdpa"  # Default to PyTorch's scaled dot product attention
+            try:
+                import flash_attn
+                attn_impl = "flash_attention_2"
+                print(f"[Model] Using Flash Attention 2 for faster inference")
+            except ImportError:
+                print(f"[Model] Flash Attention not installed, using SDPA (pip install flash-attn for 2-3x speedup)")
+
             model_kwargs = {
                 "pretrained_model_name_or_path": model_path,
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,
+                "attn_implementation": attn_impl,
             }
 
             # For Q8 partial: use BitsAndBytesConfig to quantize language model to INT8
@@ -2323,6 +2334,7 @@ class Qwen3VLMBackend:
         config: Optional[PaCoreConfig] = None,
         video_max_frames: int = 8,
         progress=gr.Progress(),
+        stop_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """
         PaCoRe multi-round synthesis inference (sequential on 1 GPU).
@@ -2394,6 +2406,24 @@ class Qwen3VLMBackend:
 
             # Generate N responses SEQUENTIALLY (1 GPU constraint)
             for i in range(num_responses):
+                # Check if stop was requested
+                if stop_event and stop_event.is_set():
+                    print("[PaCoRe] Stop requested by user")
+                    total_time = time.perf_counter() - start_time
+                    return {
+                        "final_response": "",
+                        "round_responses": all_rounds,
+                        "stats": {
+                            "total_tokens": total_tokens,
+                            "total_time": total_time,
+                            "tokens_per_sec": total_tokens / total_time if total_time > 0 else 0,
+                            "num_rounds_completed": round_idx,
+                            "mode": config.mode,
+                            "responses_per_round": config.num_responses_per_round,
+                        },
+                        "stopped": True,
+                    }
+
                 progress(
                     (round_idx + i / num_responses) / num_rounds,
                     f"Round {round_idx + 1}/{num_rounds}: response {i + 1}/{num_responses}"
@@ -2520,6 +2550,9 @@ class Qwen3VLMBackend:
 
 # Global backend instance
 vlm_backend: Optional[Qwen3VLMBackend] = None
+
+# Global stop event for cancelling generation
+pacore_stop_event = threading.Event()
 
 
 def initialize_backend(models_dir: str = "models/LLM"):
@@ -2760,6 +2793,12 @@ def batch_caption_handler(
     return f"Processed {total} images:\n\n" + "\n".join(results)
 
 
+def pacore_stop_handler():
+    """Stop the PaCoRe generation."""
+    pacore_stop_event.set()
+    return "Stopping..."
+
+
 def pacore_handler(
     mode: str,
     custom_rounds: str,
@@ -2771,6 +2810,9 @@ def pacore_handler(
     progress=gr.Progress(),
 ):
     """Handle PaCoRe inference request from UI."""
+    # Clear stop event at start
+    pacore_stop_event.clear()
+
     if vlm_backend is None or (vlm_backend.model is None and vlm_backend.lmdeploy_pipe is None):
         return "Error: No model loaded. Please load a model first.", {}, []
 
@@ -2812,7 +2854,11 @@ def pacore_handler(
         images=[image] if image else None,
         config=config,
         progress=progress,
+        stop_event=pacore_stop_event,
     )
+
+    if result.get("stopped"):
+        return "Generation stopped by user.", result["stats"], result["round_responses"]
 
     return result["final_response"], result["stats"], result["round_responses"]
 
@@ -3034,11 +3080,18 @@ def create_ui():
                             placeholder="Optional system instructions...",
                         )
 
-                pacore_btn = gr.Button(
-                    "Generate with PaCoRe",
-                    variant="primary",
-                    elem_classes=["green-btn"],
-                )
+                with gr.Row():
+                    pacore_btn = gr.Button(
+                        "Generate with PaCoRe",
+                        variant="primary",
+                        elem_classes=["green-btn"],
+                        scale=4,
+                    )
+                    pacore_stop_btn = gr.Button(
+                        "Stop",
+                        variant="stop",
+                        scale=1,
+                    )
 
                 pacore_output = gr.Textbox(
                     label="Final Synthesized Response",
@@ -3272,6 +3325,13 @@ def create_ui():
                 pacore_image, pacore_prompt, pacore_system
             ],
             outputs=[pacore_output, pacore_stats, pacore_rounds],
+        )
+
+        # PaCoRe stop button
+        pacore_stop_btn.click(
+            fn=pacore_stop_handler,
+            inputs=[],
+            outputs=[pacore_output],
         )
 
         # Save settings event handler

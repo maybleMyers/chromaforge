@@ -967,9 +967,12 @@ class Qwen3VLMBackend:
                         model_kwargs["dtype"] = torch.bfloat16
 
                     # Step3-VL key mapping for weight transformation
+                    # Uses simple string prefixes (transformers 5.0+ compiles all patterns together)
                     step3_key_mapping = {
-                        "^vision_model": "model.vision_model",
-                        r"^model(?!\.(language_model|vision_model))": "model.language_model",
+                        "vision_model.": "model.vision_model.",
+                        "model.embed_tokens": "model.language_model.embed_tokens",
+                        "model.layers": "model.language_model.layers",
+                        "model.norm": "model.language_model.norm",
                         "vit_large_projector": "model.vit_large_projector",
                     }
                     self.model = AutoModelForCausalLM.from_pretrained(
@@ -1511,10 +1514,57 @@ class Qwen3VLMBackend:
                 vid_content.append({"type": "text", "text": "Describe this video."})
                 conversation.append({"role": "user", "content": vid_content})
 
-        # Check if this is a GLM model
+        # Check model type for specific handling
         is_glm_model = self.current_model_type == "glm-vl"
+        is_step3_model = self.current_model_type == "step3-vl"
 
-        if is_glm_model:
+        if is_step3_model:
+            # Step3-VL: processor.apply_chat_template handles images internally
+            # Images should be embedded as {"type": "image", "image": <PIL.Image>}
+            step3_conversation = []
+
+            for msg in conversation:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+
+                if isinstance(content, str):
+                    step3_content = [{"type": "text", "text": content}]
+                elif isinstance(content, list):
+                    step3_content = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "image":
+                                img_data = item.get("image")
+                                if img_data:
+                                    if isinstance(img_data, str) and os.path.exists(img_data):
+                                        # Load image from path
+                                        step3_content.append({"type": "image", "image": Image.open(img_data)})
+                                    elif isinstance(img_data, Image.Image):
+                                        step3_content.append({"type": "image", "image": img_data})
+                            elif item.get("type") == "text":
+                                step3_content.append({"type": "text", "text": item.get("text", "")})
+                            elif item.get("type") == "video":
+                                # Step3-VL video support - extract frames as images
+                                vid_path = item.get("video")
+                                if vid_path and os.path.exists(vid_path):
+                                    frames = extract_video_frames(vid_path, max_frames=video_max_frames)
+                                    for frame in frames:
+                                        step3_content.append({"type": "image", "image": frame})
+                else:
+                    step3_content = [{"type": "text", "text": str(content)}]
+
+                step3_conversation.append({"role": role, "content": step3_content})
+
+            # Step3-VL's apply_chat_template - images embedded in content
+            inputs = self.processor.apply_chat_template(
+                step3_conversation,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+
+        elif is_glm_model:
             # GLM processor requires ALL content to be list of dicts with "type" keys
             # Images must be embedded in content as {"type": "image", "image": <PIL>}
             # NOT passed separately (causes "multiple values for keyword argument 'images'")

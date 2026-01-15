@@ -439,10 +439,9 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                         model_type = "glm-vl"
                     else:
                         model_type = "glm"
-                # Detect Step3-VL models
-                elif "step3" in arch or "step3" in model_type_str:
-                    if config.get("vision_config") or "vl" in model_type_str or "vl" in arch:
-                        model_type = "step3-vl"
+                # Detect Step3-VL models (StepVL, step_robotics)
+                elif "stepvl" in arch or "step_robotics" in model_type_str or "step3" in arch or "step3" in model_type_str:
+                    model_type = "step3-vl"
         except Exception:
             pass
 
@@ -938,7 +937,8 @@ class Qwen3VLMBackend:
                         pass
 
                 # For Step3-VL models (uses AutoModelForCausalLM with key_mapping)
-                if not loaded and (model_type_from_config == "step3_vl" or "step3" in str(model_type_from_config).lower()):
+                # config.json uses model_type: "step_robotics" and arch: "StepVLForConditionalGeneration"
+                if not loaded and (model_type_from_config in ["step_robotics", "step3_vl"] or "stepvl" in str(model_type_from_config).lower()):
                     print("Loading as Step3-VL model using AutoModelForCausalLM...")
                     # Step3-VL requires BF16 only
                     if model_kwargs.get("dtype") != torch.bfloat16:

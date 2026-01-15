@@ -892,10 +892,10 @@ class Qwen3VLMBackend:
                 try:
                     import flash_attn
                     attn_impl = "flash_attention_2"
-                    print(f"[Model] Using Flash Attention 2 for faster inference")
-                except ImportError:
-                    print(f"[Model] Flash Attention requested but not installed, falling back to SDPA")
-                    print(f"[Model] Install with: pip install flash-attn --no-build-isolation")
+                    print(f"[Model] Using Flash Attention 2 (v{flash_attn.__version__})")
+                except Exception as e:
+                    print(f"[Model] Flash Attention import failed: {e}")
+                    print(f"[Model] Falling back to SDPA")
             else:
                 print(f"[Model] Using SDPA (enable Flash Attention 2 for 2-3x speedup)")
 

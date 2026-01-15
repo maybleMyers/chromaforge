@@ -940,10 +940,32 @@ class Qwen3VLMBackend:
                 # config.json uses model_type: "step_robotics" and arch: "StepVLForConditionalGeneration"
                 if not loaded and (model_type_from_config in ["step_robotics", "step3_vl"] or "stepvl" in str(model_type_from_config).lower()):
                     print("Loading as Step3-VL model using AutoModelForCausalLM...")
+
+                    # Step3-VL has local custom code files that need to be importable
+                    # Add model path to sys.path and pre-import modules before transformers checks them
+                    import sys
+                    import importlib.util
+                    model_abs_path = os.path.abspath(model_path)
+                    if model_abs_path not in sys.path:
+                        sys.path.insert(0, model_abs_path)
+                        print(f"[Step3-VL] Added {model_abs_path} to sys.path for local imports")
+
+                    # Pre-import local modules to prime Python's import cache
+                    # This prevents transformers check_imports from failing
+                    for module_name in ["configuration_step_vl", "vision_encoder"]:
+                        module_file = os.path.join(model_abs_path, f"{module_name}.py")
+                        if os.path.exists(module_file) and module_name not in sys.modules:
+                            spec = importlib.util.spec_from_file_location(module_name, module_file)
+                            module = importlib.util.module_from_spec(spec)
+                            sys.modules[module_name] = module
+                            spec.loader.exec_module(module)
+                            print(f"[Step3-VL] Pre-imported {module_name}")
+
                     # Step3-VL requires BF16 only
                     if model_kwargs.get("dtype") != torch.bfloat16:
                         print("[Step3-VL] Forcing bfloat16 (required by Step3-VL)")
                         model_kwargs["dtype"] = torch.bfloat16
+
                     # Step3-VL key mapping for weight transformation
                     step3_key_mapping = {
                         "^vision_model": "model.vision_model",

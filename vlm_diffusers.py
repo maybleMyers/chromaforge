@@ -78,6 +78,120 @@ Now, based on the original problem and reference responses above, please provide
 """
 
 
+# Settings file path
+SETTINGS_FILE = "vlm_diffusers_settings.json"
+
+# Default settings values
+DEFAULT_SETTINGS = {
+    # Model Settings
+    "model_name": None,  # Will use first available if None
+    "dtype": "bfloat16",
+    "num_gpus": 1,
+    "max_memory_per_gpu": 0,  # 0 = auto
+    "cpu_offload": False,
+    "cpu_offload_ram": 0,  # 0 = auto
+    "backend": "transformers",
+    "context_len": 8192,
+    # Generation Settings
+    "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
+    "max_new_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 50,
+    "repetition_penalty": 1.1,
+    "video_max_frames": 81,
+    # Batch Caption Settings
+    "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
+    "batch_prompt": "Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
+    # PaCoRe Settings
+    "pacore_mode": "low",
+    "pacore_temperature": 1.0,
+    "pacore_max_tokens": 4096,
+}
+
+
+def save_settings(
+    # Model Settings
+    model_name: str,
+    dtype: str,
+    num_gpus: int,
+    max_memory_per_gpu: int,
+    cpu_offload: bool,
+    cpu_offload_ram: int,
+    backend: str,
+    context_len: int,
+    # Generation Settings
+    system_prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    video_max_frames: int,
+    # Batch Caption Settings
+    batch_system_prompt: str,
+    batch_prompt: str,
+    # PaCoRe Settings
+    pacore_mode: str,
+    pacore_temperature: float,
+    pacore_max_tokens: int,
+) -> str:
+    """Save all settings to a JSON file."""
+    settings = {
+        # Model Settings
+        "model_name": model_name,
+        "dtype": dtype,
+        "num_gpus": num_gpus,
+        "max_memory_per_gpu": max_memory_per_gpu,
+        "cpu_offload": cpu_offload,
+        "cpu_offload_ram": cpu_offload_ram,
+        "backend": backend,
+        "context_len": context_len,
+        # Generation Settings
+        "system_prompt": system_prompt,
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repetition_penalty": repetition_penalty,
+        "video_max_frames": video_max_frames,
+        # Batch Caption Settings
+        "batch_system_prompt": batch_system_prompt,
+        "batch_prompt": batch_prompt,
+        # PaCoRe Settings
+        "pacore_mode": pacore_mode,
+        "pacore_temperature": pacore_temperature,
+        "pacore_max_tokens": pacore_max_tokens,
+    }
+
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        print(f"[vlm_diffusers] Settings saved to {SETTINGS_FILE}")
+        return f"Settings saved to {SETTINGS_FILE}"
+    except Exception as e:
+        print(f"[vlm_diffusers] Error saving settings: {e}")
+        return f"Error saving settings: {e}"
+
+
+def load_settings() -> Dict[str, Any]:
+    """Load settings from JSON file. Returns defaults if file doesn't exist."""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            # Merge with defaults to handle missing keys
+            merged = {**DEFAULT_SETTINGS, **settings}
+            print(f"[vlm_diffusers] Settings loaded from {SETTINGS_FILE}")
+            return merged
+        else:
+            print(f"[vlm_diffusers] No settings file found, using defaults")
+            return DEFAULT_SETTINGS.copy()
+    except Exception as e:
+        print(f"[vlm_diffusers] Error loading settings: {e}, using defaults")
+        return DEFAULT_SETTINGS.copy()
+
+
 # Try to import psutil for memory detection
 try:
     import psutil
@@ -1368,6 +1482,7 @@ class Qwen3VLMBackend:
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 50,
+        repetition_penalty: float = 1.1,
         video_max_frames: int = 8,
     ) -> Tuple[str, Dict[str, Any]]:
         """
@@ -1381,6 +1496,7 @@ class Qwen3VLMBackend:
             temperature: Sampling temperature
             top_p: Top-p sampling
             top_k: Top-k sampling
+            repetition_penalty: Repetition penalty (1.0 = no penalty)
             video_max_frames: Max frames for video processing
 
         Returns:
@@ -1396,25 +1512,25 @@ class Qwen3VLMBackend:
             if self.current_backend == "lmdeploy" and self.lmdeploy_pipe is not None:
                 return self._generate_lmdeploy(
                     messages, images, video_path,
-                    max_new_tokens, temperature, top_p, top_k, video_max_frames
+                    max_new_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
                 )
 
             # Handle InternVL models (use model's built-in chat method)
             if self.current_model_type == "internvl" and self.tokenizer is not None:
                 return self._generate_internvl(
                     messages, images, video_path,
-                    max_new_tokens, temperature, top_p, top_k, video_max_frames
+                    max_new_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
                 )
             # Handle vision-language model (Qwen-VL, GLM-VL, Step3-VL, etc.)
             elif self.current_model_type in ["qwen-vl", "glm-vl", "step3-vl"] and self.processor is not None:
                 return self._generate_vl(
                     messages, images, video_path,
-                    max_new_tokens, temperature, top_p, top_k, video_max_frames
+                    max_new_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
                 )
             # Handle text-only model
             elif self.tokenizer is not None:
                 return self._generate_text(
-                    messages, max_new_tokens, temperature, top_p, top_k
+                    messages, max_new_tokens, temperature, top_p, top_k, repetition_penalty
                 )
             else:
                 return "Error: No processor or tokenizer available", empty_stats
@@ -1433,6 +1549,7 @@ class Qwen3VLMBackend:
         temperature: float,
         top_p: float,
         top_k: int,
+        repetition_penalty: float,
         video_max_frames: int,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate response from vision-language model."""
@@ -1668,15 +1785,33 @@ class Qwen3VLMBackend:
         else:
             inputs = inputs.to(self.model.device)
 
+        # Build generation kwargs
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature if temperature > 0 else None,
+            "top_p": top_p if temperature > 0 else None,
+            "top_k": top_k if temperature > 0 else None,
+            "do_sample": temperature > 0,
+            "repetition_penalty": repetition_penalty,
+        }
+
+        # Add eos_token_id from processor/model config if available
+        if hasattr(self.processor, "tokenizer") and hasattr(self.processor.tokenizer, "eos_token_id"):
+            gen_kwargs["eos_token_id"] = self.processor.tokenizer.eos_token_id
+        elif hasattr(self.model.config, "eos_token_id"):
+            gen_kwargs["eos_token_id"] = self.model.config.eos_token_id
+
+        # Add pad_token_id to avoid warnings
+        if hasattr(self.processor, "tokenizer") and hasattr(self.processor.tokenizer, "pad_token_id"):
+            gen_kwargs["pad_token_id"] = self.processor.tokenizer.pad_token_id
+        elif hasattr(self.model.config, "pad_token_id"):
+            gen_kwargs["pad_token_id"] = self.model.config.pad_token_id
+
         # Generate
         with torch.inference_mode():
             generated_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature if temperature > 0 else None,
-                top_p=top_p if temperature > 0 else None,
-                top_k=top_k if temperature > 0 else None,
-                do_sample=temperature > 0,
+                **gen_kwargs,
             )
 
         # Decode output, removing input tokens
@@ -1711,6 +1846,7 @@ class Qwen3VLMBackend:
         temperature: float,
         top_p: float,
         top_k: int,
+        repetition_penalty: float = 1.1,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate response from text-only model."""
         start_time = time.perf_counter()
@@ -1758,6 +1894,7 @@ class Qwen3VLMBackend:
                 top_p=top_p if temperature > 0 else None,
                 top_k=top_k if temperature > 0 else None,
                 do_sample=temperature > 0,
+                repetition_penalty=repetition_penalty,
             )
 
         # Decode output
@@ -1790,6 +1927,7 @@ class Qwen3VLMBackend:
         temperature: float,
         top_p: float,
         top_k: int,
+        repetition_penalty: float,
         video_max_frames: int,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate response using lmdeploy pipeline."""
@@ -1926,6 +2064,7 @@ class Qwen3VLMBackend:
         temperature: float,
         top_p: float,
         top_k: int,
+        repetition_penalty: float,
         video_max_frames: int,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate response from InternVL model using its built-in chat() method."""
@@ -2015,6 +2154,7 @@ class Qwen3VLMBackend:
         generation_config = {
             "max_new_tokens": max_new_tokens,
             "do_sample": temperature > 0,
+            "repetition_penalty": repetition_penalty,
         }
         if temperature > 0:
             generation_config["temperature"] = temperature
@@ -2447,6 +2587,7 @@ def chat_handler(
     temperature: float,
     top_p: float,
     top_k: int,
+    repetition_penalty: float,
     video_max_frames: int,
 ):
     """Handle chat messages from UI."""
@@ -2506,6 +2647,7 @@ def chat_handler(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
         video_max_frames=video_max_frames,
     )
 
@@ -2657,6 +2799,9 @@ def pacore_handler(
 
 def create_ui():
     """Create the Gradio interface."""
+    # Load saved settings
+    saved_settings = load_settings()
+
     # Theme
     vlm_theme = themes.Default(
         primary_hue=colors.Color(
@@ -2776,13 +2921,13 @@ def create_ui():
                 batch_system_prompt = gr.Textbox(
                     label="System Prompt",
                     lines=3,
-                    value="You are an image captioning assistant. Provide detailed, accurate descriptions.",
+                    value=saved_settings.get("batch_system_prompt", DEFAULT_SETTINGS["batch_system_prompt"]),
                 )
 
                 batch_prompt = gr.Textbox(
                     label="Caption Prompt",
                     lines=2,
-                    value="Describe this image in detail.",
+                    value=saved_settings.get("batch_prompt", DEFAULT_SETTINGS["batch_prompt"]),
                 )
 
                 batch_start_btn = gr.Button(
@@ -2816,13 +2961,13 @@ def create_ui():
                     pacore_mode = gr.Dropdown(
                         label="Mode",
                         choices=["low", "medium", "high"],
-                        value="low",
+                        value=saved_settings.get("pacore_mode", DEFAULT_SETTINGS["pacore_mode"]),
                         info="Higher modes = more responses, better synthesis, longer time",
                     )
                     pacore_temp = gr.Slider(
                         minimum=0.1,
                         maximum=2.0,
-                        value=1.0,
+                        value=saved_settings.get("pacore_temperature", DEFAULT_SETTINGS["pacore_temperature"]),
                         step=0.1,
                         label="Temperature",
                         info="Higher = more diverse responses",
@@ -2830,7 +2975,7 @@ def create_ui():
                     pacore_max_tokens = gr.Slider(
                         minimum=256,
                         maximum=8192,
-                        value=2048,
+                        value=saved_settings.get("pacore_max_tokens", DEFAULT_SETTINGS["pacore_max_tokens"]),
                         step=256,
                         label="Max Tokens per Response",
                     )
@@ -2976,7 +3121,7 @@ def create_ui():
                     label="System Prompt",
                     placeholder="Enter a system prompt...",
                     lines=2,
-                    value="You are a helpful AI assistant that can understand and describe images and videos in detail.",
+                    value=saved_settings.get("system_prompt", DEFAULT_SETTINGS["system_prompt"]),
                     scale=3,
                 )
 
@@ -2984,37 +3129,53 @@ def create_ui():
                 max_tokens = gr.Slider(
                     minimum=64,
                     maximum=4096,
-                    value=512,
+                    value=saved_settings.get("max_new_tokens", DEFAULT_SETTINGS["max_new_tokens"]),
                     step=64,
                     label="Max New Tokens",
                 )
                 temperature = gr.Slider(
                     minimum=0.0,
                     maximum=2.0,
-                    value=0.7,
+                    value=saved_settings.get("temperature", DEFAULT_SETTINGS["temperature"]),
                     step=0.1,
                     label="Temperature",
                 )
                 top_p = gr.Slider(
                     minimum=0.0,
                     maximum=1.0,
-                    value=0.9,
+                    value=saved_settings.get("top_p", DEFAULT_SETTINGS["top_p"]),
                     step=0.05,
                     label="Top-P",
                 )
                 top_k = gr.Slider(
                     minimum=1,
                     maximum=100,
-                    value=50,
+                    value=saved_settings.get("top_k", DEFAULT_SETTINGS["top_k"]),
                     step=1,
                     label="Top-K",
+                )
+                repetition_penalty = gr.Slider(
+                    minimum=1.0,
+                    maximum=2.0,
+                    value=saved_settings.get("repetition_penalty", DEFAULT_SETTINGS["repetition_penalty"]),
+                    step=0.05,
+                    label="Repetition Penalty",
                 )
                 video_max_frames = gr.Slider(
                     minimum=1,
                     maximum=251,
-                    value=81,
+                    value=saved_settings.get("video_max_frames", DEFAULT_SETTINGS["video_max_frames"]),
                     step=1,
                     label="Max Video Frames",
+                )
+
+            with gr.Row():
+                save_settings_btn = gr.Button("Save Settings", variant="secondary")
+                settings_status = gr.Textbox(
+                    label="Settings Status",
+                    value="",
+                    interactive=False,
+                    scale=3,
                 )
 
         # Event handlers
@@ -3034,13 +3195,13 @@ def create_ui():
             outputs=[model_status],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, tp, tk, vid_frames):
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, tp, tk, rep_pen, vid_frames):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
                 return history, "", None, None, None, None, None, "Tokens: 0 | Time: 0.00s | Speed: 0.00 tok/s"
 
             new_history, _, stats_str = chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid,
-                max_tok, temp, tp, tk, vid_frames
+                max_tok, temp, tp, tk, rep_pen, vid_frames
             )
             return new_history, "", None, None, None, None, None, stats_str
 
@@ -3049,7 +3210,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4, video_input,
-                max_tokens, temperature, top_p, top_k, video_max_frames
+                max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display],
         )
@@ -3076,6 +3237,23 @@ def create_ui():
                 pacore_image, pacore_prompt, pacore_system
             ],
             outputs=[pacore_output, pacore_stats, pacore_rounds],
+        )
+
+        # Save settings event handler
+        save_settings_btn.click(
+            fn=save_settings,
+            inputs=[
+                # Model Settings
+                model_dropdown, dtype_dropdown, num_gpus_slider, max_memory_slider,
+                cpu_offload_checkbox, cpu_ram_slider, backend_dropdown, context_len_slider,
+                # Generation Settings
+                system_prompt, max_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames,
+                # Batch Caption Settings
+                batch_system_prompt, batch_prompt,
+                # PaCoRe Settings
+                pacore_mode, pacore_temp, pacore_max_tokens,
+            ],
+            outputs=[settings_status],
         )
 
     return demo

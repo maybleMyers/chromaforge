@@ -10,7 +10,7 @@ import huggingface_guess
 
 def patch_zimage_for_fp16(model):
     import torch.nn.functional as F
-    from diffusers.models.transformers.transformer_z_image import FeedForward, ZImageTransformerBlock
+    from diffusers.models.transformers.transformer_z_image import FeedForward, ZImageTransformerBlock, TimestepEmbedder
 
     def clamp_fp16(x):
         if x.dtype == torch.float16:
@@ -23,6 +23,26 @@ def patch_zimage_for_fp16(model):
     for module in model.modules():
         if isinstance(module, FeedForward):
             module._forward_silu_gating = patched_forward_silu_gating.__get__(module, FeedForward)
+
+    # Patch TimestepEmbedder to handle FP8 weights properly
+    # The original code converts input to weight_dtype, which breaks FP8 since
+    # torch.nn.functional.linear doesn't support FP8 directly
+    def patched_timestep_embedder_forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        weight_dtype = self.mlp[0].weight.dtype
+        # Skip conversion to FP8 - let the manual cast in forge operations handle it
+        if weight_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            compute_dtype = getattr(self.mlp[0], "compute_dtype", None)
+            if weight_dtype.is_floating_point:
+                t_freq = t_freq.to(weight_dtype)
+            elif compute_dtype is not None:
+                t_freq = t_freq.to(compute_dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+    for module in model.modules():
+        if isinstance(module, TimestepEmbedder):
+            module.forward = patched_timestep_embedder_forward.__get__(module, TimestepEmbedder)
 
     original_block_forward = ZImageTransformerBlock.forward
 
@@ -105,6 +125,20 @@ def patch_zimage_for_fp16(model):
         if isinstance(module, ZImageTransformerBlock):
             module.forward = patched_block_forward.__get__(module, ZImageTransformerBlock)
 
+    # Convert FP8 normalization weights to bfloat16
+    # RMSNorm and other custom norm layers aren't patched by forge operations,
+    # so their FP8 weights cause "Promotion for Float8 Types is not supported" errors
+    from diffusers.models.normalization import RMSNorm
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    converted_count = 0
+    for module in model.modules():
+        if isinstance(module, RMSNorm):
+            if hasattr(module, 'weight') and module.weight is not None and module.weight.dtype in fp8_dtypes:
+                module.weight.data = module.weight.data.to(torch.bfloat16)
+                converted_count += 1
+    if converted_count > 0:
+        print(f"[Z-Image FP8] Converted {converted_count} RMSNorm weights from FP8 to bfloat16")
+
 
 def convert_comfy_zimage_state_dict(state_dict):
     """
@@ -118,6 +152,13 @@ def convert_comfy_zimage_state_dict(state_dict):
     - q_norm/k_norm -> norm_q/norm_k
     - out.weight -> to_out.0.weight
     """
+    # Strip 'model.diffusion_model.' prefix if present (common in FP8 checkpoints)
+    prefix = 'model.diffusion_model.'
+    has_prefix = any(k.startswith(prefix) for k in state_dict.keys())
+    if has_prefix:
+        state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v
+                      for k, v in state_dict.items()}
+
     # Detect ComfyUI format
     if 'x_embedder.weight' not in state_dict or 'all_x_embedder.2-1.weight' in state_dict:
         return state_dict  # Already in diffusers format or unknown format
@@ -241,6 +282,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                             'bfloat16': torch.bfloat16,
                             'float16': torch.float16,
                             'float32': torch.float32,
+                            'float8_e4m3fn': torch.float8_e4m3fn,
+                            'float8_e5m2': torch.float8_e5m2,
                         }
                         if z_vae_dtype in dtype_map:
                             vae_dtype = dtype_map[z_vae_dtype]
@@ -330,6 +373,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                             'bfloat16': torch.bfloat16,
                             'float16': torch.float16,
                             'float32': torch.float32,
+                            'float8_e4m3fn': torch.float8_e4m3fn,
+                            'float8_e5m2': torch.float8_e5m2,
                         }
                         if z_text_encoder_dtype in dtype_map:
                             text_encoder_dtype = dtype_map[z_text_encoder_dtype]
@@ -454,6 +499,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                             'bfloat16': torch.bfloat16,
                             'float16': torch.float16,
                             'float32': torch.float32,
+                            'float8_e4m3fn': torch.float8_e4m3fn,
+                            'float8_e5m2': torch.float8_e5m2,
                         }
                         if z_transformer_dtype in dtype_map:
                             storage_dtype = dtype_map[z_transformer_dtype]
@@ -465,11 +512,13 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             computation_dtype = memory_management.get_computation_dtype(load_device, parameters=state_dict_parameters, supported_dtypes=guess.supported_inference_dtypes)
 
             # For Z-Image, if user specified a precision, also use it for computation
+            # Note: FP8 is storage-only, computation stays in bfloat16
             if cls_name == 'ZImageTransformer2DModel':
                 try:
                     from modules import shared
                     z_transformer_dtype = getattr(shared.opts, 'z_transformer_dtype', 'Automatic')
                     if z_transformer_dtype != 'Automatic':
+                        # FP8 types are storage-only, computation uses bfloat16
                         dtype_map = {
                             'bfloat16': torch.bfloat16,
                             'float16': torch.float16,

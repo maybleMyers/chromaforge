@@ -48,7 +48,7 @@ forge_unet_storage_dtype_options = {
 }
 
 # Z-Image precision options
-z_precision_options = ['Automatic', 'bfloat16', 'float16', 'float32']
+z_precision_options = ['Automatic', 'bfloat16', 'float16', 'float32', 'float8_e4m3fn', 'float8_e5m2']
 
 module_list = {}
 

@@ -169,12 +169,16 @@ class ZImage(ForgeDiffusionEngine):
                 timestep = 1.0 - timestep
                 timestep = torch.clamp(timestep, min=1e-6, max=1.0)
 
-                # Ensure pad tokens are on the same device as input
+                # Ensure pad tokens are on the same device and dtype as input
+                # FP8 models store pad tokens in FP8 but they need to match input dtype
                 target_device = x[0].device
-                if hasattr(self.transformer, 'x_pad_token') and self.transformer.x_pad_token.device != target_device:
-                    self.transformer.x_pad_token.data = self.transformer.x_pad_token.data.to(target_device)
-                if hasattr(self.transformer, 'cap_pad_token') and self.transformer.cap_pad_token.device != target_device:
-                    self.transformer.cap_pad_token.data = self.transformer.cap_pad_token.data.to(target_device)
+                target_dtype = x[0].dtype
+                if hasattr(self.transformer, 'x_pad_token'):
+                    if self.transformer.x_pad_token.device != target_device or self.transformer.x_pad_token.dtype != target_dtype:
+                        self.transformer.x_pad_token.data = self.transformer.x_pad_token.data.to(device=target_device, dtype=target_dtype)
+                if hasattr(self.transformer, 'cap_pad_token'):
+                    if self.transformer.cap_pad_token.device != target_device or self.transformer.cap_pad_token.dtype != target_dtype:
+                        self.transformer.cap_pad_token.data = self.transformer.cap_pad_token.data.to(device=target_device, dtype=target_dtype)
 
                 # Call transformer
                 result = self.transformer(x=x, t=timestep, cap_feats=context, patch_size=2, f_patch_size=1)

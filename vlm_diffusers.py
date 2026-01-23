@@ -1110,18 +1110,12 @@ class Qwen3VLMBackend:
                         print("[Step3-VL] Forcing bfloat16 (required by Step3-VL)")
                         model_kwargs["dtype"] = torch.bfloat16
 
-                    # Step3-VL key mapping for weight transformation
-                    # Uses simple string prefixes (transformers 5.0+ compiles all patterns together)
-                    step3_key_mapping = {
-                        "vision_model.": "model.vision_model.",
-                        "model.embed_tokens": "model.language_model.embed_tokens",
-                        "model.layers": "model.language_model.layers",
-                        "model.norm": "model.language_model.norm",
-                        "vit_large_projector": "model.vit_large_projector",
-                    }
+                    # Step3-VL checkpoints already have the correct key format:
+                    # model.language_model.*, model.vision_model.*, model.vit_large_projector.*
+                    # No key_mapping needed - the model's _checkpoint_conversion_mapping handles
+                    # any legacy checkpoint formats that use different key names.
                     self.model = AutoModelForCausalLM.from_pretrained(
                         **model_kwargs,
-                        key_mapping=step3_key_mapping,
                     )
                     # Load processor for Step3-VL
                     self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)

@@ -1001,6 +1001,17 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
     # Detect ChromaDCT models FIRST by checking for DCT-specific layers
     if "transformer" in state_dicts and any(key.startswith("img_in_patch.") or key.startswith("nerf_blocks.") for key in state_dicts["transformer"]):
         estimated_config.huggingface_repo = "ChromaDCT"
+
+        # Detect patch_size from img_in_patch.weight shape [out_ch, in_ch, kernel_h, kernel_w]
+        img_in_patch_key = "img_in_patch.weight"
+        if img_in_patch_key in state_dicts["transformer"]:
+            weight_shape = state_dicts["transformer"][img_in_patch_key].shape
+            detected_patch_size = weight_shape[2]  # kernel_h == patch_size
+            print(f"[ChromaDCT] Detected patch_size={detected_patch_size} from weights (shape {weight_shape})")
+        else:
+            detected_patch_size = 32  # Default for new Chroma Radiance models
+            print(f"[ChromaDCT] Using default patch_size={detected_patch_size}")
+
         # Configure DCT-specific parameters
         estimated_config.unet_config.update({
             'in_channels': 3,
@@ -1010,14 +1021,14 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
             'num_heads': 24,
             'depth': 19,
             'depth_single_blocks': 38,
-            'axes_dim': [16, 56, 56],
+            'axes_dim': [16, 56, 56],  # RoPE dimensions - fixed for all patch sizes
             'theta': 10000,
             'qkv_bias': True,
             'guidance_embed': True,
             'approximator_in_dim': 64,
             'approximator_depth': 5,
             'approximator_hidden_size': 5120,
-            'patch_size': 16,
+            'patch_size': detected_patch_size,
             'nerf_hidden_size': 64,
             'nerf_mlp_ratio': 4,
             'nerf_depth': 4,

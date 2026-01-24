@@ -58,14 +58,14 @@ chroma_params = ChromaParams(
     num_heads=24,
     depth=19,
     depth_single_blocks=38,
-    axes_dim=[16, 56, 56],
+    axes_dim=[16, 56, 56],  # RoPE dimensions - same for all patch sizes
     theta=10_000,
     qkv_bias=True,
     guidance_embed=True,
     approximator_in_dim=64,
     approximator_depth=5,
     approximator_hidden_size=5120,
-    patch_size=16,
+    patch_size=32,  # Default for new Chroma Radiance DCT models
     nerf_hidden_size=64,
     nerf_mlp_ratio=4,
     nerf_depth=4,
@@ -234,6 +234,11 @@ class Chroma(nn.Module):
         if params.use_x0:
             print("[ChromaDCT] Model is using x0 prediction mode")
             self.register_buffer("__x0__", torch.tensor([]))
+
+        # Register patch size marker buffer for state dict compatibility
+        patch_marker = f"__{params.patch_size}x{params.patch_size}__"
+        print(f"[ChromaDCT] Registering patch size marker: {patch_marker}")
+        self.register_buffer(patch_marker, torch.tensor([]))
 
     def _apply_x0_residual(self, predicted, noisy, timesteps):
         """
@@ -493,16 +498,16 @@ class IntegratedChromaDCTTransformer2DModel(Chroma):
     """
 
     def __init__(self, **config):
-        # Use default ChromaDCT params (defined at the top of this file)
-        # The config passed from Flux config doesn't have the right parameters
-        # but we extract use_x0 from config if available
+        # Extract configuration values, using defaults from chroma_params
         use_x0 = config.get('use_x0', False)
-        print(f"[ChromaDCT Model] __init__ called with use_x0={use_x0}")
-        print(f"[ChromaDCT Model] Config keys: {list(config.keys())}")
-        if 'use_x0' in config:
-            print(f"[ChromaDCT Model] use_x0 value from config: {config['use_x0']}")
+        patch_size = config.get('patch_size', chroma_params.patch_size)
+        # axes_dim is fixed at [16, 56, 56] for all ChromaDCT models (RoPE dimensions)
+        axes_dim = config.get('axes_dim', chroma_params.axes_dim)
 
-        # Create params with x0 mode setting from config
+        print(f"[ChromaDCT Model] __init__ called with patch_size={patch_size}, axes_dim={axes_dim}, use_x0={use_x0}")
+        print(f"[ChromaDCT Model] Config keys: {list(config.keys())}")
+
+        # Create params with values from config
         params = ChromaParams(
             in_channels=chroma_params.in_channels,
             context_in_dim=chroma_params.context_in_dim,
@@ -511,14 +516,14 @@ class IntegratedChromaDCTTransformer2DModel(Chroma):
             num_heads=chroma_params.num_heads,
             depth=chroma_params.depth,
             depth_single_blocks=chroma_params.depth_single_blocks,
-            axes_dim=chroma_params.axes_dim,
+            axes_dim=axes_dim,  # Use from config or calculated
             theta=chroma_params.theta,
             qkv_bias=chroma_params.qkv_bias,
             guidance_embed=chroma_params.guidance_embed,
             approximator_in_dim=chroma_params.approximator_in_dim,
             approximator_depth=chroma_params.approximator_depth,
             approximator_hidden_size=chroma_params.approximator_hidden_size,
-            patch_size=chroma_params.patch_size,
+            patch_size=patch_size,  # Use from config
             nerf_hidden_size=chroma_params.nerf_hidden_size,
             nerf_mlp_ratio=chroma_params.nerf_mlp_ratio,
             nerf_depth=chroma_params.nerf_depth,

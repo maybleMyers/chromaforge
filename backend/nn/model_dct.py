@@ -50,13 +50,6 @@ class ChromaParams:
     use_x0: bool = False  # x0 prediction mode for newer Chroma Radiance models
 
 
-def calculate_axes_dim_for_patch_size(patch_size: int, pe_dim: int = 128) -> list[int]:
-    """Calculate axes_dim based on patch_size. Sum must equal pe_dim (128)."""
-    remaining = pe_dim - patch_size
-    hw_dim = remaining // 2
-    return [patch_size, hw_dim, hw_dim]
-
-
 chroma_params = ChromaParams(
     in_channels=3,
     context_in_dim=4096,
@@ -65,7 +58,7 @@ chroma_params = ChromaParams(
     num_heads=24,
     depth=19,
     depth_single_blocks=38,
-    axes_dim=[32, 48, 48],  # Default for new Chroma Radiance DCT models
+    axes_dim=[16, 56, 56],  # RoPE dimensions - same for all patch sizes
     theta=10_000,
     qkv_bias=True,
     guidance_embed=True,
@@ -241,6 +234,11 @@ class Chroma(nn.Module):
         if params.use_x0:
             print("[ChromaDCT] Model is using x0 prediction mode")
             self.register_buffer("__x0__", torch.tensor([]))
+
+        # Register patch size marker buffer for state dict compatibility
+        patch_marker = f"__{params.patch_size}x{params.patch_size}__"
+        print(f"[ChromaDCT] Registering patch size marker: {patch_marker}")
+        self.register_buffer(patch_marker, torch.tensor([]))
 
     def _apply_x0_residual(self, predicted, noisy, timesteps):
         """
@@ -503,9 +501,8 @@ class IntegratedChromaDCTTransformer2DModel(Chroma):
         # Extract configuration values, using defaults from chroma_params
         use_x0 = config.get('use_x0', False)
         patch_size = config.get('patch_size', chroma_params.patch_size)
-        axes_dim = config.get('axes_dim', None)
-        if axes_dim is None:
-            axes_dim = calculate_axes_dim_for_patch_size(patch_size)
+        # axes_dim is fixed at [16, 56, 56] for all ChromaDCT models (RoPE dimensions)
+        axes_dim = config.get('axes_dim', chroma_params.axes_dim)
 
         print(f"[ChromaDCT Model] __init__ called with patch_size={patch_size}, axes_dim={axes_dim}, use_x0={use_x0}")
         print(f"[ChromaDCT Model] Config keys: {list(config.keys())}")

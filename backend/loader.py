@@ -1012,13 +1012,6 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
             detected_patch_size = 32  # Default for new Chroma Radiance models
             print(f"[ChromaDCT] Using default patch_size={detected_patch_size}")
 
-        # Calculate axes_dim: [patch_size, hw_dim, hw_dim] where sum = 128 (pe_dim)
-        pe_dim = 128  # hidden_size (3072) / num_heads (24)
-        remaining = pe_dim - detected_patch_size
-        hw_dim = remaining // 2
-        detected_axes_dim = [detected_patch_size, hw_dim, hw_dim]
-        print(f"[ChromaDCT] Calculated axes_dim={detected_axes_dim}")
-
         # Configure DCT-specific parameters
         estimated_config.unet_config.update({
             'in_channels': 3,
@@ -1028,7 +1021,7 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
             'num_heads': 24,
             'depth': 19,
             'depth_single_blocks': 38,
-            'axes_dim': detected_axes_dim,
+            'axes_dim': [16, 56, 56],  # RoPE dimensions - fixed for all patch sizes
             'theta': 10000,
             'qkv_bias': True,
             'guidance_embed': True,

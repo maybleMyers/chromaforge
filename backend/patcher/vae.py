@@ -106,7 +106,12 @@ class VAE:
         steps += samples.shape[0] * get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += samples.shape[0] * get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
 
-        decode_fn = lambda a: (self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)) + 1.0).float()
+        def decode_fn(a):
+            decoded = self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device))
+            # Handle DecoderOutput from diffusers VAE models (e.g., AutoencoderKLFlux2)
+            if hasattr(decoded, 'sample'):
+                decoded = decoded.sample
+            return (decoded + 1.0).float()
         output = torch.clamp(((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.downscale_ratio, output_device=self.output_device) +
                                tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.downscale_ratio, output_device=self.output_device) +
                                tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.downscale_ratio, output_device=self.output_device))
@@ -118,7 +123,16 @@ class VAE:
         steps += pixel_samples.shape[0] * get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += pixel_samples.shape[0] * get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x * 2, tile_y // 2, overlap)
 
-        encode_fn = lambda a: self.first_stage_model.encode((2. * a - 1.).to(self.vae_dtype).to(self.device)).float()
+        def encode_fn(a):
+            encoded = self.first_stage_model.encode((2. * a - 1.).to(self.vae_dtype).to(self.device))
+            # Handle EncoderOutput from diffusers VAE models
+            if hasattr(encoded, 'latent_dist'):
+                encoded = encoded.latent_dist.mode()
+            elif hasattr(encoded, 'latents'):
+                encoded = encoded.latents
+            elif isinstance(encoded, tuple):
+                encoded = encoded[0]  # Some VAEs return (latent, other_info)
+            return encoded.float()
         samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
         samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
         samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
@@ -139,7 +153,11 @@ class VAE:
             pixel_samples = torch.empty((samples_in.shape[0], 3, round(samples_in.shape[2] * self.downscale_ratio), round(samples_in.shape[3] * self.downscale_ratio)), device=self.output_device)
             for x in range(0, samples_in.shape[0], batch_number):
                 samples = samples_in[x:x + batch_number].to(self.vae_dtype).to(self.device)
-                pixel_samples[x:x + batch_number] = torch.clamp((self.first_stage_model.decode(samples).to(self.output_device).float() + 1.0) / 2.0, min=0.0, max=1.0)
+                decoded = self.first_stage_model.decode(samples)
+                # Handle DecoderOutput from diffusers VAE models (e.g., AutoencoderKLFlux2)
+                if hasattr(decoded, 'sample'):
+                    decoded = decoded.sample
+                pixel_samples[x:x + batch_number] = torch.clamp((decoded.to(self.output_device).float() + 1.0) / 2.0, min=0.0, max=1.0)
         except memory_management.OOM_EXCEPTION as e:
             print("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
             pixel_samples = self.decode_tiled_(samples_in)
@@ -175,7 +193,24 @@ class VAE:
             samples = torch.empty((pixel_samples.shape[0], self.latent_channels, round(pixel_samples.shape[2] // self.downscale_ratio), round(pixel_samples.shape[3] // self.downscale_ratio)), device=self.output_device)
             for x in range(0, pixel_samples.shape[0], batch_number):
                 pixels_in = (2. * pixel_samples[x:x + batch_number] - 1.).to(self.vae_dtype).to(self.device)
-                samples[x:x + batch_number] = self.first_stage_model.encode(pixels_in, regulation).to(self.output_device).float()
+                # Try encode with regulation first (for custom VAEs), fall back to without
+                try:
+                    import inspect
+                    sig = inspect.signature(self.first_stage_model.encode)
+                    if len(sig.parameters) > 1 and regulation is not None:
+                        encoded = self.first_stage_model.encode(pixels_in, regulation)
+                    else:
+                        encoded = self.first_stage_model.encode(pixels_in)
+                except (TypeError, ValueError):
+                    encoded = self.first_stage_model.encode(pixels_in)
+                # Handle EncoderOutput from diffusers VAE models
+                if hasattr(encoded, 'latent_dist'):
+                    encoded = encoded.latent_dist.mode()
+                elif hasattr(encoded, 'latents'):
+                    encoded = encoded.latents
+                elif isinstance(encoded, tuple):
+                    encoded = encoded[0]  # Some VAEs return (latent, other_info)
+                samples[x:x + batch_number] = encoded.to(self.output_device).float()
 
         except memory_management.OOM_EXCEPTION as e:
             print("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")

@@ -36,6 +36,7 @@ ARCH_SDXL = 'sdxl'
 ARCH_SDXL_REFINER = 'sdxl_refiner'
 ARCH_SD3 = 'sd3'
 ARCH_FLUX = 'flux'
+ARCH_FLUX2 = 'flux2'
 ARCH_CHROMA = 'chroma'
 ARCH_ZIMAGE = 'zimage'
 ARCH_UNKNOWN = 'unknown'
@@ -67,6 +68,11 @@ def detect_architecture_from_keys(keys):
         has_flux_structure = any('double_blocks' in k for k in keys_set)
         if not has_flux_structure:
             return ARCH_CHROMA
+
+    # FLUX.2 detection - MUST come before FLUX.1
+    # FLUX.2 has shared modulation (double_stream_modulation_*)
+    if any('double_stream_modulation_img' in k for k in keys_set):
+        return ARCH_FLUX2
 
     # FLUX detection - has double_blocks with img_attn.norm.key_norm structure
     flux_test = "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale"

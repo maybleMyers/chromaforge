@@ -241,10 +241,11 @@ from backend.diffusion_engine.sd35 import StableDiffusion3
 from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.chroma import Chroma
 from backend.diffusion_engine.chroma_dct import ChromaDCT
+from backend.diffusion_engine.chroma2 import Chroma2Klein
 from backend.diffusion_engine.zimage import ZImage
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, ZImage, Flux]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, ChromaDCT, Chroma2Klein, ZImage, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -297,6 +298,21 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if 'decoder.up_blocks.0.resnets.0.norm1.weight' in state_dict.keys(): #diffusers format
                 state_dict = huggingface_guess.diffusers_convert.convert_vae_state_dict(state_dict)
             load_state_dict(model, state_dict, ignore_start='loss.')
+            return model
+        if cls_name == 'AutoencoderKLFlux2':
+            # FLUX.2 VAE with batch normalization
+            from diffusers import AutoencoderKLFlux2
+
+            vae_dtype = memory_management.vae_dtype()
+            config = AutoencoderKLFlux2.load_config(config_path)
+
+            with using_forge_operations(device=memory_management.cpu, dtype=vae_dtype):
+                model = AutoencoderKLFlux2.from_config(config)
+
+            if state_dict is not None and len(state_dict) > 16:
+                # Filter out keys that don't match the model
+                filtered_sd = {k: v for k, v in state_dict.items() if not k.startswith(('quant_conv', 'post_quant_conv')) or k in model.state_dict()}
+                load_state_dict(model, filtered_sd, ignore_start='loss.')
             return model
         if component_name.startswith('text_encoder') and cls_name in ['CLIPTextModel', 'CLIPTextModelWithProjection']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have CLIP state dict!'
@@ -444,7 +460,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             load_state_dict(model, state_dict, log_name=cls_name)
             return model
-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'ZImageTransformer2DModel']:
+        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'ChromaDCTTransformer2DModel', 'Chroma2Transformer2DModel', 'Flux2Transformer2DModel', 'ZImageTransformer2DModel']:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
 
             model_loader = None
@@ -456,6 +472,17 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             elif cls_name == 'ChromaTransformer2DModel':
                 from backend.nn.chroma import IntegratedChromaTransformer2DModel
                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
+            elif cls_name == 'Chroma2Transformer2DModel' or cls_name == 'Flux2Transformer2DModel':
+                from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
+                flux2_valid_keys = ['patch_size', 'in_channels', 'out_channels', 'num_layers', 'num_single_layers',
+                                    'attention_head_dim', 'num_attention_heads', 'joint_attention_dim',
+                                    'timestep_guidance_channels', 'mlp_ratio', 'axes_dims_rope', 'rope_theta', 'eps']
+                def flux2_loader(c):
+                    filtered_config = {k: v for k, v in c.items() if k in flux2_valid_keys}
+                    print(f"[Flux2] Creating model with config: {filtered_config}")
+                    model = Flux2Transformer2DModel(**filtered_config)
+                    return model
+                model_loader = flux2_loader
             elif cls_name == 'ChromaDCTTransformer2DModel':
                 from backend.nn.model_dct import IntegratedChromaDCTTransformer2DModel
                 def chromadct_loader(c):
@@ -847,6 +874,13 @@ def replace_state_dict(sd, asd, guess):
         for k, v in asd.items():
             sd[f"{text_encoder_key_prefix}t5xxl.transformer.{k}"] = v
 
+    if 'model.layers.0.self_attn.q_proj.weight' in asd or 'layers.0.self_attn.q_proj.weight' in asd:
+        keys_to_delete = [k for k in sd if k.startswith(f"{text_encoder_key_prefix}qwen.")]
+        for k in keys_to_delete:
+            del sd[k]
+        for k, v in asd.items():
+            sd[f"{text_encoder_key_prefix}qwen.{k}"] = v
+
     return sd
 
 
@@ -986,6 +1020,89 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
         print("DEBUG: Loaded Z-Image components:", list(huggingface_components.keys()))
         return ZImage(components_dict=huggingface_components, estimated_config=estimated_config)
 
+    if preset == 'chroma2':
+        print("DEBUG: Loading Chroma2 model from preset")
+        state_dicts = {}
+
+        transformer_sd = load_torch_file(sd)
+
+        from diffusers.loaders.single_file_utils import convert_flux2_transformer_checkpoint_to_diffusers
+        print("DEBUG: Converting Forge-format state dict to Diffusers format")
+        converted_sd = convert_flux2_transformer_checkpoint_to_diffusers(transformer_sd.copy())
+
+        # For distilled models, add zero guidance embedder weights if missing
+        has_guidance = any('guidance_embedder' in k for k in converted_sd.keys())
+        if not has_guidance:
+            print("DEBUG: Distilled model - adding zero guidance embedder weights")
+            inner_dim = 24 * 128  # num_heads * head_dim = 3072
+            in_ch = 256
+            # Use same dtype as other weights
+            sample_weight = next(iter(converted_sd.values()))
+            weight_dtype = sample_weight.dtype
+            converted_sd['time_guidance_embed.guidance_embedder.linear_1.weight'] = torch.zeros(inner_dim, in_ch, dtype=weight_dtype)
+            converted_sd['time_guidance_embed.guidance_embedder.linear_2.weight'] = torch.zeros(inner_dim, inner_dim, dtype=weight_dtype)
+
+        state_dicts['transformer'] = converted_sd
+
+        if additional_state_dicts:
+            for module_path in additional_state_dicts:
+                module_sd = load_torch_file(module_path)
+                if 'decoder.conv_in.weight' in module_sd or 'decoder.up_blocks.0.resnets.0.conv1.weight' in module_sd:
+                    state_dicts['vae'] = module_sd
+                elif 'model.embed_tokens.weight' in module_sd or 'embed_tokens.weight' in module_sd or 'model.layers.0.self_attn.q_proj.weight' in module_sd:
+                    state_dicts['text_encoder'] = module_sd
+
+        local_path = os.path.join(dir_path, 'huggingface', 'Chroma2Klein')
+        config = {
+            "_class_name": "Flux2Pipeline",
+            "_diffusers_version": "0.36.0",
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            "text_encoder": ["transformers", "Qwen3Model"],
+            "tokenizer": ["transformers", "Qwen2TokenizerFast"],
+            "transformer": ["diffusers", "Flux2Transformer2DModel"],
+            "vae": ["diffusers", "AutoencoderKLFlux2"]
+        }
+
+        class Chroma2Config:
+            def __init__(self):
+                self.huggingface_repo = "Chroma2Klein"
+                self.unet_config = {
+                    "image_model": "flux2",
+                    "guidance_embed": False,
+                    "num_layers": 5,
+                    "num_single_layers": 20,
+                    "num_attention_heads": 24,
+                    "attention_head_dim": 128,
+                    "joint_attention_dim": 7680,
+                    "in_channels": 128,
+                }
+                self.supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
+
+            def inpaint_model(self):
+                return False
+
+        estimated_config = Chroma2Config()
+
+        huggingface_components = {}
+        for component_name, v in config.items():
+            if isinstance(v, list) and len(v) == 2:
+                lib_name, cls_name = v
+                component_sd = state_dicts.get(component_name, None)
+                component = load_huggingface_component(estimated_config, component_name, lib_name, cls_name, local_path, component_sd)
+                if component is not None:
+                    huggingface_components[component_name] = component
+
+        # Extract VAE batch norm stats for FLUX.2 latent normalization
+        if 'vae' in state_dicts:
+            vae_sd = state_dicts['vae']
+            if 'bn.running_mean' in vae_sd and 'bn.running_var' in vae_sd:
+                huggingface_components['vae_bn_mean'] = vae_sd['bn.running_mean']
+                huggingface_components['vae_bn_var'] = vae_sd['bn.running_var']
+                print("DEBUG: Extracted VAE batch norm stats for FLUX.2")
+
+        print("DEBUG: Loaded Chroma2 components:", list(huggingface_components.keys()))
+        return Chroma2Klein(estimated_config=estimated_config, huggingface_components=huggingface_components)
+
     try:
         state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
     except:
@@ -1089,10 +1206,34 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
         state_dicts['text_encoder'] = state_dicts['text_encoder_2']
         del state_dicts['text_encoder_2']
     
+    if "transformer" in state_dicts and any('double_stream_modulation_img' in k for k in state_dicts["transformer"].keys()):
+        estimated_config.huggingface_repo = "Chroma2Klein"
+        estimated_config.unet_config = {
+            "image_model": "flux2",
+            "guidance_embed": False,
+            "num_layers": 5,
+            "num_single_layers": 20,
+            "num_attention_heads": 24,
+            "attention_head_dim": 128,
+            "joint_attention_dim": 7680,
+            "in_channels": 128,
+        }
+        print("[Chroma2] Detected FLUX.2-klein transformer (shared modulation)")
+
     repo_name = estimated_config.huggingface_repo
 
-    # Handle ChromaDCT with direct config to avoid HuggingFace directory structure requirements
-    if repo_name == "ChromaDCT":
+    if repo_name == "Chroma2Klein":
+        config = {
+            "_class_name": "Flux2Pipeline",
+            "_diffusers_version": "0.30.0.dev0",
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            "text_encoder": ["transformers", "Qwen3Model"],
+            "tokenizer": ["transformers", "Qwen2TokenizerFast"],
+            "transformer": ["diffusers", "Chroma2Transformer2DModel"],
+            "vae": ["diffusers", "AutoencoderKL"]
+        }
+        local_path = os.path.join(dir_path, 'huggingface', 'Chroma2Klein')
+    elif repo_name == "ChromaDCT":
         config = {
             "_class_name": "FluxPipeline",
             "_diffusers_version": "0.30.0.dev0",
@@ -1101,7 +1242,7 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
             "tokenizer": ["transformers", "T5TokenizerFast"],
             "transformer": ["diffusers", "ChromaDCTTransformer2DModel"]
         }
-        local_path = os.path.join(dir_path, 'huggingface', 'Chroma')  # Use Chroma configs for components
+        local_path = os.path.join(dir_path, 'huggingface', 'Chroma')
     else:
         local_path = os.path.join(dir_path, 'huggingface', repo_name)
         config: dict = DiffusionPipeline.load_config(local_path)
@@ -1168,6 +1309,9 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
     if estimated_config.huggingface_repo == "ChromaDCT":
         print("DEBUG: Loading ChromaDCT engine")
         return ChromaDCT(estimated_config=estimated_config, huggingface_components=huggingface_components)
+    if estimated_config.huggingface_repo == "Chroma2Klein":
+        print("DEBUG: Loading Chroma2Klein engine (FLUX.2-klein-4B)")
+        return Chroma2Klein(estimated_config=estimated_config, huggingface_components=huggingface_components)
 
     # Load Z-Image when 'z' preset is selected
     if preset == 'z':

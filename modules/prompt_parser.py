@@ -191,7 +191,7 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
         cond_schedule = []
         for i, (end_at_step, _) in enumerate(prompt_schedule):
             if isinstance(conds, dict):
-                cond = {k: v[i] for k, v in conds.items()}
+                cond = {k: v[i] for k, v in conds.items() if v is not None}
             else:
                 cond = conds[i]
 

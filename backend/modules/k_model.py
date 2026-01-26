@@ -75,9 +75,14 @@ class KModel(torch.nn.Module):
             xc = torch.cat([xc] + [c_concat], dim=1)
 
         # Handle context which may now be a dict with crossattn and attention_mask
+        ref_latents = None
+        ref_latent_ids = None
         if isinstance(c_crossattn, dict):
             context = c_crossattn['crossattn']
             attention_mask = c_crossattn.get('attention_mask', None)
+            # FLUX.2 reference image latents for editing
+            ref_latents = c_crossattn.get('ref_latents', None)
+            ref_latent_ids = c_crossattn.get('ref_latent_ids', None)
         else:
             # Backward compatibility: if context is just a tensor
             context = c_crossattn
@@ -102,6 +107,12 @@ class KModel(torch.nn.Module):
                 if extra.dtype != torch.int and extra.dtype != torch.long:
                     extra = extra.to(dtype)
             extra_conds[o] = extra
+
+        # Add FLUX.2 reference image latents if present
+        if ref_latents is not None:
+            extra_conds['ref_latents'] = ref_latents.to(dtype)
+        if ref_latent_ids is not None:
+            extra_conds['ref_latent_ids'] = ref_latent_ids
 
         model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
         denoised = self.predictor.calculate_denoised(sigma, model_output, x)

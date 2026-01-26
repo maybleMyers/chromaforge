@@ -43,24 +43,36 @@ class ConditionNoiseShape(Condition):
 
 
 class ConditionCrossAttn(Condition):
-    def __init__(self, cond, attention_mask=None):
+    def __init__(self, cond, attention_mask=None, ref_latents=None, ref_latent_ids=None):
         # cond can be a tensor or a dict with 'crossattn' and optionally 'attention_mask'
         if isinstance(cond, dict):
             self.cond = cond['crossattn']
             self.attention_mask = cond.get('attention_mask', None)
+            # FLUX.2 reference image latents for editing
+            self.ref_latents = cond.get('ref_latents', None)
+            self.ref_latent_ids = cond.get('ref_latent_ids', None)
         else:
             self.cond = cond
             self.attention_mask = attention_mask
+            self.ref_latents = ref_latents
+            self.ref_latent_ids = ref_latent_ids
 
-    def _copy_with(self, cond, attention_mask=None):
-        return self.__class__(cond, attention_mask)
+    def _copy_with(self, cond, attention_mask=None, ref_latents=None, ref_latent_ids=None):
+        return self.__class__(cond, attention_mask, ref_latents, ref_latent_ids)
 
     def process_cond(self, batch_size, device, **kwargs):
         processed_cond = repeat_to_batch_size(self.cond, batch_size).to(device)
         processed_mask = None
         if self.attention_mask is not None:
             processed_mask = repeat_to_batch_size(self.attention_mask, batch_size).to(device)
-        return self._copy_with(processed_cond, processed_mask)
+        # Process reference latents if present
+        processed_ref_latents = None
+        processed_ref_latent_ids = None
+        if self.ref_latents is not None:
+            processed_ref_latents = repeat_to_batch_size(self.ref_latents, batch_size).to(device)
+        if self.ref_latent_ids is not None:
+            processed_ref_latent_ids = repeat_to_batch_size(self.ref_latent_ids, batch_size).to(device)
+        return self._copy_with(processed_cond, processed_mask, processed_ref_latents, processed_ref_latent_ids)
 
     def can_concat(self, other):
         s1 = self.cond.shape
@@ -78,12 +90,16 @@ class ConditionCrossAttn(Condition):
     def concat(self, others):
         conds = [self.cond]
         masks = [self.attention_mask]
+        ref_latents_list = [self.ref_latents]
+        ref_latent_ids_list = [self.ref_latent_ids]
         crossattn_max_len = self.cond.shape[1]
         for x in others:
             c = x.cond
             crossattn_max_len = lcm(crossattn_max_len, c.shape[1])
             conds.append(c)
             masks.append(x.attention_mask)
+            ref_latents_list.append(x.ref_latents)
+            ref_latent_ids_list.append(x.ref_latent_ids)
 
         out = []
         out_masks = []
@@ -102,11 +118,24 @@ class ConditionCrossAttn(Condition):
                         m = m.repeat(1, crossattn_max_len // m.shape[1])
                     out_masks.append(m)
 
-        # Return dict with attention_mask if all conds had masks
-        if has_mask and len(out_masks) == len(conds):
-            concat_mask = torch.cat(out_masks)
-            return {'crossattn': torch.cat(out), 'attention_mask': concat_mask}
+        # Build result dict
+        result = {'crossattn': torch.cat(out)}
 
+        if has_mask and len(out_masks) == len(conds):
+            result['attention_mask'] = torch.cat(out_masks)
+
+        # Concat reference latents if any are present (for FLUX.2 editing)
+        has_ref = any(r is not None for r in ref_latents_list)
+        if has_ref:
+            out_ref_latents = [r for r in ref_latents_list if r is not None]
+            out_ref_ids = [r for r in ref_latent_ids_list if r is not None]
+            if out_ref_latents:
+                result['ref_latents'] = torch.cat(out_ref_latents)
+                result['ref_latent_ids'] = torch.cat(out_ref_ids)
+
+        # Return dict if we have any extra fields, otherwise just tensor for backward compat
+        if len(result) > 1 or has_ref:
+            return result
         return torch.cat(out)
 
 

@@ -66,18 +66,23 @@ function switch_to_img2img() {
     return Array.from(arguments);
 }
 
-function switch_to_sketch() {
+function switch_to_ref_edit() {
     switch_to_img2img_tab(1);
     return Array.from(arguments);
 }
 
-function switch_to_inpaint() {
+function switch_to_sketch() {
     switch_to_img2img_tab(2);
     return Array.from(arguments);
 }
 
-function switch_to_inpaint_sketch() {
+function switch_to_inpaint() {
     switch_to_img2img_tab(3);
+    return Array.from(arguments);
+}
+
+function switch_to_inpaint_sketch() {
+    switch_to_img2img_tab(4);
     return Array.from(arguments);
 }
 

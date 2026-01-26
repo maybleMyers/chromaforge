@@ -1218,6 +1218,22 @@ def create_ui():
                                 init_img = ForgeCanvas(elem_id="img2img_image", height=512, no_scribbles=True)
                                 add_copy_image_controls('img2img', init_img)
 
+                            with gr.TabItem('Reference Edit', id='img2img_ref_edit', elem_id="img2img_ref_edit_tab") as tab_ref_edit:
+                                gr.HTML("<p class='text-gray-500' style='margin-bottom: 0.5em;'>FLUX.2/Chroma2 reference-based generation. Starts from pure noise - all images are used as references to guide generation.</p>")
+                                with gr.Row():
+                                    with gr.Column(scale=1):
+                                        ref_edit_main_img = gr.Image(label="Main Image", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_main")
+                                    with gr.Column(scale=2):
+                                        gr.HTML("<p class='text-gray-500' style='margin-bottom: 0.3em;'>Reference Images (up to 6)</p>")
+                                        with gr.Row():
+                                            ref_edit_img1 = gr.Image(label="Ref 1", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_1", height=150)
+                                            ref_edit_img2 = gr.Image(label="Ref 2", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_2", height=150)
+                                            ref_edit_img3 = gr.Image(label="Ref 3", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_3", height=150)
+                                        with gr.Row():
+                                            ref_edit_img4 = gr.Image(label="Ref 4", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_4", height=150)
+                                            ref_edit_img5 = gr.Image(label="Ref 5", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_5", height=150)
+                                            ref_edit_img6 = gr.Image(label="Ref 6", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_6", height=150)
+
                             with gr.TabItem('Sketch', id='img2img_sketch', elem_id="img2img_img2img_sketch_tab") as tab_sketch:
                                 sketch = ForgeCanvas(elem_id="img2img_sketch", height=512, scribble_color=opts.img2img_sketch_default_brush_color)
                                 add_copy_image_controls('sketch', sketch)
@@ -1257,7 +1273,7 @@ def create_ui():
                                     img2img_batch_png_info_dir = gr.Textbox(label="PNG info directory", **shared.hide_dirs, placeholder="Leave empty to use input directory", elem_id="img2img_batch_png_info_dir")
                                     img2img_batch_png_info_props = gr.CheckboxGroup(["Prompt", "Negative prompt", "Seed", "CFG scale", "Sampler", "Steps", "Model hash"], label="Parameters to take from png info", info="Prompts from png info will be appended to prompts set in ui.")
 
-                            img2img_tabs = [tab_img2img, tab_sketch, tab_inpaint, tab_inpaint_color, tab_inpaint_upload, tab_batch]
+                            img2img_tabs = [tab_img2img, tab_ref_edit, tab_sketch, tab_inpaint, tab_inpaint_color, tab_inpaint_upload, tab_batch]
 
                             for i, tab in enumerate(img2img_tabs):
                                 tab.select(fn=lambda tabnum=i: tabnum, inputs=[], outputs=[img2img_selected_tab])
@@ -1324,7 +1340,7 @@ def create_ui():
                                         else:
                                             return w, h
 
-                                    img_sources = [init_img.background, sketch.background, init_img_with_mask.background, inpaint_color_sketch.background, init_img_inpaint]
+                                    img_sources = [init_img.background, ref_edit_main_img, sketch.background, init_img_with_mask.background, inpaint_color_sketch.background, init_img_inpaint]
                                     for i in img_sources:
                                         i.change(fn=updateWH, inputs=[i, width, height], outputs=[width, height], show_progress='hidden')
                                         i.change(**on_change_args)
@@ -1428,6 +1444,13 @@ def create_ui():
                 inpaint_color_sketch.foreground,
                 init_img_inpaint,
                 init_mask_inpaint,
+                ref_edit_main_img,
+                ref_edit_img1,
+                ref_edit_img2,
+                ref_edit_img3,
+                ref_edit_img4,
+                ref_edit_img5,
+                ref_edit_img6,
                 mask_blur,
                 mask_alpha,
                 inpainting_fill,
@@ -1483,6 +1506,7 @@ def create_ui():
                     img2img_batch_input_dir,
                     img2img_batch_output_dir,
                     init_img.background,
+                    ref_edit_main_img,
                     sketch.background,
                     init_img_with_mask.background,
                     inpaint_color_sketch.background,

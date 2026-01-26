@@ -1017,6 +1017,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     "Please try again with a shorter prompt or reduce GPU Weights slider."
                 ) from e
 
+            # FLUX.2/Chroma2 reference image conditioning
+            # Set reference images directly on model (stored on transformer wrapper)
+            if hasattr(p, 'reference_images') and p.reference_images and hasattr(p.sd_model, 'set_reference_images'):
+                try:
+                    p.sd_model.set_reference_images(p.reference_images)
+                    print(f"Reference edit: Using {len(p.reference_images)} reference image(s)")
+                except Exception as e:
+                    print(f"Warning: Failed to set reference images: {e}")
+                    import traceback
+                    traceback.print_exc()
+
             p.extra_generation_params.update(p.sd_model.extra_generation_params)
 
             # params.txt should be saved after scripts.process_batch, since the
@@ -1051,6 +1062,12 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     "Out of memory during sampling. Memory has been cleared. "
                     "Please try again with a smaller resolution, fewer steps, or reduce GPU Weights slider."
                 ) from e
+            finally:
+                # Clear reference latents after sampling (FLUX.2/Chroma2)
+                if hasattr(p.sd_model, 'forge_objects') and hasattr(p.sd_model.forge_objects, 'unet'):
+                    if hasattr(p.sd_model.forge_objects.unet.model, 'diffusion_model'):
+                        if hasattr(p.sd_model.forge_objects.unet.model.diffusion_model, 'clear_reference_latents'):
+                            p.sd_model.forge_objects.unet.model.diffusion_model.clear_reference_latents()
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)

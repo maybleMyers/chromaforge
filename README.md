@@ -30,7 +30,7 @@ Please see levzzz chroma guide for more information about chroma: https://github
   
 Download chroma2_kaleidoscope.safetensors from https://huggingface.co/lodestones/Chroma2-Kaleidoscope/tree/main and  flux2_klein_text_encoder.safetensors and flux_2_vae.safetensors from https://huggingface.co/maybleMyers/chromafiles/tree/main  
   
-Use the moodel in the chroma2 tab in the gui. Klein2 4b will also work in this tab.  
+Use the moodel in the chroma2 tab in the gui. Klein2 4b will also work in this tab. Editting does use 4x memory per image, it is very expensive to run.    
 
 ## To use the Z-Image model
 
@@ -57,7 +57,7 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
-1/26/26 Add support for Kaleidoscope chroma model.  
+1/26/26 Add support for Kaleidoscope chroma model. Supports klein 4b in the chroma2 tab as well.    
 1/23/26  Add support for latest chroma radiance model.
 12/29/2025  Add DPM++ 3M SDE RF sampler for chroma. Works best with simple and high steps, like 67+.  
 12/8/2025 support x0 radiance model.  

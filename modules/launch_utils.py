@@ -459,18 +459,8 @@ def prepare_environment():
         run_pip(f"install {openclip_package}", "open_clip")
         startup_timer.record("install open_clip")
 
-    # Check if diffusers is installed with version >= 0.36.0.dev0
-    diffusers_installed = False
-    try:
-        import packaging.version
-        diffusers_version = importlib.metadata.version("diffusers")
-        if packaging.version.parse(diffusers_version) >= packaging.version.parse("0.36.0.dev0"):
-            diffusers_installed = True
-    except Exception:
-        pass
-    if not diffusers_installed:
-        run_pip("install git+https://github.com/huggingface/diffusers", "diffusers")
-        startup_timer.record("install diffusers")
+    # diffusers is now pinned in requirements_versions.txt with specific commit
+    # No need to install from git HEAD here
 
     if (not is_installed("xformers") or args.reinstall_xformers) and args.xformers:
         run_pip(f"install -U -I --no-deps {xformers_package}", "xformers")
@@ -486,7 +476,8 @@ def prepare_environment():
     # git_clone(stable_diffusion_repo, repo_dir('stable-diffusion-stability-ai'), "Stable Diffusion", stable_diffusion_commit_hash)
     # git_clone(stable_diffusion_xl_repo, repo_dir('generative-models'), "Stable Diffusion XL", stable_diffusion_xl_commit_hash)
     # git_clone(k_diffusion_repo, repo_dir('k-diffusion'), "K-diffusion", k_diffusion_commit_hash)
-    git_clone(huggingface_guess_repo, repo_dir('huggingface_guess'), "huggingface_guess", huggingface_guess_commit_hash)
+    # huggingface_guess is already bundled in this repo - do not clone separately
+    # git_clone(huggingface_guess_repo, repo_dir('huggingface_guess'), "huggingface_guess", huggingface_guess_commit_hash)
     git_clone(blip_repo, repo_dir('BLIP'), "BLIP", blip_commit_hash)
 
     startup_timer.record("clone repositores")

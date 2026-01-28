@@ -364,8 +364,31 @@ def apply_quantization_dtype_fix(model):
     original_instantiate_guidance_tokens = model.instantiate_guidance_tokens
     original_instantiate_timestep_r_tokens = model.instantiate_timestep_r_tokens
 
-    def patched_instantiate_vae_image_tokens(self, hidden_states, images, image_mask, timesteps):
+    def patched_instantiate_vae_image_tokens(self, hidden_states, timesteps, images, image_mask, guidance=None, timesteps_r=None):
         """Patched version with dtype casting for quantization compatibility."""
+        # Handle the hidden_states is None case (inference non-first step)
+        if hidden_states is None:
+            t_emb = self.time_embed(timesteps)
+            image_emb = self.patch_embed(images, t_emb)[0]
+            timestep_emb = self.timestep_emb(timesteps).reshape(images.size(0), -1, self.config.hidden_size)
+            cat_list = [timestep_emb, image_emb]
+
+            if guidance is not None:
+                guidance_src = self.guidance_emb(guidance.reshape(-1))
+                guidance_emb = guidance_src.reshape(images.size(0), -1, self.config.hidden_size)
+            if timesteps_r is not None:
+                timesteps_r_src = self.timestep_r_emb(timesteps_r.reshape(-1))
+                timesteps_r_emb = timesteps_r_src.reshape(images.size(0), -1, self.config.hidden_size)
+
+            if guidance is not None and timesteps_r is not None:
+                cat_list = [timestep_emb, guidance_emb, timesteps_r_emb, image_emb]
+            elif guidance is not None:
+                cat_list = [timestep_emb, guidance_emb, image_emb]
+            elif timesteps_r is not None:
+                cat_list = [timestep_emb, timesteps_r_emb, image_emb]
+            hidden_states = torch.cat(cat_list, dim=1)
+            return hidden_states
+
         if images is None:
             return hidden_states
 
@@ -373,6 +396,7 @@ def apply_quantization_dtype_fix(model):
         target_dtype = hidden_states.dtype
 
         if isinstance(images, torch.Tensor):
+            assert images.ndim == 4, f"images should be a 4-D tensor, got {images.ndim}-D tensor"
             assert isinstance(timesteps, torch.Tensor), f"timesteps should be 1-D tensor, got {type(timesteps)}"
 
             index = torch.arange(seqlen, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
@@ -1502,7 +1526,8 @@ def create_ui():
                     cot_output = gr.Textbox(
                         label="Chain-of-Thought Reasoning",
                         interactive=False,
-                        lines=8,
+                        lines=10,
+                        max_lines=10,
                         placeholder="Reasoning output will stream here when using think_recaption bot task...",
                         autoscroll=True,
                     )

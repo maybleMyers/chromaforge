@@ -4,7 +4,7 @@
 # Core dependencies
 einops==0.8.1
 numpy==2.2.0
-pillow==12.0.0
+pillow>=11.0.0,<12.0
 diffusers==0.35.2
 safetensors==0.7.0
 tokenizers==0.22.0

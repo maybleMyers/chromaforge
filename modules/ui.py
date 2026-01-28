@@ -1233,6 +1233,8 @@ def create_ui():
                                             ref_edit_img4 = gr.Image(label="Ref 4", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_4", height=150)
                                             ref_edit_img5 = gr.Image(label="Ref 5", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_5", height=150)
                                             ref_edit_img6 = gr.Image(label="Ref 6", source="upload", interactive=True, type="pil", elem_id="img2img_ref_edit_6", height=150)
+                                with gr.Row():
+                                    ref_edit_lora_strength = gr.Slider(minimum=0.0, maximum=5.0, value=1.0, step=0.05, label="LoRA Strength (Z-Image i2L)", elem_id="img2img_ref_edit_lora_strength")
 
                             with gr.TabItem('Sketch', id='img2img_sketch', elem_id="img2img_img2img_sketch_tab") as tab_sketch:
                                 sketch = ForgeCanvas(elem_id="img2img_sketch", height=512, scribble_color=opts.img2img_sketch_default_brush_color)
@@ -1451,6 +1453,7 @@ def create_ui():
                 ref_edit_img4,
                 ref_edit_img5,
                 ref_edit_img6,
+                ref_edit_lora_strength,
                 mask_blur,
                 mask_alpha,
                 inpainting_fill,

@@ -1017,14 +1017,67 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     "Please try again with a shorter prompt or reduce GPU Weights slider."
                 ) from e
 
-            # FLUX.2/Chroma2 reference image conditioning
-            # Set reference images directly on model (stored on transformer wrapper)
-            if hasattr(p, 'reference_images') and p.reference_images and hasattr(p.sd_model, 'set_reference_images'):
+            # Reference image handling - detect model type and route accordingly
+            if hasattr(p, 'reference_images') and p.reference_images:
+                is_zimage = 'ZImage' in type(p.sd_model).__name__
+
+                if is_zimage:
+                    # Z-Image: Use i2L pipeline to convert style images (excluding main) to LoRA
+                    style_images = getattr(p, 'style_images', None) or p.reference_images
+                    p.zimage_i2l_images = style_images
+                    p.zimage_i2l_strength = getattr(p, 'ref_edit_lora_strength', 1.0)
+                    print(f"[Z-Image i2L] Detected Z-Image model, routing {len(style_images)} style images to i2L pipeline")
+                elif hasattr(p.sd_model, 'set_reference_images'):
+                    # FLUX.2/Chroma2: Use direct reference conditioning
+                    try:
+                        p.sd_model.set_reference_images(p.reference_images)
+                        print(f"Reference edit: Using {len(p.reference_images)} reference image(s)")
+                    except Exception as e:
+                        print(f"Warning: Failed to set reference images: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+            # Z-Image i2L: Convert style images to LoRA (generates now, applies before sampling)
+            if hasattr(p, 'zimage_i2l_images') and p.zimage_i2l_images:
                 try:
-                    p.sd_model.set_reference_images(p.reference_images)
-                    print(f"Reference edit: Using {len(p.reference_images)} reference image(s)")
+                    from backend.diffusion_engine.zimage import ZImage
+                    from modules.paths_internal import models_path
+
+                    models_dir = os.path.join(models_path, "Z-Image-i2L")
+                    i2l_model_path = os.path.join(models_dir, "model.safetensors")
+
+                    if os.path.exists(i2l_model_path):
+                        # Unload all models to free VRAM for i2L encoders
+                        print("[Z-Image i2L] Unloading models to free VRAM for i2L encoding...")
+                        memory_management.unload_all_models()
+                        torch.cuda.empty_cache()
+
+                        # Generate LoRA from style images
+                        lora_dict = ZImage.generate_lora_from_images(
+                            images=p.zimage_i2l_images,
+                            models_dir=models_dir,
+                            i2l_model_path=i2l_model_path,
+                        )
+
+                        # Apply LoRA IMMEDIATELY while model is on CPU (after unload_all_models)
+                        # This ensures the modified weights are moved to GPU when the model loads
+                        from backend.lora.zimage_lora import get_lora_manager
+                        # Use KModel (not diffusion_model) to match file-based LoRA and verification
+                        model = p.sd_model.forge_objects.unet.model
+                        lora_manager = get_lora_manager(model)
+                        strength = getattr(p, 'zimage_i2l_strength', 1.0)
+                        lora_manager.apply_lora_dict(lora_dict, strength)
+                        print(f"[Z-Image i2L] Generated and applied LoRA with strength {strength}")
+
+                        # Update snapshot so LoRA persists through model reloads
+                        p.sd_model.forge_objects_after_applying_lora = p.sd_model.forge_objects.shallow_copy()
+
+                        # Store for cleanup after sampling
+                        p.zimage_i2l_lora_dict = lora_dict
+                    else:
+                        print(f"[Z-Image i2L] Warning: i2L model not found at {i2l_model_path}")
                 except Exception as e:
-                    print(f"Warning: Failed to set reference images: {e}")
+                    print(f"[Z-Image i2L] Error generating LoRA: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -1068,6 +1121,19 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     if hasattr(p.sd_model.forge_objects.unet.model, 'diffusion_model'):
                         if hasattr(p.sd_model.forge_objects.unet.model.diffusion_model, 'clear_reference_latents'):
                             p.sd_model.forge_objects.unet.model.diffusion_model.clear_reference_latents()
+
+                # Clear i2L LoRA after sampling (Z-Image)
+                if hasattr(p, 'zimage_i2l_lora_dict') and p.zimage_i2l_lora_dict:
+                    try:
+                        from backend.lora.zimage_lora import get_lora_manager
+                        if hasattr(p.sd_model, 'forge_objects') and hasattr(p.sd_model.forge_objects, 'unet'):
+                            # Use KModel to match how we stored the manager
+                            model = p.sd_model.forge_objects.unet.model
+                            lora_manager = get_lora_manager(model)
+                            lora_manager.clear_loras()
+                            print("[Z-Image i2L] Cleared generated LoRA after sampling")
+                    except Exception as e:
+                        print(f"[Z-Image i2L] Warning: Failed to clear LoRA: {e}")
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)

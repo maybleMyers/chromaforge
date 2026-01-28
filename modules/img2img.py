@@ -147,7 +147,7 @@ def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, 
     return batch_results
 
 
-def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
+def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6, ref_edit_lora_strength: float, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
 
     override_settings = create_override_settings_dict(override_settings_texts)
 
@@ -165,13 +165,16 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     if mode == 0:  # img2img
         image = init_img
         mask = None
-    elif mode == 1:  # reference edit (FLUX.2/Chroma2)
+    elif mode == 1:  # reference edit (FLUX.2/Chroma2/Z-Image)
         # Main image is used for sizing but treated as a reference
         image = ref_edit_main_img
         mask = None
-        # All images (including main) become references - matches diffusers pipeline
+        # All images (including main) become references - matches diffusers FLUX/Chroma2 pipeline
         all_ref_images = [ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6]
         reference_images = [img for img in all_ref_images if img is not None]
+        # Style-only images (excluding main) for Z-Image i2L
+        style_only_images = [ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6]
+        style_images = [img for img in style_only_images if img is not None]
         # Force full denoising (pure noise start) to match diffusers Flux2Pipeline
         denoising_strength = 1.0
     elif mode == 2:  # img2img sketch
@@ -244,8 +247,11 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     p.scripts = modules.scripts.scripts_img2img
     p.script_args = args
 
-    # FLUX.2/Chroma2 reference images for editing
+    # Reference images for editing - pass both to processing.py for model-type detection
+    # (Model isn't loaded yet here, so we can't check if it's Z-Image)
     p.reference_images = reference_images
+    p.style_images = style_images if 'style_images' in dir() else None  # Style-only images for Z-Image i2L
+    p.ref_edit_lora_strength = ref_edit_lora_strength  # Store for potential i2L use
 
     p.user = request.username
 

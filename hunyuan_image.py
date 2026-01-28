@@ -33,6 +33,10 @@ import copy
 
 # Image size options for generation
 IMAGE_SIZE_OPTIONS = [
+    "512x512",
+    "640x640",
+    "768x768",
+    "896x896",
     "1024x1024",
     "1024x768",
     "768x1024",
@@ -366,28 +370,9 @@ def apply_quantization_dtype_fix(model):
 
     def patched_instantiate_vae_image_tokens(self, hidden_states, timesteps, images, image_mask, guidance=None, timesteps_r=None):
         """Patched version with dtype casting for quantization compatibility."""
-        # Handle the hidden_states is None case (inference non-first step)
+        # Handle the hidden_states is None case - no scatter ops, just call original
         if hidden_states is None:
-            t_emb = self.time_embed(timesteps)
-            image_emb = self.patch_embed(images, t_emb)[0]
-            timestep_emb = self.timestep_emb(timesteps).reshape(images.size(0), -1, self.config.hidden_size)
-            cat_list = [timestep_emb, image_emb]
-
-            if guidance is not None:
-                guidance_src = self.guidance_emb(guidance.reshape(-1))
-                guidance_emb = guidance_src.reshape(images.size(0), -1, self.config.hidden_size)
-            if timesteps_r is not None:
-                timesteps_r_src = self.timestep_r_emb(timesteps_r.reshape(-1))
-                timesteps_r_emb = timesteps_r_src.reshape(images.size(0), -1, self.config.hidden_size)
-
-            if guidance is not None and timesteps_r is not None:
-                cat_list = [timestep_emb, guidance_emb, timesteps_r_emb, image_emb]
-            elif guidance is not None:
-                cat_list = [timestep_emb, guidance_emb, image_emb]
-            elif timesteps_r is not None:
-                cat_list = [timestep_emb, timesteps_r_emb, image_emb]
-            hidden_states = torch.cat(cat_list, dim=1)
-            return hidden_states
+            return original_instantiate_vae_image_tokens(hidden_states, timesteps, images, image_mask, guidance, timesteps_r)
 
         if images is None:
             return hidden_states

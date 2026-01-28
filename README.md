@@ -61,15 +61,15 @@ git clone https://huggingface.co/DiffSynth-Studio/General-Image-Encoders ./model
 
 **Direct link:** https://huggingface.co/DiffSynth-Studio/General-Image-Encoders
 
-### Expected File Structure rename files
+### Expected File Structure -- rename files if needed
 
 ```
 models/Z-Image-i2L/
-├── model.safetensors          # Image2LoRA model (already present)
+├── model.safetensors          # Image2LoRA model
 ├── SigLIP2-G384/
-│   └── model.safetensors      # SigLIP2 encoder (~2GB)
+│   └── model.safetensors      # SigLIP2 encoder
 └── DINOv3-7B/
-    └── model.safetensors      # DINOv3 encoder (~7GB)
+    └── model.safetensors      # DINOv3 encoder
 ```
 
 ---

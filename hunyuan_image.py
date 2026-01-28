@@ -27,7 +27,6 @@ import base64
 import torch
 import gradio as gr
 from gradio import themes
-from gradio.themes.utils import colors
 from PIL import Image
 from dataclasses import dataclass
 import copy
@@ -43,12 +42,11 @@ IMAGE_SIZE_OPTIONS = [
     "1024x1536",
 ]
 
-# Solver options for diffusion
-SOLVER_OPTIONS = ["euler", "heun-2", "midpoint-2", "kutta-4"]
-
-
 # Settings file path
 SETTINGS_FILE = "hunyuan_image_settings.json"
+
+# Global stop flag for generation
+stop_generation: bool = False
 
 # Modules to skip during quantization (keep in full precision)
 HUNYUAN_SKIP_MODULES = [
@@ -67,6 +65,15 @@ HUNYUAN_SKIP_MODULES = [
     'layernorm', 'input_layernorm', 'post_attention_layernorm',
 ]
 
+# Bot task options for generation
+BOT_TASK_OPTIONS = ["think_recaption", "recaption", "image", "auto"]
+
+# System prompt options
+SYSTEM_PROMPT_OPTIONS = ["en_unified", "en_recaption", "en_think_recaption", "en_vanilla", "dynamic", "custom", "None"]
+
+# MoE implementation options
+MOE_IMPL_OPTIONS = ["eager", "flashinfer"]
+
 # Default settings values
 DEFAULT_SETTINGS = {
     # Model Settings
@@ -77,11 +84,20 @@ DEFAULT_SETTINGS = {
     "cpu_offload": False,
     "cpu_offload_ram": 0,  # 0 = auto
     "flash_attention": False,
+    "moe_impl": "eager",
+    "moe_drop_tokens": True,
     # Generation Settings
     "default_steps": 50,
-    "default_guidance": 7.5,
-    "default_solver": "euler",
+    "default_guidance": 2.5,  # Model default is 2.5
+    "default_flow_shift": 3.0,  # Model default
     "default_image_size": "1024x1024",
+    "infer_align_image_size": True,
+    "use_taylor_cache": False,
+    # Prompt Settings
+    "system_prompt_type": "en_unified",
+    "custom_system_prompt": "",
+    "bot_task": "think_recaption",
+    "verbose": 2,
 }
 
 
@@ -94,11 +110,20 @@ def save_settings(
     cpu_offload: bool,
     cpu_offload_ram: int,
     flash_attention: bool,
+    moe_impl: str,
+    moe_drop_tokens: bool,
     # Generation Settings
     default_steps: int,
     default_guidance: float,
-    default_solver: str,
+    default_flow_shift: float,
     default_image_size: str,
+    infer_align_image_size: bool,
+    use_taylor_cache: bool,
+    # Prompt Settings
+    system_prompt_type: str,
+    custom_system_prompt: str,
+    bot_task: str,
+    verbose: int,
 ) -> str:
     """Save all settings to a JSON file."""
     settings = {
@@ -110,11 +135,20 @@ def save_settings(
         "cpu_offload": cpu_offload,
         "cpu_offload_ram": cpu_offload_ram,
         "flash_attention": flash_attention,
+        "moe_impl": moe_impl,
+        "moe_drop_tokens": moe_drop_tokens,
         # Generation Settings
         "default_steps": default_steps,
         "default_guidance": default_guidance,
-        "default_solver": default_solver,
+        "default_flow_shift": default_flow_shift,
         "default_image_size": default_image_size,
+        "infer_align_image_size": infer_align_image_size,
+        "use_taylor_cache": use_taylor_cache,
+        # Prompt Settings
+        "system_prompt_type": system_prompt_type,
+        "custom_system_prompt": custom_system_prompt,
+        "bot_task": bot_task,
+        "verbose": verbose,
     }
 
     try:
@@ -481,6 +515,8 @@ class HunyuanImage3Backend:
         cpu_offload: bool = False,
         cpu_offload_ram: Optional[int] = None,
         flash_attention: bool = False,
+        moe_impl: str = "eager",
+        moe_drop_tokens: bool = True,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -617,6 +653,13 @@ class HunyuanImage3Backend:
             if flash_attention:
                 model_kwargs["attn_implementation"] = "flash_attention_2"
                 print("[hunyuan_image] Using Flash Attention 2")
+            else:
+                model_kwargs["attn_implementation"] = "sdpa"
+
+            # MoE implementation
+            model_kwargs["moe_impl"] = moe_impl
+            model_kwargs["moe_drop_tokens"] = moe_drop_tokens
+            print(f"[hunyuan_image] MoE implementation: {moe_impl}, drop_tokens: {moe_drop_tokens}")
 
             progress(0.4, desc="Loading HunyuanImage-3.0 model...")
             print(f"[hunyuan_image] Loading model from {model_path}")
@@ -714,10 +757,16 @@ class HunyuanImage3Backend:
         seed: int = -1,
         image_size: str = "1024x1024",
         num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        solver: str = "euler",
+        guidance_scale: float = 2.5,
+        flow_shift: float = 3.0,
+        system_prompt_type: Optional[str] = "en_unified",
+        custom_system_prompt: Optional[str] = None,
+        bot_task: str = "think_recaption",
+        verbose: int = 2,
+        infer_align_image_size: bool = True,
+        use_taylor_cache: bool = False,
         progress=gr.Progress(),
-    ) -> Tuple[Optional[Image.Image], Dict[str, Any]]:
+    ) -> Tuple[Optional[Image.Image], Dict[str, Any], str]:
         """
         Generate an image from a text prompt.
 
@@ -727,12 +776,18 @@ class HunyuanImage3Backend:
             seed: Random seed (-1 for random)
             image_size: Output image size (e.g., "1024x1024")
             num_inference_steps: Number of diffusion steps
-            guidance_scale: Classifier-free guidance scale
-            solver: Diffusion solver (euler, heun-2, midpoint-2, kutta-4)
+            guidance_scale: Diffusion guidance scale (diff_guidance_scale)
+            flow_shift: Flow rectified flow shift parameter
+            system_prompt_type: System prompt type (en_unified, en_recaption, etc.)
+            custom_system_prompt: Custom system prompt (when system_prompt_type is "custom")
+            bot_task: Bot task (think_recaption, recaption, image, auto)
+            verbose: Verbosity level (0-2)
+            infer_align_image_size: Align output size to input image size (for I2I)
+            use_taylor_cache: Use Taylor Cache for faster inference
             progress: Gradio progress callback
 
         Returns:
-            Tuple of (generated_image, stats_dict)
+            Tuple of (generated_image, stats_dict, cot_reasoning_text)
         """
         if self.model is None:
             return None, {"error": "No model loaded"}
@@ -752,15 +807,39 @@ class HunyuanImage3Backend:
 
             progress(0.1, desc="Preparing generation...")
 
+            # Build generation kwargs
+            gen_kwargs = {
+                "prompt": prompt,
+                "image": reference_image,
+                "image_size": (height, width),  # HunyuanImage uses (H, W)
+                "diff_infer_steps": num_inference_steps,
+                "diff_guidance_scale": guidance_scale,
+                "flow_shift": flow_shift,
+                "seed": actual_seed,
+                "verbose": verbose,
+                "use_taylor_cache": use_taylor_cache,
+            }
+
+            # Add infer_align_image_size for I2I mode
+            if reference_image is not None:
+                gen_kwargs["infer_align_image_size"] = infer_align_image_size
+
+            # Add system prompt if specified
+            if system_prompt_type and system_prompt_type != "None":
+                if system_prompt_type == "custom" and custom_system_prompt:
+                    gen_kwargs["use_system_prompt"] = "custom"
+                    gen_kwargs["system_prompt"] = custom_system_prompt
+                else:
+                    gen_kwargs["use_system_prompt"] = system_prompt_type
+
+            # Add bot task
+            if bot_task:
+                gen_kwargs["bot_task"] = bot_task
+
+            print(f"[hunyuan_image] Generation kwargs: guidance={guidance_scale}, flow_shift={flow_shift}, taylor_cache={use_taylor_cache}")
+
             # Generate image using the model's generate_image API
-            cot_text, outputs = self.model.generate_image(
-                prompt=prompt,
-                image=reference_image,
-                image_size=(height, width),  # HunyuanImage uses (H, W)
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                seed=actual_seed,
-            )
+            cot_text, outputs = self.model.generate_image(**gen_kwargs)
 
             progress(0.9, desc="Processing output...")
 
@@ -780,19 +859,26 @@ class HunyuanImage3Backend:
                 "seed": actual_seed,
                 "steps": num_inference_steps,
                 "guidance": guidance_scale,
+                "flow_shift": flow_shift,
                 "size": f"{width}x{height}",
-                "solver": solver,
             }
+
+            # Extract CoT reasoning text
+            cot_reasoning = ""
+            if cot_text and isinstance(cot_text, list) and len(cot_text) > 0:
+                cot_reasoning = cot_text[0] if isinstance(cot_text[0], str) else str(cot_text[0])
+            elif isinstance(cot_text, str):
+                cot_reasoning = cot_text
 
             progress(1.0, desc="Done!")
             print(f"[hunyuan_image] Generation completed in {generation_time:.2f}s")
 
-            return generated_image, stats
+            return generated_image, stats, cot_reasoning
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return None, {"error": str(e)}
+            return None, {"error": str(e)}, ""
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path."""
@@ -826,6 +912,8 @@ def load_model_handler(
     cpu_offload: bool = False,
     cpu_offload_ram: Optional[int] = None,
     flash_attention: bool = False,
+    moe_impl: str = "eager",
+    moe_drop_tokens: bool = True,
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -844,6 +932,8 @@ def load_model_handler(
         cpu_offload=cpu_offload,
         cpu_offload_ram=cpu_ram,
         flash_attention=flash_attention,
+        moe_impl=moe_impl,
+        moe_drop_tokens=moe_drop_tokens,
         progress=progress,
     )
 
@@ -869,29 +959,63 @@ def generate_handler(
     image_size: str,
     steps: int,
     guidance: float,
-    solver: str,
+    flow_shift: float,
+    system_prompt_type: str,
+    custom_system_prompt: str,
+    bot_task: str,
+    verbose: int,
+    infer_align_image_size: bool,
+    use_taylor_cache: bool,
     progress=gr.Progress()
 ):
     """Handle image generation."""
-    if hunyuan_backend is None:
-        return None, "Backend not initialized"
+    global stop_generation
 
-    image, stats = hunyuan_backend.generate_image(
+    # Check if stop was requested before starting
+    if stop_generation:
+        stop_generation = False
+        return None, "Generation cancelled", ""
+
+    if hunyuan_backend is None:
+        return None, "Backend not initialized", ""
+
+    # Reset stop flag
+    stop_generation = False
+
+    image, stats, cot_text = hunyuan_backend.generate_image(
         prompt=prompt,
         reference_image=reference_image,
         seed=int(seed),
         image_size=image_size,
         num_inference_steps=int(steps),
         guidance_scale=float(guidance),
-        solver=solver,
+        flow_shift=float(flow_shift),
+        system_prompt_type=system_prompt_type if system_prompt_type != "None" else None,
+        custom_system_prompt=custom_system_prompt if system_prompt_type == "custom" else None,
+        bot_task=bot_task,
+        verbose=int(verbose),
+        infer_align_image_size=infer_align_image_size,
+        use_taylor_cache=use_taylor_cache,
         progress=progress,
     )
 
     if "error" in stats:
-        return None, f"Error: {stats['error']}"
+        return None, f"Error: {stats['error']}", ""
 
-    stats_text = f"Time: {stats['time']:.2f}s | Seed: {stats['seed']} | Size: {stats['size']} | Steps: {stats['steps']} | Guidance: {stats['guidance']}"
-    return image, stats_text
+    stats_text = f"Time: {stats['time']:.2f}s | Seed: {stats['seed']} | Size: {stats['size']} | Steps: {stats['steps']} | Guidance: {stats['guidance']} | Flow: {stats['flow_shift']}"
+    return image, stats_text, cot_text
+
+
+def stop_generation_handler():
+    """Set the stop flag to interrupt generation."""
+    global stop_generation
+    stop_generation = True
+    return "Generation stop requested", ""
+
+
+def clear_handler():
+    """Clear the output and reset inputs."""
+    return None, "", "", -1, ""
 
 
 
@@ -901,40 +1025,35 @@ def create_ui():
     # Load saved settings
     saved_settings = load_settings()
 
-    # Theme
-    hunyuan_theme = themes.Default(
-        primary_hue=colors.Color(
-            name="custom",
-            c50="#E6F0FF",
-            c100="#CCE0FF",
-            c200="#99C1FF",
-            c300="#66A3FF",
-            c400="#3384FF",
-            c500="#0060df",
-            c600="#0052C2",
-            c700="#003D91",
-            c800="#002961",
-            c900="#001430",
-            c950="#000A18"
-        )
+    # Use Default theme like the main webui
+    default_theme_args = dict(
+        font=["Source Sans Pro", 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        font_mono=['IBM Plex Mono', 'ui-monospace', 'Consolas', 'monospace'],
     )
+    hunyuan_theme = themes.Default(**default_theme_args)
 
     hunyuan_css = """
+    .stats-display {
+        font-family: monospace;
+        font-size: 14px;
+        padding: 8px 12px;
+        border-radius: 5px;
+    }
     .green-btn {
         background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
         color: white !important;
         border: none !important;
     }
     .green-btn:hover {
-        background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+        background: linear-gradient(to bottom right, #27ae60, #1e8449) !important;
     }
-    .stats-display {
-        font-family: monospace;
-        font-size: 14px;
-        padding: 8px 12px;
-        background: #1a1a2e;
-        border-radius: 5px;
-        color: #4ade80;
+    .red-btn {
+        background: linear-gradient(to bottom right, #e74c3c, #c0392b) !important;
+        color: white !important;
+        border: none !important;
+    }
+    .red-btn:hover {
+        background: linear-gradient(to bottom right, #c0392b, #a93226) !important;
     }
     """
 
@@ -942,9 +1061,7 @@ def create_ui():
     initial_models = hunyuan_backend.get_model_names() if hunyuan_backend else ["Initialize backend first"]
     num_gpus = hunyuan_backend.num_gpus if hunyuan_backend else 0
 
-    with gr.Blocks(title="Chromaforge HunyuanImage-3.0") as demo:
-        demo._hunyuan_theme = hunyuan_theme
-        demo._hunyuan_css = hunyuan_css
+    with gr.Blocks(title="Chromaforge HunyuanImage-3.0", theme=hunyuan_theme, css=hunyuan_css) as demo:
         gr.Markdown("# Chromaforge HunyuanImage-3.0 Image Generator")
 
         with gr.Tabs():
@@ -985,24 +1102,72 @@ def create_ui():
                     )
                     guidance_slider = gr.Slider(
                         minimum=1.0,
-                        maximum=20.0,
-                        value=saved_settings.get("default_guidance", 7.5),
-                        step=0.5,
+                        maximum=10.0,
+                        value=saved_settings.get("default_guidance", 2.5),
+                        step=0.1,
                         label="Guidance Scale",
+                    )
+                    flow_shift_slider = gr.Slider(
+                        minimum=1.0,
+                        maximum=10.0,
+                        value=saved_settings.get("default_flow_shift", 3.0),
+                        step=0.1,
+                        label="Flow Shift",
                     )
                     seed_input = gr.Number(
                         value=-1,
                         label="Seed (-1 = random)",
                     )
-                    solver_dropdown = gr.Dropdown(
-                        choices=SOLVER_OPTIONS,
-                        value=saved_settings.get("default_solver", "euler"),
-                        label="Solver",
+
+                with gr.Accordion("Advanced Prompt Settings", open=False):
+                    with gr.Row():
+                        system_prompt_type = gr.Dropdown(
+                            choices=SYSTEM_PROMPT_OPTIONS,
+                            value=saved_settings.get("system_prompt_type", "en_unified"),
+                            label="System Prompt Type",
+                        )
+                        bot_task = gr.Dropdown(
+                            choices=BOT_TASK_OPTIONS,
+                            value=saved_settings.get("bot_task", "think_recaption"),
+                            label="Bot Task",
+                        )
+                        verbose_slider = gr.Slider(
+                            minimum=0,
+                            maximum=2,
+                            value=saved_settings.get("verbose", 2),
+                            step=1,
+                            label="Verbose Level",
+                        )
+                    custom_system_prompt = gr.Textbox(
+                        label="Custom System Prompt",
+                        placeholder="Enter custom system prompt (only used when System Prompt Type is 'custom')...",
+                        lines=2,
+                        value=saved_settings.get("custom_system_prompt", ""),
                     )
+                    with gr.Row():
+                        infer_align_image_size_check = gr.Checkbox(
+                            value=saved_settings.get("infer_align_image_size", True),
+                            label="Align I2I Output Size",
+                            info="Match output size to input image (for I2I)",
+                        )
+                        use_taylor_cache_check = gr.Checkbox(
+                            value=saved_settings.get("use_taylor_cache", False),
+                            label="Taylor Cache",
+                            info="Faster inference (experimental)",
+                        )
 
                 with gr.Row():
-                    generate_btn = gr.Button("Generate", variant="primary", elem_classes=["green-btn"])
-                    # stop_btn = gr.Button("Stop", variant="secondary")
+                    generate_btn = gr.Button("Generate", variant="primary", elem_classes=["green-btn"], scale=2)
+                    stop_btn = gr.Button("Stop", variant="stop", elem_classes=["red-btn"], scale=1)
+                    clear_btn = gr.Button("Clear", variant="secondary", scale=1)
+
+                with gr.Accordion("CoT Reasoning", open=False):
+                    cot_output = gr.Textbox(
+                        label="Chain-of-Thought Reasoning",
+                        interactive=False,
+                        lines=6,
+                        placeholder="Reasoning output will appear here when using think_recaption bot task...",
+                    )
 
                 stats_display = gr.Textbox(
                     label="Stats",
@@ -1062,8 +1227,20 @@ def create_ui():
                     )
 
                 with gr.Row():
-                    load_btn = gr.Button("Load Model", variant="primary")
-                    unload_btn = gr.Button("Unload Model", variant="secondary")
+                    moe_impl_dropdown = gr.Dropdown(
+                        choices=MOE_IMPL_OPTIONS,
+                        value=saved_settings.get("moe_impl", "eager"),
+                        label="MoE Implementation",
+                        info="FlashInfer is ~3x faster (10min first-run compile)",
+                    )
+                    moe_drop_tokens_check = gr.Checkbox(
+                        value=saved_settings.get("moe_drop_tokens", True),
+                        label="MoE Drop Tokens",
+                    )
+
+                with gr.Row():
+                    load_btn = gr.Button("Load Model", variant="primary", elem_classes=["green-btn"])
+                    unload_btn = gr.Button("Unload Model", variant="secondary", elem_classes=["red-btn"])
 
                 status_display = gr.Textbox(
                     label="Status",
@@ -1083,21 +1260,61 @@ def create_ui():
                     )
                     default_guidance = gr.Slider(
                         minimum=1.0,
-                        maximum=20.0,
-                        value=saved_settings.get("default_guidance", 7.5),
-                        step=0.5,
+                        maximum=10.0,
+                        value=saved_settings.get("default_guidance", 2.5),
+                        step=0.1,
                         label="Default Guidance",
                     )
-                    default_solver = gr.Dropdown(
-                        choices=SOLVER_OPTIONS,
-                        value=saved_settings.get("default_solver", "euler"),
-                        label="Default Solver",
+                    default_flow_shift = gr.Slider(
+                        minimum=1.0,
+                        maximum=10.0,
+                        value=saved_settings.get("default_flow_shift", 3.0),
+                        step=0.1,
+                        label="Default Flow Shift",
                     )
                     default_size = gr.Dropdown(
                         choices=IMAGE_SIZE_OPTIONS,
                         value=saved_settings.get("default_image_size", "1024x1024"),
                         label="Default Size",
                     )
+
+                with gr.Row():
+                    default_infer_align_image_size = gr.Checkbox(
+                        value=saved_settings.get("infer_align_image_size", True),
+                        label="Default Align I2I Output Size",
+                    )
+                    default_use_taylor_cache = gr.Checkbox(
+                        value=saved_settings.get("use_taylor_cache", False),
+                        label="Default Taylor Cache",
+                    )
+
+                gr.Markdown("### Default Prompt Settings")
+
+                with gr.Row():
+                    default_system_prompt_type = gr.Dropdown(
+                        choices=SYSTEM_PROMPT_OPTIONS,
+                        value=saved_settings.get("system_prompt_type", "en_unified"),
+                        label="Default System Prompt Type",
+                    )
+                    default_bot_task = gr.Dropdown(
+                        choices=BOT_TASK_OPTIONS,
+                        value=saved_settings.get("bot_task", "think_recaption"),
+                        label="Default Bot Task",
+                    )
+                    default_verbose = gr.Slider(
+                        minimum=0,
+                        maximum=2,
+                        value=saved_settings.get("verbose", 2),
+                        step=1,
+                        label="Default Verbose Level",
+                    )
+
+                default_custom_system_prompt = gr.Textbox(
+                    label="Default Custom System Prompt",
+                    placeholder="Enter default custom system prompt...",
+                    lines=2,
+                    value=saved_settings.get("custom_system_prompt", ""),
+                )
 
                 save_btn = gr.Button("Save Settings")
                 save_status = gr.Textbox(label="", interactive=False, visible=False)
@@ -1113,7 +1330,7 @@ def create_ui():
             inputs=[
                 model_dropdown, dtype_dropdown, num_gpus_slider,
                 max_memory_slider, cpu_offload_check, cpu_ram_slider,
-                flash_attention_check,
+                flash_attention_check, moe_impl_dropdown, moe_drop_tokens_check,
             ],
             outputs=[status_display],
         )
@@ -1127,9 +1344,21 @@ def create_ui():
             generate_handler,
             inputs=[
                 prompt_input, reference_image, seed_input, image_size,
-                steps_slider, guidance_slider, solver_dropdown,
+                steps_slider, guidance_slider, flow_shift_slider,
+                system_prompt_type, custom_system_prompt, bot_task, verbose_slider,
+                infer_align_image_size_check, use_taylor_cache_check,
             ],
-            outputs=[output_image, stats_display],
+            outputs=[output_image, stats_display, cot_output],
+        )
+
+        stop_btn.click(
+            stop_generation_handler,
+            outputs=[stats_display, cot_output],
+        )
+
+        clear_btn.click(
+            clear_handler,
+            outputs=[output_image, prompt_input, stats_display, seed_input, cot_output],
         )
 
         save_btn.click(
@@ -1137,8 +1366,11 @@ def create_ui():
             inputs=[
                 model_dropdown, dtype_dropdown, num_gpus_slider,
                 max_memory_slider, cpu_offload_check, cpu_ram_slider,
-                flash_attention_check,
-                default_steps, default_guidance, default_solver, default_size,
+                flash_attention_check, moe_impl_dropdown, moe_drop_tokens_check,
+                default_steps, default_guidance, default_flow_shift, default_size,
+                default_infer_align_image_size, default_use_taylor_cache,
+                default_system_prompt_type, default_custom_system_prompt,
+                default_bot_task, default_verbose,
             ],
             outputs=[save_status],
         )

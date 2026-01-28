@@ -18,6 +18,7 @@ import json
 import argparse
 import tempfile
 import threading
+import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Union
 from io import BytesIO
@@ -1172,6 +1173,11 @@ def main():
         default=7864,
         help="Port to run the server on (default: 7864)",
     )
+    parser.add_argument(
+        "--listen",
+        action="store_true",
+        help="Listen on 0.0.0.0 to allow external connections",
+    )
 
     args = parser.parse_args()
 
@@ -1182,6 +1188,7 @@ def main():
     # Create and launch the UI
     demo = create_ui()
     demo.launch(
+        server_name="0.0.0.0" if args.listen else "127.0.0.1",
         server_port=args.port,
         share=args.share,
     )

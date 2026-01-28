@@ -345,6 +345,183 @@ except ImportError:
     print("Warning: accelerate not installed. Multi-GPU support will be limited.")
 
 
+def apply_quantization_dtype_fix(model):
+    """
+    Monkey-patch the model to fix dtype mismatches when using quantization.
+
+    When BitsAndBytes quantization is applied, the transformer backbone produces
+    hidden_states in a different dtype than the skipped modules (patch_embed,
+    timestep_emb, etc.). The scatter_ operations require matching dtypes.
+
+    This patch wraps the problematic methods to cast src tensors before scatter.
+    """
+    import types
+
+    # Store original methods
+    original_instantiate_vae_image_tokens = model.instantiate_vae_image_tokens
+    original_instantiate_vit_image_tokens = model.instantiate_vit_image_tokens
+    original_instantiate_continuous_tokens = model.instantiate_continuous_tokens
+    original_instantiate_guidance_tokens = model.instantiate_guidance_tokens
+    original_instantiate_timestep_r_tokens = model.instantiate_timestep_r_tokens
+
+    def patched_instantiate_vae_image_tokens(self, hidden_states, images, image_mask, timesteps):
+        """Patched version with dtype casting for quantization compatibility."""
+        if images is None:
+            return hidden_states
+
+        bsz, seqlen, n_embd = hidden_states.shape
+        target_dtype = hidden_states.dtype
+
+        if isinstance(images, torch.Tensor):
+            assert isinstance(timesteps, torch.Tensor), f"timesteps should be 1-D tensor, got {type(timesteps)}"
+
+            index = torch.arange(seqlen, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+            t_emb = self.time_embed(timesteps)
+            image_seq, token_h, token_w = self.patch_embed(images, t_emb)
+            image_scatter_index = index.masked_select(image_mask.bool()).reshape(bsz, -1)
+            hidden_states.scatter_(
+                dim=1,
+                index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=image_seq.to(target_dtype),  # Cast for quantization compatibility
+            )
+        else:  # list
+            index = torch.arange(seqlen, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+            for i, (image_i, t_i) in enumerate(zip(images, timesteps)):
+                t_i_emb = self.time_embed(t_i)
+
+                if isinstance(image_i, torch.Tensor):
+                    image_i_seq, _, _ = self.patch_embed(image_i, t_i_emb)
+                elif isinstance(image_i, list):
+                    image_i_seq_list = []
+                    for j in range(len(image_i)):
+                        image_ij = image_i[j].unsqueeze(0)
+                        assert image_ij.ndim == 4, f"image_ij should have size of (1, C, H, W), got {list(image_ij.size())}"
+                        image_i_seq_j = self.patch_embed(image_ij, t_i_emb[j:j + 1])[0]
+                        image_i_seq_list.append(image_i_seq_j)
+                    image_i_seq = torch.cat(image_i_seq_list, dim=1)
+                else:
+                    raise TypeError(f"image_i should be a torch.Tensor or a list, got {type(image_i)}")
+
+                image_i_index = index[i:i + 1].masked_select(image_mask[i:i + 1].bool()).reshape(1, -1)
+                hidden_states[i:i + 1].scatter_(
+                    dim=1,
+                    index=image_i_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=image_i_seq.reshape(1, -1, n_embd).to(target_dtype),  # Cast for quantization compatibility
+                )
+
+        return hidden_states
+
+    def patched_instantiate_vit_image_tokens(self, hidden_states, images, image_masks, **image_kwargs):
+        """Patched version with dtype casting for quantization compatibility."""
+        if images is None:
+            return hidden_states
+
+        bsz, seqlen, n_embd = hidden_states.shape
+        target_dtype = hidden_states.dtype
+        index = torch.arange(seqlen, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+
+        if isinstance(images, torch.Tensor):
+            if images.ndim == 4:
+                n = 1
+            else:
+                n = 1
+            image_embeds = self._forward_vision_encoder(images, **image_kwargs)
+            image_seqlen = image_embeds.size(1)
+
+            image_scatter_index = index.masked_select(image_masks.bool()).reshape(bsz, -1)
+            hidden_states.scatter_(
+                dim=1,
+                index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=image_embeds.reshape(bsz, n * image_seqlen, n_embd).to(target_dtype),  # Cast
+            )
+        elif isinstance(images, list):
+            for i, (image, image_mask) in enumerate(zip(images, image_masks)):
+                cur_kwargs = {k: v[i] for k, v in image_kwargs.items()} if image_kwargs is not None else {}
+                image_embed = self._forward_vision_encoder(image, **cur_kwargs)
+                n, image_seqlen, n_embd_local = image_embed.shape
+                image_embed = image_embed.reshape(n * image_seqlen, n_embd_local)
+
+                image_scatter_index = index[i:i+1].masked_select(image_mask.bool()).reshape(1, -1)
+                hidden_states[i:i+1].scatter_(
+                    dim=1,
+                    index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=image_embed.reshape(1, -1, n_embd).to(target_dtype),  # Cast
+                )
+        else:
+            raise ValueError(f"und_images should be Tensor or List, but got {type(images)}")
+
+        return hidden_states
+
+    def patched_instantiate_continuous_tokens(self, hidden_states, timesteps=None, timesteps_index=None):
+        """Patched version with dtype casting for quantization compatibility."""
+        bsz, seqlen, n_embd = hidden_states.shape
+        target_dtype = hidden_states.dtype
+
+        if isinstance(timesteps, list):
+            for i, timestep in enumerate(timesteps):
+                timestep_src = self.timestep_emb(timestep)
+                hidden_states[i:i+1].scatter_(
+                    dim=1,
+                    index=timesteps_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=timestep_src.reshape(1, -1, n_embd).to(target_dtype),  # Cast
+                )
+        else:
+            timesteps_src = self.timestep_emb(timesteps.reshape(-1))
+            hidden_states.scatter_(
+                dim=1,
+                index=timesteps_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=timesteps_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
+            )
+
+        return hidden_states
+
+    def patched_instantiate_guidance_tokens(self, hidden_states, guidance=None, guidance_index=None):
+        """Patched version with dtype casting for quantization compatibility."""
+        bsz, seqlen, n_embd = hidden_states.shape
+        target_dtype = hidden_states.dtype
+
+        guidance_src = self.guidance_emb(guidance.reshape(-1))
+        hidden_states.scatter_(
+            dim=1,
+            index=guidance_index.unsqueeze(-1).repeat(1, 1, n_embd),
+            src=guidance_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
+        )
+
+        return hidden_states
+
+    def patched_instantiate_timestep_r_tokens(self, hidden_states, timesteps_r=None, timesteps_r_index=None):
+        """Patched version with dtype casting for quantization compatibility."""
+        bsz, seqlen, n_embd = hidden_states.shape
+        target_dtype = hidden_states.dtype
+
+        if isinstance(timesteps_r, list):
+            for i, timestep_r in enumerate(timesteps_r):
+                timestep_r_src = self.timestep_r_emb(timestep_r)
+                hidden_states[i:i+1].scatter_(
+                    dim=1,
+                    index=timesteps_r_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=timestep_r_src.reshape(1, -1, n_embd).to(target_dtype),  # Cast
+                )
+        else:
+            timesteps_r_src = self.timestep_r_emb(timesteps_r.reshape(-1))
+            hidden_states.scatter_(
+                dim=1,
+                index=timesteps_r_index.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=timesteps_r_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
+            )
+
+        return hidden_states
+
+    # Apply patches
+    model.instantiate_vae_image_tokens = types.MethodType(patched_instantiate_vae_image_tokens, model)
+    model.instantiate_vit_image_tokens = types.MethodType(patched_instantiate_vit_image_tokens, model)
+    model.instantiate_continuous_tokens = types.MethodType(patched_instantiate_continuous_tokens, model)
+    model.instantiate_guidance_tokens = types.MethodType(patched_instantiate_guidance_tokens, model)
+    model.instantiate_timestep_r_tokens = types.MethodType(patched_instantiate_timestep_r_tokens, model)
+
+    print("[hunyuan_image] Applied quantization dtype compatibility patches")
+    return model
+
 
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
@@ -676,6 +853,10 @@ class HunyuanImage3Backend:
 
             # Load tokenizer into model
             self.model.load_tokenizer(tokenizer_path)
+
+            # Apply quantization compatibility patches if using quantization
+            if use_q4_nf4 or use_q8:
+                self.model = apply_quantization_dtype_fix(self.model)
 
             self.current_model_path = model_path
             self.device_map = device_map

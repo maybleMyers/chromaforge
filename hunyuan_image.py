@@ -818,6 +818,7 @@ class HunyuanImage3Backend:
                     bnb_4bit_compute_dtype=torch.bfloat16,
                     bnb_4bit_use_double_quant=True,
                     llm_int8_skip_modules=HUNYUAN_SKIP_MODULES,
+                    llm_int8_enable_fp32_cpu_offload=cpu_offload,  # Enable CPU offload support
                 )
                 model_kwargs["quantization_config"] = quantization_config
             elif use_q8:
@@ -826,6 +827,7 @@ class HunyuanImage3Backend:
                     load_in_8bit=True,
                     llm_int8_skip_modules=HUNYUAN_SKIP_MODULES,
                     llm_int8_threshold=6.0,
+                    llm_int8_enable_fp32_cpu_offload=cpu_offload,  # Enable CPU offload support
                 )
                 model_kwargs["quantization_config"] = quantization_config
             else:

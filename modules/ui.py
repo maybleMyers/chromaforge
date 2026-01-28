@@ -1682,6 +1682,14 @@ def create_ui():
         (modelmerger_ui.blocks, "Checkpoint Merger", "modelmerger"),
     ]
 
+    # Add Z-Image i2L tab if available
+    try:
+        from modules import ui_zimage_i2l
+        i2l_interface = ui_zimage_i2l.create_i2l_interface()
+        interfaces.append((i2l_interface, "Z-Image i2L", "zimage_i2l"))
+    except Exception as e:
+        print(f"[UI] Could not load Z-Image i2L tab: {e}")
+
     interfaces += script_callbacks.ui_tabs_callback()
     interfaces += [(settings.interface, "Settings", "settings")]
 

@@ -400,6 +400,121 @@ class ZImageLoRAManager:
         """Return list of currently applied LoRAs."""
         return self.applied_loras.copy()
 
+    def apply_lora_dict(self, lora_dict: dict, strength: float = 1.0, name: str = "i2l_lora") -> dict:
+        """
+        Apply an in-memory LoRA dictionary to the model.
+
+        This method is designed for LoRA weights generated at runtime (e.g., from the
+        Image-to-LoRA model) rather than loaded from a file.
+
+        The LoRA dict should have keys in PEFT format:
+        - "layers.0.attention.to_q.lora_A.default.weight"
+        - "layers.0.attention.to_q.lora_B.default.weight"
+
+        Args:
+            lora_dict: Dictionary of LoRA weights
+            strength: LoRA strength multiplier (default 1.0)
+            name: Name for tracking this LoRA application
+
+        Returns:
+            Dict with statistics about the merge operation
+        """
+        # Clear any previously applied LoRAs first
+        if self.applied_loras:
+            self.clear_loras()
+
+        # Group LoRA keys by base key
+        lora_groups = {}
+        for key in lora_dict.keys():
+            # Parse PEFT format keys: {base}.lora_A.default.weight / {base}.lora_B.default.weight
+            if '.lora_A.default.weight' in key:
+                base_key = key.replace('.lora_A.default.weight', '')
+                if base_key not in lora_groups:
+                    lora_groups[base_key] = {}
+                lora_groups[base_key]['down'] = lora_dict[key]  # lora_A = down
+            elif '.lora_B.default.weight' in key:
+                base_key = key.replace('.lora_B.default.weight', '')
+                if base_key not in lora_groups:
+                    lora_groups[base_key] = {}
+                lora_groups[base_key]['up'] = lora_dict[key]  # lora_B = up
+
+        print(f"[Z-Image LoRA] Applying in-memory LoRA dict with {len(lora_groups)} base keys (strength={strength})")
+
+        matched = 0
+        applied = 0
+        unmatched_keys = []
+
+        for lora_base_key, lora_weights in lora_groups.items():
+            # The i2L model outputs keys without 'diffusion_model.' prefix
+            # Try to find the model key with various prefixes
+            model_key = self._find_model_key(lora_base_key)
+
+            if model_key is None:
+                unmatched_keys.append(lora_base_key)
+                continue
+
+            matched += 1
+
+            # Get LoRA components
+            lora_up = lora_weights.get('up')
+            lora_down = lora_weights.get('down')
+
+            if lora_up is None or lora_down is None:
+                continue
+
+            # Backup original weight before first modification
+            self._backup_weight(model_key)
+
+            # Get current parameter
+            param = self._get_parameter(model_key)
+            device = param.device
+            dtype = param.dtype
+
+            # For i2L LoRAs, there's no alpha - just use rank directly
+            rank = lora_down.shape[0]
+            scale = strength  # No alpha scaling for i2L
+
+            # Move LoRA weights to computation device
+            lora_up = lora_up.to(device=device, dtype=torch.float32)
+            lora_down = lora_down.to(device=device, dtype=torch.float32)
+
+            # Compute delta: up @ down * scale
+            # i2L output: lora_A shape [rank, in_features], lora_B shape [out_features, rank]
+            # So: lora_B @ lora_A = [out_features, in_features]
+            if len(lora_up.shape) == 2 and len(lora_down.shape) == 2:
+                delta = (lora_up @ lora_down) * scale
+            else:
+                print(f"[Z-Image LoRA] Unexpected shapes for {lora_base_key}: up={lora_up.shape}, down={lora_down.shape}")
+                continue
+
+            # Apply delta to weight
+            with torch.no_grad():
+                if param.shape == delta.shape:
+                    # Do addition in float32 to avoid precision loss
+                    if dtype == torch.bfloat16 or dtype == torch.float16:
+                        new_data = (param.data.float() + delta).to(dtype=dtype)
+                        param.data.copy_(new_data)
+                    else:
+                        param.data.add_(delta.to(dtype=dtype))
+                    applied += 1
+                else:
+                    print(f"[Z-Image LoRA] Shape mismatch for {model_key}: param={param.shape}, delta={delta.shape}")
+
+        if unmatched_keys:
+            print(f"[Z-Image LoRA] {len(unmatched_keys)} unmatched keys")
+            if len(unmatched_keys) <= 5:
+                print(f"[Z-Image LoRA] Unmatched: {unmatched_keys}")
+
+        print(f"[Z-Image LoRA] Applied {applied}/{matched} layers from in-memory LoRA")
+
+        self.applied_loras.append((name, strength))
+
+        return {
+            'applied': applied,
+            'matched': matched,
+            'unmatched': len(unmatched_keys),
+        }
+
 
 # Global manager instance per model (weak reference would be better but this is simpler)
 _lora_managers = {}
@@ -707,6 +822,7 @@ def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
     Supports multiple LoRA formats:
     - Kohya/WebUI format: .lora_up.weight, .lora_down.weight
     - PEFT/HuggingFace format: .lora_B.weight (up), .lora_A.weight (down)
+    - PEFT with adapter name: .lora_B.default.weight, .lora_A.default.weight (i2L generated)
     - sd-scripts/musubi-tuner format: lora_unet_*
     """
     global _logged_format_detection
@@ -738,6 +854,12 @@ def extract_lora_base_key(full_key: str) -> tuple[str, str] | None:
         return full_key[:-len('.lora_up.weight')], 'up'
     elif full_key.endswith('.lora_down.weight'):
         return full_key[:-len('.lora_down.weight')], 'down'
+    # PEFT format with adapter name (e.g., i2L generated LoRAs: .lora_B.default.weight)
+    # Must check BEFORE standard PEFT format since this is more specific
+    elif '.lora_B.default.weight' in full_key:
+        return full_key.split('.lora_B.default.weight')[0], 'up'
+    elif '.lora_A.default.weight' in full_key:
+        return full_key.split('.lora_A.default.weight')[0], 'down'
     # PEFT/HuggingFace format (lora_B = up, lora_A = down)
     elif full_key.endswith('.lora_B.weight'):
         return full_key[:-len('.lora_B.weight')], 'up'

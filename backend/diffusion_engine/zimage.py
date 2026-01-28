@@ -687,3 +687,121 @@ User input prompt: '''
         # VAE outputs [0, 1], convert to [-1, 1]
         result = decoded.movedim(-1, 1) * 2.0 - 1.0
         return result.to(x)
+
+    # ========== Image-to-LoRA (i2L) Support ==========
+
+    # Class-level cache for i2L models
+    _i2l_encoder = None
+    _i2l_model = None
+
+    @classmethod
+    def get_i2l_encoder(cls, models_dir: str = None):
+        """Get or create the i2L image encoder (SigLIP2 + DINOv3)."""
+        if cls._i2l_encoder is None:
+            from backend.nn.zimage_i2l_encoders import I2LImageEncoder
+            cls._i2l_encoder = I2LImageEncoder(models_dir)
+        return cls._i2l_encoder
+
+    @classmethod
+    def get_i2l_model(cls, model_path: str = None):
+        """Get or create the Image2LoRA model."""
+        if cls._i2l_model is None:
+            from backend.nn.zimage_image2lora import load_zimage_i2l_model
+            import os
+            if model_path is None:
+                # Default path
+                model_path = os.path.join(
+                    os.path.dirname(__file__), "..", "..", "models", "Z-Image-i2L", "model.safetensors"
+                )
+            cls._i2l_model = load_zimage_i2l_model(model_path)
+        return cls._i2l_model
+
+    @classmethod
+    def unload_i2l_models(cls):
+        """Unload i2L models to free VRAM."""
+        if cls._i2l_encoder is not None:
+            cls._i2l_encoder.unload()
+            cls._i2l_encoder = None
+        if cls._i2l_model is not None:
+            del cls._i2l_model
+            cls._i2l_model = None
+        torch.cuda.empty_cache()
+
+    @classmethod
+    @torch.inference_mode()
+    def generate_lora_from_images(
+        cls,
+        images: list,
+        models_dir: str = None,
+        i2l_model_path: str = None,
+        device: str = "cuda",
+        dtype=torch.bfloat16,
+        alphas: list = None,
+    ) -> dict:
+        """
+        Generate LoRA weights from style reference images.
+
+        Args:
+            images: List of PIL Images (1-4 recommended)
+            models_dir: Path to models directory (for encoders)
+            i2l_model_path: Path to Image2LoRA model.safetensors
+            device: Computation device
+            dtype: Model dtype
+            alphas: Optional weights for each image (default: equal weighting)
+
+        Returns:
+            Dict of LoRA weights that can be applied to the Z-Image model
+        """
+        from backend.nn.zimage_image2lora import merge_lora_dicts
+
+        print(f"[Z-Image i2L] Generating LoRA from {len(images)} style images...")
+
+        # Load encoder and encode images
+        encoder = cls.get_i2l_encoder(models_dir)
+        embeddings = encoder.encode_and_unload(images, device=device, dtype=dtype)
+        print(f"[Z-Image i2L] Encoded images to embeddings: {embeddings.shape}")
+
+        # Load i2L model and generate LoRA for each image
+        i2l_model = cls.get_i2l_model(i2l_model_path)
+        i2l_model = i2l_model.to(device=device, dtype=dtype)
+
+        lora_dicts = []
+        for i in range(embeddings.shape[0]):
+            emb = embeddings[i:i+1]  # [1, 5632]
+            lora = i2l_model(emb)
+            lora_dicts.append(lora)
+            print(f"[Z-Image i2L] Generated LoRA {i+1}/{len(images)}")
+
+        # Merge LoRAs if multiple images
+        if len(lora_dicts) > 1:
+            merged_lora = merge_lora_dicts(lora_dicts, alphas)
+            print(f"[Z-Image i2L] Merged {len(lora_dicts)} LoRAs")
+        else:
+            merged_lora = lora_dicts[0]
+
+        # Unload i2L model to free VRAM
+        cls.unload_i2l_models()
+
+        print(f"[Z-Image i2L] Generated LoRA with {len(merged_lora)} keys")
+        return merged_lora
+
+    @classmethod
+    def save_lora_to_file(cls, lora_dict: dict, output_path: str):
+        """
+        Save a generated LoRA dictionary to a safetensors file.
+
+        Args:
+            lora_dict: LoRA weights dictionary from generate_lora_from_images
+            output_path: Path to save the .safetensors file
+        """
+        from safetensors.torch import save_file
+        import os
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Convert tensors to CPU for saving
+        cpu_dict = {k: v.cpu() for k, v in lora_dict.items()}
+
+        save_file(cpu_dict, output_path)
+        print(f"[Z-Image i2L] Saved LoRA to {output_path}")

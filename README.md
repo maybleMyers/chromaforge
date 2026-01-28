@@ -45,6 +45,35 @@ I have added support for these models as well:
 https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct  
 https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct  
 
+## To use Z-Image i2L (Image-to-LoRA), you need to download the encoder models. and the i2L model
+
+### Download from HuggingFace (Recommended)
+
+```bash
+# Using huggingface-cli
+huggingface-cli download DiffSynth-Studio/General-Image-Encoders --local-dir ./models/Z-Image-i2L/
+
+https://www.modelscope.cn/models/DiffSynth-Studio/Z-Image-i2L
+# Or using git
+git lfs install
+git clone https://huggingface.co/DiffSynth-Studio/General-Image-Encoders ./models/Z-Image-i2L/
+```
+
+**Direct link:** https://huggingface.co/DiffSynth-Studio/General-Image-Encoders
+
+### Expected File Structure rename files
+
+```
+models/Z-Image-i2L/
+├── model.safetensors          # Image2LoRA model (already present)
+├── SigLIP2-G384/
+│   └── model.safetensors      # SigLIP2 encoder (~2GB)
+└── DINOv3-7B/
+    └── model.safetensors      # DINOv3 encoder (~7GB)
+```
+
+---
+
 ## Radiance Model
 
 This supports the latest x32 model.

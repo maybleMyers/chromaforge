@@ -528,6 +528,65 @@ def apply_quantization_dtype_fix(model):
     model.instantiate_guidance_tokens = types.MethodType(patched_instantiate_guidance_tokens, model)
     model.instantiate_timestep_r_tokens = types.MethodType(patched_instantiate_timestep_r_tokens, model)
 
+    # === Patch HunyuanStaticCache.update for index_copy_ dtype compatibility ===
+    # The KV cache buffers may be in a different dtype than key/value states with CPU offload
+    import importlib
+    model_module = type(model).__module__
+    hunyuan_module = importlib.import_module(model_module)
+
+    if hasattr(hunyuan_module, 'HunyuanStaticCache'):
+        HunyuanStaticCache = hunyuan_module.HunyuanStaticCache
+
+        def patched_cache_update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+            """Patched update with dtype casting for quantization compatibility."""
+            cache_position = cache_kwargs.get("cache_position") if cache_kwargs else None
+
+            # Lazy initialization if needed
+            if self.layers[layer_idx].keys is None:
+                self.layers[layer_idx].lazy_initialization(key_states)
+
+            k_out = self.layers[layer_idx].keys
+            v_out = self.layers[layer_idx].values
+
+            # Get target dtype from the cache buffers and cast if needed
+            target_dtype = k_out.dtype
+            if key_states.dtype != target_dtype:
+                key_states = key_states.to(target_dtype)
+            if value_states.dtype != target_dtype:
+                value_states = value_states.to(target_dtype)
+
+            if cache_position is None:
+                k_out.copy_(key_states)
+                v_out.copy_(value_states)
+            else:
+                if cache_position.dim() == 1:
+                    k_out.index_copy_(2, cache_position, key_states)
+                    v_out.index_copy_(2, cache_position, value_states)
+
+                    if self.dynamic:
+                        end = cache_position[-1].item() + 1
+                        k_out = k_out[:, :, :end]
+                        v_out = v_out[:, :, :end]
+                else:
+                    assert cache_position.dim() == 2
+                    batch_size, idx_size = cache_position.shape
+                    for i in range(batch_size):
+                        unbatched_dim = 1
+                        k_out[i].index_copy_(unbatched_dim, cache_position[i], key_states[i])
+                        v_out[i].index_copy_(unbatched_dim, cache_position[i], value_states[i])
+
+                    if self.dynamic:
+                        assert len(cache_position) == 1
+                        end = cache_position[0, -1].item() + 1
+                        k_out = k_out[:, :, :end]
+                        v_out = v_out[:, :, :end]
+
+            return k_out, v_out
+
+        # Replace the class method (affects all instances)
+        HunyuanStaticCache.update = patched_cache_update
+        print("[hunyuan_image] Applied KV cache dtype compatibility patch")
+
     print("[hunyuan_image] Applied quantization dtype compatibility patches")
     return model
 

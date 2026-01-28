@@ -296,19 +296,10 @@ except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
     print(f"Error: transformers not installed or incompatible version: {e}")
 
-# Try to import HunyuanImage-3.0 model
-try:
-    from hunyuan3.modeling_hunyuan_image_3 import HunyuanImage3ForCausalMM
-    from hunyuan3.configuration_hunyuan_image_3 import HunyuanImage3Config
-    from hunyuan3.tokenization_hunyuan_image_3 import HunyuanImage3TokenizerFast
-    HUNYUAN_AVAILABLE = True
-    print("HunyuanImage-3.0: available")
-except ImportError as e:
-    HUNYUAN_AVAILABLE = False
-    HunyuanImage3ForCausalMM = None
-    HunyuanImage3Config = None
-    HunyuanImage3TokenizerFast = None
-    print(f"Note: HunyuanImage-3.0 not available: {e}")
+# HunyuanImage-3.0 uses trust_remote_code to load model classes from the model directory
+# No need to import from a local hunyuan3/ folder
+from transformers import AutoModelForCausalLM
+HUNYUAN_AVAILABLE = TRANSFORMERS_AVAILABLE  # Available if transformers is installed
 
 try:
     import accelerate
@@ -514,7 +505,7 @@ class HunyuanImage3Backend:
             return "Error: transformers not installed"
 
         if not HUNYUAN_AVAILABLE:
-            return "Error: HunyuanImage-3.0 modules not found. Ensure hunyuan3/ directory is present."
+            return "Error: transformers not available for HunyuanImage-3.0"
 
         # Find the model
         models = self.get_available_models()
@@ -630,8 +621,9 @@ class HunyuanImage3Backend:
             progress(0.4, desc="Loading HunyuanImage-3.0 model...")
             print(f"[hunyuan_image] Loading model from {model_path}")
 
-            # Load the model
-            self.model = HunyuanImage3ForCausalMM.from_pretrained(
+            # Load the model using AutoModelForCausalLM with trust_remote_code
+            # This loads model classes directly from the model directory
+            self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 **model_kwargs,
             )

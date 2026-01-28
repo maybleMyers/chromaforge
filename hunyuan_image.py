@@ -333,6 +333,7 @@ except ImportError as e:
 # HunyuanImage-3.0 uses trust_remote_code to load model classes from the model directory
 # No need to import from a local hunyuan3/ folder
 from transformers import AutoModelForCausalLM
+from transformers.generation.streamers import TextIteratorStreamer
 HUNYUAN_AVAILABLE = TRANSFORMERS_AVAILABLE  # Available if transformers is installed
 
 try:
@@ -880,6 +881,158 @@ class HunyuanImage3Backend:
             traceback.print_exc()
             return None, {"error": str(e)}, ""
 
+    def generate_image_streaming(
+        self,
+        prompt: str,
+        reference_image: Optional[Image.Image] = None,
+        seed: int = -1,
+        image_size: str = "1024x1024",
+        num_inference_steps: int = 50,
+        guidance_scale: float = 2.5,
+        flow_shift: float = 3.0,
+        system_prompt_type: Optional[str] = "en_unified",
+        custom_system_prompt: Optional[str] = None,
+        bot_task: str = "think_recaption",
+        verbose: int = 2,
+        infer_align_image_size: bool = True,
+        use_taylor_cache: bool = False,
+    ):
+        """
+        Generator that yields (cot_text, stats_text, image) tuples during generation.
+        Streams the thinking/reasoning text in real-time with tok/s display.
+        """
+        if self.model is None:
+            yield "", "No model loaded", None
+            return
+
+        # Parse image size
+        if "x" in image_size:
+            width, height = map(int, image_size.split("x"))
+        else:
+            width = height = int(image_size)
+
+        # Handle seed
+        actual_seed = seed if seed >= 0 else int(time.time() * 1000) % (2**32)
+        print(f"[hunyuan_image] Streaming generation: seed={actual_seed}, size={width}x{height}, steps={num_inference_steps}")
+
+        # Create streamer for real-time token capture
+        streamer = TextIteratorStreamer(
+            self.model._tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=False,
+        )
+
+        # Build generation kwargs
+        gen_kwargs = {
+            "prompt": prompt,
+            "image": reference_image,
+            "image_size": (height, width),
+            "diff_infer_steps": num_inference_steps,
+            "diff_guidance_scale": guidance_scale,
+            "flow_shift": flow_shift,
+            "seed": actual_seed,
+            "verbose": 1,  # Keep minimal console output
+            "use_taylor_cache": use_taylor_cache,
+            "streamer": streamer,  # Pass our custom streamer
+        }
+
+        # Add infer_align_image_size for I2I mode
+        if reference_image is not None:
+            gen_kwargs["infer_align_image_size"] = infer_align_image_size
+
+        # Add system prompt if specified
+        if system_prompt_type and system_prompt_type != "None":
+            if system_prompt_type == "custom" and custom_system_prompt:
+                gen_kwargs["use_system_prompt"] = "custom"
+                gen_kwargs["system_prompt"] = custom_system_prompt
+            else:
+                gen_kwargs["use_system_prompt"] = system_prompt_type
+
+        # Add bot task
+        if bot_task:
+            gen_kwargs["bot_task"] = bot_task
+
+        print(f"[hunyuan_image] Streaming with guidance={guidance_scale}, flow_shift={flow_shift}")
+
+        # Store generation result from thread
+        generation_result = {"image": None, "error": None, "cot_text": None}
+
+        def run_generation():
+            try:
+                cot_text, outputs = self.model.generate_image(**gen_kwargs)
+                # Extract the generated image
+                if outputs and hasattr(outputs, 'images') and len(outputs.images) > 0:
+                    generation_result["image"] = outputs.images[0]
+                elif isinstance(outputs, list) and len(outputs) > 0:
+                    generation_result["image"] = outputs[0]
+                else:
+                    generation_result["image"] = outputs
+                generation_result["cot_text"] = cot_text
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                generation_result["error"] = str(e)
+
+        # Start generation in background thread
+        thread = threading.Thread(target=run_generation)
+        start_time = time.perf_counter()
+        thread.start()
+
+        # Stream tokens from the iterator
+        accumulated_text = ""
+        token_count = 0
+        last_yield_time = start_time
+
+        try:
+            for token_text in streamer:
+                # Check global stop flag
+                global stop_generation
+                if stop_generation:
+                    print("[hunyuan_image] Generation stopped by user")
+                    break
+
+                accumulated_text += token_text
+                token_count += 1
+
+                # Calculate tok/s
+                elapsed = time.perf_counter() - start_time
+                tps = token_count / elapsed if elapsed > 0 else 0
+
+                # Yield update (throttle to ~10 updates per second to avoid UI lag)
+                current_time = time.perf_counter()
+                if current_time - last_yield_time >= 0.1:
+                    stats = f"{tps:.1f} tok/s | {token_count} tokens | {elapsed:.1f}s"
+                    yield accumulated_text, stats, None
+                    last_yield_time = current_time
+
+        except Exception as e:
+            print(f"[hunyuan_image] Streaming error: {e}")
+
+        # Wait for thread to complete (image generation phase)
+        print("[hunyuan_image] Text generation complete, waiting for image...")
+
+        # Yield status during diffusion phase
+        while thread.is_alive():
+            elapsed = time.perf_counter() - start_time
+            stats = f"{token_count} tokens done | Generating image... | {elapsed:.1f}s"
+            yield accumulated_text, stats, None
+            time.sleep(0.5)  # Check every 0.5 seconds
+
+        thread.join()
+
+        # Final result
+        total_time = time.perf_counter() - start_time
+        final_tps = token_count / total_time if total_time > 0 else 0
+
+        if generation_result["error"]:
+            error_stats = f"Error: {generation_result['error']}"
+            yield accumulated_text, error_stats, None
+        else:
+            image = generation_result["image"]
+            final_stats = f"{final_tps:.1f} tok/s | {token_count} tokens | {total_time:.1f}s | Seed: {actual_seed} | {width}x{height}"
+            print(f"[hunyuan_image] Streaming complete: {token_count} tokens, {total_time:.1f}s, {final_tps:.1f} tok/s")
+            yield accumulated_text, final_stats, image
+
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path."""
         temp_dir = tempfile.gettempdir()
@@ -968,21 +1121,24 @@ def generate_handler(
     use_taylor_cache: bool,
     progress=gr.Progress()
 ):
-    """Handle image generation."""
+    """Generator handler for streaming image generation with real-time CoT display."""
     global stop_generation
 
     # Check if stop was requested before starting
     if stop_generation:
         stop_generation = False
-        return None, "Generation cancelled", ""
+        yield None, "Generation cancelled", ""
+        return
 
     if hunyuan_backend is None:
-        return None, "Backend not initialized", ""
+        yield None, "Backend not initialized", ""
+        return
 
     # Reset stop flag
     stop_generation = False
 
-    image, stats, cot_text = hunyuan_backend.generate_image(
+    # Use the streaming generator
+    for cot_text, stats, image in hunyuan_backend.generate_image_streaming(
         prompt=prompt,
         reference_image=reference_image,
         seed=int(seed),
@@ -996,14 +1152,14 @@ def generate_handler(
         verbose=int(verbose),
         infer_align_image_size=infer_align_image_size,
         use_taylor_cache=use_taylor_cache,
-        progress=progress,
-    )
+    ):
+        # Check stop flag during streaming
+        if stop_generation:
+            stop_generation = False
+            yield image, stats + " [Stopped]", cot_text
+            return
 
-    if "error" in stats:
-        return None, f"Error: {stats['error']}", ""
-
-    stats_text = f"Time: {stats['time']:.2f}s | Seed: {stats['seed']} | Size: {stats['size']} | Steps: {stats['steps']} | Guidance: {stats['guidance']} | Flow: {stats['flow_shift']}"
-    return image, stats_text, cot_text
+        yield image, stats, cot_text
 
 
 def stop_generation_handler():
@@ -1161,12 +1317,13 @@ def create_ui():
                     stop_btn = gr.Button("Stop", variant="stop", elem_classes=["red-btn"], scale=1)
                     clear_btn = gr.Button("Clear", variant="secondary", scale=1)
 
-                with gr.Accordion("CoT Reasoning", open=False):
+                with gr.Accordion("CoT Reasoning (streams in real-time)", open=True):
                     cot_output = gr.Textbox(
                         label="Chain-of-Thought Reasoning",
                         interactive=False,
-                        lines=6,
-                        placeholder="Reasoning output will appear here when using think_recaption bot task...",
+                        lines=8,
+                        placeholder="Reasoning output will stream here when using think_recaption bot task...",
+                        autoscroll=True,
                     )
 
                 stats_display = gr.Textbox(

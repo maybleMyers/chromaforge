@@ -1013,6 +1013,17 @@ class HunyuanImage3Backend:
                 "use_taylor_cache": use_taylor_cache,
             }
 
+            # Add Taylor cache parameters when enabled
+            if use_taylor_cache:
+                gen_kwargs["taylor_cache_interval"] = 3  # Full computation every 3 steps
+                gen_kwargs["taylor_cache_order"] = 2     # 2nd order Taylor approximation
+                gen_kwargs["taylor_cache_enable_first_enhance"] = True
+                gen_kwargs["taylor_cache_first_enhance_steps"] = 3
+                gen_kwargs["taylor_cache_enable_tailing_enhance"] = True
+                gen_kwargs["taylor_cache_tailing_enhance_steps"] = 1
+                gen_kwargs["taylor_cache_low_freqs_order"] = 0
+                gen_kwargs["taylor_cache_high_freqs_order"] = 2
+
             # Add infer_align_image_size for I2I mode
             if reference_image is not None:
                 gen_kwargs["infer_align_image_size"] = infer_align_image_size
@@ -1127,6 +1138,17 @@ class HunyuanImage3Backend:
             "use_taylor_cache": use_taylor_cache,
             "streamer": streamer,  # Pass our custom streamer
         }
+
+        # Add Taylor cache parameters when enabled
+        if use_taylor_cache:
+            gen_kwargs["taylor_cache_interval"] = 3  # Full computation every 3 steps
+            gen_kwargs["taylor_cache_order"] = 2     # 2nd order Taylor approximation
+            gen_kwargs["taylor_cache_enable_first_enhance"] = True
+            gen_kwargs["taylor_cache_first_enhance_steps"] = 3
+            gen_kwargs["taylor_cache_enable_tailing_enhance"] = True
+            gen_kwargs["taylor_cache_tailing_enhance_steps"] = 1
+            gen_kwargs["taylor_cache_low_freqs_order"] = 0
+            gen_kwargs["taylor_cache_high_freqs_order"] = 2
 
         # Add infer_align_image_size for I2I mode
         if reference_image is not None:

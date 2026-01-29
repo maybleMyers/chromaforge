@@ -337,7 +337,6 @@ except ImportError as e:
 # HunyuanImage-3.0 uses trust_remote_code to load model classes from the model directory
 # No need to import from a local hunyuan3/ folder
 from transformers import AutoModelForCausalLM
-from transformers.generation.streamers import TextIteratorStreamer
 HUNYUAN_AVAILABLE = TRANSFORMERS_AVAILABLE  # Available if transformers is installed
 
 try:
@@ -589,6 +588,28 @@ def apply_quantization_dtype_fix(model):
 
     print("[hunyuan_image] Applied quantization dtype compatibility patches")
     return model
+
+
+def apply_global_scatter_dtype_fix():
+    """
+    Patch torch.Tensor.scatter_ to automatically cast src tensor to destination dtype.
+    This fixes dtype mismatches when using BitsAndBytes quantization with image generation.
+    The existing apply_quantization_dtype_fix only patches 5 methods, but there are 20+
+    scatter operations in the image generation pipeline that also need dtype casting.
+    """
+    if hasattr(torch.Tensor, '_original_scatter_'):
+        return  # Already patched
+
+    original_scatter = torch.Tensor.scatter_
+
+    def patched_scatter_(self, dim, index, src, **kwargs):
+        if isinstance(src, torch.Tensor) and src.dtype != self.dtype:
+            src = src.to(self.dtype)
+        return original_scatter(self, dim, index, src, **kwargs)
+
+    torch.Tensor._original_scatter_ = original_scatter
+    torch.Tensor.scatter_ = patched_scatter_
+    print("[hunyuan_image] Applied global scatter_ dtype fix")
 
 
 def get_gpu_info() -> List[Dict[str, Any]]:
@@ -956,6 +977,7 @@ class HunyuanImage3Backend:
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8:
                 self.model = apply_quantization_dtype_fix(self.model)
+                apply_global_scatter_dtype_fix()
 
             self.current_model_path = model_path
             self.device_map = device_map
@@ -1221,13 +1243,6 @@ class HunyuanImage3Backend:
         actual_seed = seed if seed >= 0 else int(time.time() * 1000) % (2**32)
         print(f"[hunyuan_image] Streaming generation: seed={actual_seed}, size={width}x{height}, steps={num_inference_steps}")
 
-        # Create streamer for real-time token capture
-        streamer = TextIteratorStreamer(
-            self.model._tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=False,
-        )
-
         # Build generation kwargs
         gen_kwargs = {
             "prompt": prompt,
@@ -1239,7 +1254,6 @@ class HunyuanImage3Backend:
             "seed": actual_seed,
             "verbose": 1,  # Keep minimal console output
             "use_taylor_cache": use_taylor_cache,
-            "streamer": streamer,  # Pass our custom streamer
         }
 
         # Also set on generation_config directly (some model versions ignore kwargs)
@@ -1305,46 +1319,18 @@ class HunyuanImage3Backend:
         start_time = time.perf_counter()
         thread.start()
 
-        # Stream tokens from the iterator
-        accumulated_text = ""
-        token_count = 0
-        last_yield_time = start_time
-
-        try:
-            for token_text in streamer:
-                # Check global stop flag
-                global stop_generation
-                if stop_generation:
-                    print("[hunyuan_image] Generation stopped by user")
-                    break
-
-                accumulated_text += token_text
-                token_count += 1
-
-                # Calculate tok/s
-                elapsed = time.perf_counter() - start_time
-                tps = token_count / elapsed if elapsed > 0 else 0
-
-                # Yield update (throttle to ~10 updates per second to avoid UI lag)
-                current_time = time.perf_counter()
-                if current_time - last_yield_time >= 0.1:
-                    stats = f"{tps:.1f} tok/s | {token_count} tokens | {elapsed:.1f}s"
-                    yield accumulated_text, stats, None
-                    last_yield_time = current_time
-
-        except Exception as e:
-            print(f"[hunyuan_image] Streaming error: {e}")
-
-        # Wait for thread to complete (image generation phase)
-        print("[hunyuan_image] Text generation complete, waiting for image...")
-        log_gpu_memory("After text generation, before diffusion")
-
-        # Yield status during diffusion phase
+        # Poll for completion while showing progress
         while thread.is_alive():
+            # Check global stop flag
+            global stop_generation
+            if stop_generation:
+                print("[hunyuan_image] Generation stopped by user")
+                break
+
             elapsed = time.perf_counter() - start_time
-            stats = f"{token_count} tokens done | Generating image... | {elapsed:.1f}s"
-            yield accumulated_text, stats, None
-            time.sleep(0.5)  # Check every 0.5 seconds
+            stats = f"Generating... | {elapsed:.1f}s"
+            yield "", stats, None
+            time.sleep(0.5)
 
         thread.join()
 
@@ -1353,16 +1339,21 @@ class HunyuanImage3Backend:
 
         # Final result
         total_time = time.perf_counter() - start_time
-        final_tps = token_count / total_time if total_time > 0 else 0
 
         if generation_result["error"]:
             error_stats = f"Error: {generation_result['error']}"
-            yield accumulated_text, error_stats, None
+            yield "", error_stats, None
         else:
             image = generation_result["image"]
-            final_stats = f"{final_tps:.1f} tok/s | {token_count} tokens | {total_time:.1f}s | Seed: {actual_seed} | {width}x{height}"
-            print(f"[hunyuan_image] Streaming complete: {token_count} tokens, {total_time:.1f}s, {final_tps:.1f} tok/s")
-            yield accumulated_text, final_stats, image
+            cot_text = generation_result.get("cot_text", "")
+            # Format cot_text if it's a list
+            if isinstance(cot_text, list) and len(cot_text) > 0:
+                cot_text = cot_text[0] if isinstance(cot_text[0], str) else str(cot_text[0])
+            elif not isinstance(cot_text, str):
+                cot_text = str(cot_text) if cot_text else ""
+            final_stats = f"{total_time:.1f}s | Seed: {actual_seed} | {width}x{height}"
+            print(f"[hunyuan_image] Generation complete: {total_time:.1f}s")
+            yield cot_text, final_stats, image
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path."""

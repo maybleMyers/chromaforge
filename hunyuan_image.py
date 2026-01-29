@@ -1184,10 +1184,34 @@ class HunyuanImage3Backend:
 
                 progress(0.7, desc="Applying quantized weights...")
 
-                # Apply quantized weights - this materializes the model with quanto tensors
-                requantize(self.model, state_dict, qmap, device="cuda")
+                # Apply quantized weights to CPU first (don't pass device to avoid OOM)
+                requantize(self.model, state_dict, qmap)
 
-                log_gpu_memory("After Quanto loading")
+                # Free state_dict memory
+                del state_dict
+                gc.collect()
+
+                progress(0.8, desc="Dispatching model to devices...")
+
+                # Use accelerate to dispatch model with CPU offloading
+                from accelerate import infer_auto_device_map, dispatch_model
+
+                # Build max_memory dict for offloading
+                dispatch_max_memory = {}
+                if self.num_gpus > 0:
+                    # Leave some room for activations
+                    dispatch_max_memory[0] = f"{int(torch.cuda.get_device_properties(0).total_memory * 0.9 / 1024**3)}GiB"
+                if cpu_offload and cpu_offload_ram:
+                    dispatch_max_memory["cpu"] = f"{cpu_offload_ram}GiB"
+                else:
+                    dispatch_max_memory["cpu"] = "64GiB"
+
+                print(f"[hunyuan_image] Dispatching with max_memory: {dispatch_max_memory}")
+
+                device_map = infer_auto_device_map(self.model, max_memory=dispatch_max_memory)
+                self.model = dispatch_model(self.model, device_map=device_map)
+
+                log_gpu_memory("After Quanto loading and dispatch")
                 print(f"[hunyuan_image] Loaded pre-quantized model successfully")
 
             else:

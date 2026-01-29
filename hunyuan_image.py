@@ -444,7 +444,14 @@ def _fp8_linear_forward(layer, input):
     weight = layer.weight
     scale = layer.scale_weight
     input_dtype = input.dtype
+    input_device = input.device
     computation_dtype = getattr(layer, 'computation_dtype', torch.bfloat16)
+
+    # Ensure weight and scale are on the same device as input
+    if weight.device != input_device:
+        weight = weight.to(input_device)
+    if scale.device != input_device:
+        scale = scale.to(input_device)
 
     # Dequantize weight to computation dtype
     weight_dequant = weight.to(computation_dtype) * scale.to(computation_dtype)
@@ -454,7 +461,10 @@ def _fp8_linear_forward(layer, input):
 
     # Standard linear
     if layer.bias is not None:
-        output = torch.nn.functional.linear(input_cast, weight_dequant, layer.bias.to(computation_dtype))
+        bias = layer.bias
+        if bias.device != input_device:
+            bias = bias.to(input_device)
+        output = torch.nn.functional.linear(input_cast, weight_dequant, bias.to(computation_dtype))
     else:
         output = torch.nn.functional.linear(input_cast, weight_dequant, None)
 
@@ -1527,11 +1537,14 @@ class HunyuanImage3Backend:
                             with safe_open(shard_path, framework="pt", device="cpu") as f:
                                 for key in f.keys():
                                     if key.endswith('.scale_weight'):
-                                        # Load scale buffer
+                                        # Load scale buffer to same device as the weight
                                         module_name = key.rsplit('.scale_weight', 1)[0]
                                         try:
                                             module = self.model.get_submodule(module_name)
                                             scale = f.get_tensor(key)
+                                            # Move scale to same device as weight
+                                            if hasattr(module, 'weight') and module.weight is not None:
+                                                scale = scale.to(module.weight.device)
                                             module.register_buffer('scale_weight', scale)
                                             scales_loaded += 1
                                         except AttributeError:

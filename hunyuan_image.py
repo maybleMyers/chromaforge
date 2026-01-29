@@ -232,10 +232,12 @@ except ImportError:
 
 def convert_model_to_fp8_scaled(model, skip_patterns=None):
     """
-    Convert model linear layers to FP8 with per-tensor scaling.
+    Convert model linear layers to FP8 with per-tensor scaling at runtime.
     Saves ~50% memory. Works on any GPU (older GPUs compute in fp16/fp32).
 
-    Intelligently skips layers that would lose too much precision in FP8.
+    Note: This runtime conversion may not work well with device_map='auto' because
+    weights may be on meta device. For best results, use convert_to_fp8.py to
+    pre-convert the model offline.
 
     Args:
         model: The model to convert
@@ -247,14 +249,35 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
     import torch.nn as nn
 
     if skip_patterns is None:
-        # Default: skip embedding, output head, norm, and vision encoder layers
-        # Vision layers are sensitive to quantization (based on analysis)
         skip_patterns = ['embed', 'lm_head', 'wte', 'wpe', 'norm', 'visual']
 
+    # Normalize patterns
+    skip_patterns = [p.lower() for p in skip_patterns]
+
     converted_count = 0
-    skipped_count = 0
+    skipped_meta = 0
+    skipped_pattern = 0
+    skipped_range = 0
+    skipped_fp8 = 0
     total_params_before = 0
     total_params_after = 0
+
+    # First pass: count layers and check for meta tensors
+    total_linear = 0
+    meta_count = 0
+    for name, child in model.named_modules():
+        if isinstance(child, nn.Linear):
+            total_linear += 1
+            if child.weight.data.device.type == 'meta':
+                meta_count += 1
+
+    print(f"[FP8] Found {total_linear} linear layers, {meta_count} on meta device")
+
+    if meta_count > total_linear * 0.5:
+        print(f"[FP8] WARNING: Most weights are on meta device (device_map offloading)")
+        print(f"[FP8] Runtime FP8 conversion will skip these layers.")
+        print(f"[FP8] For proper FP8 support, pre-convert the model using:")
+        print(f"[FP8]   python convert_to_fp8.py --input <model_path> --output <output_path>")
 
     for name, child in model.named_modules():
         if isinstance(child, nn.Linear) and not hasattr(child, 'fp8_converted'):
@@ -263,37 +286,36 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
 
             # Skip if already FP8
             if original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                skipped_fp8 += 1
                 continue
 
-            # Skip meta tensors (shouldn't happen after CPU load, but be safe)
+            # Skip meta tensors
             if weight.device.type == 'meta':
-                skipped_count += 1
+                skipped_meta += 1
                 continue
 
             # Skip patterns that shouldn't be converted
             if any(pattern in name.lower() for pattern in skip_patterns):
-                skipped_count += 1
+                skipped_pattern += 1
                 continue
 
-            # Check if layer can be safely converted to FP8
-            # FP8 E4M3 has range ~[-448, 448] with limited precision
+            # Check dynamic range
             weight_float = weight.float()
             abs_max = weight_float.abs().max()
             non_zero = weight_float[weight_float != 0]
             abs_min = non_zero.abs().min() if non_zero.numel() > 0 else torch.tensor(1.0)
 
-            # Skip if dynamic range is too large (would lose small values)
             if abs_max > 0 and abs_min > 0:
                 dynamic_range = abs_max / abs_min
-                if dynamic_range > 1e6:  # Very large dynamic range
-                    skipped_count += 1
+                if dynamic_range > 1e6:
+                    skipped_range += 1
                     continue
 
             # Calculate memory before
             param_bytes_before = weight.numel() * weight.element_size()
             total_params_before += param_bytes_before
 
-            # Compute scale factor (FP8 E4M3 max value is ~448)
+            # Compute scale factor
             if abs_max == 0:
                 abs_max = torch.tensor(1.0, device=weight.device, dtype=torch.float32)
             scale = (abs_max / 448.0).float()
@@ -304,28 +326,31 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
             # Store FP8 weight and scale
             child.weight = nn.Parameter(fp8_weight, requires_grad=False)
             child.register_buffer('scale_weight', scale.view(1))
-            child.computation_dtype = original_dtype  # Use original dtype for computation
+            child.computation_dtype = original_dtype
 
             # Calculate memory after
             total_params_after += fp8_weight.numel() * fp8_weight.element_size()
-            total_params_after += 4  # scale is float32
+            total_params_after += 4
 
             # Replace forward method
-            original_forward = child.forward
-            child.original_forward = original_forward
+            child.original_forward = child.forward
             child.forward = lambda x, m=child: _fp8_linear_forward(m, x)
             child.fp8_converted = True
 
             converted_count += 1
 
-    if converted_count > 0 or skipped_count > 0:
+    # Print summary
+    total_skipped = skipped_meta + skipped_pattern + skipped_range + skipped_fp8
+    print(f"[FP8] Converted {converted_count} layers to FP8")
+    print(f"[FP8] Skipped {total_skipped}: {skipped_meta} meta, {skipped_pattern} pattern, {skipped_range} range, {skipped_fp8} already FP8")
+
+    if total_params_before > 0:
         mem_before_gb = total_params_before / (1024**3)
         mem_after_gb = total_params_after / (1024**3)
-        reduction = (1 - mem_after_gb / mem_before_gb) * 100 if mem_before_gb > 0 else 0
-        print(f"[FP8] Converted {converted_count} linear layers to FP8 scaled, skipped {skipped_count}")
-        print(f"[FP8] Linear layer memory: {mem_before_gb:.2f}GB -> {mem_after_gb:.2f}GB ({reduction:.1f}% reduction)")
+        reduction = (1 - mem_after_gb / mem_before_gb) * 100
+        print(f"[FP8] Memory: {mem_before_gb:.2f}GB -> {mem_after_gb:.2f}GB ({reduction:.1f}% reduction)")
 
-    # Force garbage collection to free original weights
+    # Force garbage collection
     import gc
     gc.collect()
     if torch.cuda.is_available():
@@ -418,7 +443,7 @@ def _fp8_linear_forward(layer, input):
     """FP8 linear forward with dequantization."""
     weight = layer.weight
     scale = layer.scale_weight
-    computation_dtype = getattr(layer, 'computation_dtype', torch.float16)
+    computation_dtype = getattr(layer, 'computation_dtype', torch.bfloat16)
 
     # Dequantize weight to computation dtype
     weight_dequant = weight.to(computation_dtype) * scale.to(computation_dtype)
@@ -433,6 +458,61 @@ def _fp8_linear_forward(layer, input):
         output = torch.nn.functional.linear(input_cast, weight_dequant, None)
 
     return output
+
+
+def apply_fp8_hooks_to_model(model, computation_dtype=torch.bfloat16):
+    """
+    Apply FP8 forward hooks to a pre-converted FP8 model.
+
+    This function finds all Linear layers that have a 'scale_weight' buffer
+    (indicating they were pre-converted to FP8) and replaces their forward
+    method with the FP8 dequantization forward.
+
+    Args:
+        model: Model with pre-converted FP8 weights
+        computation_dtype: Dtype to use for computation (default: bfloat16)
+
+    Returns:
+        model with FP8 forward hooks applied
+    """
+    import torch.nn as nn
+
+    hooked_count = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # Check if this layer has FP8 weights (has scale_weight buffer)
+            if hasattr(module, 'scale_weight'):
+                # Set computation dtype
+                module.computation_dtype = computation_dtype
+
+                # Replace forward method if not already done
+                if not hasattr(module, 'fp8_converted'):
+                    module.original_forward = module.forward
+                    module.forward = lambda x, m=module: _fp8_linear_forward(m, x)
+                    module.fp8_converted = True
+                    hooked_count += 1
+
+    if hooked_count > 0:
+        print(f"[FP8] Applied forward hooks to {hooked_count} pre-converted FP8 layers")
+
+    return model
+
+
+def is_fp8_converted_model(model_path: str) -> bool:
+    """Check if a model was pre-converted to FP8 by checking config.json."""
+    import json
+    from pathlib import Path
+
+    config_path = Path(model_path) / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            return config.get('fp8_converted', False)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return False
 
 # Try to import video processing utilities
 try:
@@ -1366,12 +1446,22 @@ class HunyuanImage3Backend:
             # Apply dynamic resolution patch to support multiple base sizes (512, 768, 1024, etc.)
             self.model = apply_dynamic_resolution_patch(self.model)
 
-            # Apply FP8 conversion if requested (only for non-quanto)
+            # Handle FP8: either apply hooks to pre-converted model or convert at runtime
             if use_fp8 and not use_quanto:
-                log_gpu_memory("Before FP8 conversion")
-                print("[hunyuan_image] Converting model to FP8 scaled...")
-                self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
-                log_gpu_memory("After FP8 conversion")
+                # Check if model was pre-converted to FP8
+                is_preconverted = is_fp8_converted_model(model_path)
+
+                if is_preconverted:
+                    log_gpu_memory("Before FP8 hook application")
+                    print("[hunyuan_image] Detected pre-converted FP8 model, applying forward hooks...")
+                    self.model = apply_fp8_hooks_to_model(self.model, computation_dtype=torch.bfloat16)
+                    log_gpu_memory("After FP8 hook application")
+                else:
+                    log_gpu_memory("Before FP8 conversion")
+                    print("[hunyuan_image] Converting model to FP8 at runtime...")
+                    print("[hunyuan_image] Note: For better results, use convert_to_fp8.py to pre-convert the model")
+                    self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
+                    log_gpu_memory("After FP8 conversion")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8 or use_quanto:

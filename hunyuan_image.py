@@ -1103,6 +1103,13 @@ class HunyuanImage3Backend:
                 "use_taylor_cache": use_taylor_cache,
             }
 
+            # Also set on generation_config directly (some model versions ignore kwargs)
+            if hasattr(self.model, 'generation_config'):
+                self.model.generation_config.diff_infer_steps = num_inference_steps
+                self.model.generation_config.diff_guidance_scale = guidance_scale
+                self.model.generation_config.flow_shift = flow_shift
+                print(f"[hunyuan_image] Set generation_config: steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}")
+
             # Add Taylor cache parameters when enabled
             if use_taylor_cache:
                 gen_kwargs["taylor_cache_interval"] = 3  # Full computation every 3 steps
@@ -1235,6 +1242,13 @@ class HunyuanImage3Backend:
             "streamer": streamer,  # Pass our custom streamer
         }
 
+        # Also set on generation_config directly (some model versions ignore kwargs)
+        if hasattr(self.model, 'generation_config'):
+            self.model.generation_config.diff_infer_steps = num_inference_steps
+            self.model.generation_config.diff_guidance_scale = guidance_scale
+            self.model.generation_config.flow_shift = flow_shift
+            print(f"[hunyuan_image] Set generation_config: steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}")
+
         # Add Taylor cache parameters when enabled
         if use_taylor_cache:
             gen_kwargs["taylor_cache_interval"] = 3  # Full computation every 3 steps
@@ -1262,7 +1276,7 @@ class HunyuanImage3Backend:
         if bot_task:
             gen_kwargs["bot_task"] = bot_task
 
-        print(f"[hunyuan_image] Streaming with guidance={guidance_scale}, flow_shift={flow_shift}")
+        print(f"[hunyuan_image] Streaming with steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}")
 
         # Log memory before generation
         log_gpu_memory("Before streaming generation")

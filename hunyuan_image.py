@@ -334,89 +334,84 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
     return model
 
 
-def create_attention_priority_device_map(model, max_gpu_memory_gb: float = None, gpu_modules: list = None):
+def estimate_attention_gpu_memory(num_layers: int = 32, hidden_size: int = 4096,
+                                   num_heads: int = 32, num_kv_heads: int = 8,
+                                   head_dim: int = 128, bytes_per_param: float = 2.0):
+    """
+    Estimate GPU memory needed for attention layers + non-MoE components.
+
+    Returns memory in GB.
+    """
+    # Per-layer attention: Q, K, V, O projections
+    q_params = hidden_size * (num_heads * head_dim)  # 4096 * 4096
+    k_params = hidden_size * (num_kv_heads * head_dim)  # 4096 * 1024
+    v_params = hidden_size * (num_kv_heads * head_dim)  # 4096 * 1024
+    o_params = (num_heads * head_dim) * hidden_size  # 4096 * 4096
+    attn_params_per_layer = q_params + k_params + v_params + o_params
+
+    # LayerNorms per layer (2 per layer)
+    ln_params_per_layer = 2 * hidden_size * 2  # input_ln + post_attn_ln, weight + bias
+
+    # MoE gate + shared_mlp per layer (small)
+    gate_params_per_layer = hidden_size * 64  # gate to 64 experts
+    shared_mlp_params = hidden_size * 3072 * 3  # up, gate, down projections
+
+    # Per-layer total (non-expert)
+    per_layer = attn_params_per_layer + ln_params_per_layer + gate_params_per_layer + shared_mlp_params
+    transformer_params = per_layer * num_layers
+
+    # Embeddings
+    vocab_size = 133120
+    embed_params = vocab_size * hidden_size
+
+    # Vision encoder (SigLIP2) ~400M params
+    vision_params = 400_000_000
+
+    # VAE ~80M params
+    vae_params = 80_000_000
+
+    # Final LN + lm_head
+    final_params = hidden_size + vocab_size * hidden_size
+
+    total_params = transformer_params + embed_params + vision_params + vae_params + final_params
+    total_bytes = total_params * bytes_per_param
+    total_gb = total_bytes / (1024**3)
+
+    return total_gb
+
+
+def create_attention_priority_device_map(num_layers: int = 32, num_experts: int = 64):
     """
     Create a device_map that keeps attention layers on GPU while offloading MoE experts to CPU.
 
-    This improves inference speed for FP8 models by keeping latency-sensitive attention
-    computations on GPU while offloading the larger MoE FFN experts to CPU.
+    Based on HunyuanImage-3.0 model structure:
+    - model.layers.X.self_attn: attention -> GPU
+    - model.layers.X.moe.experts.Y: MoE FFN experts -> CPU
+    - Everything else: GPU (default)
 
     Args:
-        model: The loaded model to create a device_map for
-        max_gpu_memory_gb: Maximum GPU memory to use (None = auto-detect)
-        gpu_modules: List of module name patterns to keep on GPU
+        num_layers: Number of transformer layers (default 32)
+        num_experts: Number of MoE experts per layer (default 64)
 
     Returns:
-        dict: device_map with attention on GPU (0) and MoE experts on CPU
+        tuple: (device_map dict, estimated GPU memory in GB)
     """
-    if gpu_modules is None:
-        gpu_modules = HUNYUAN_GPU_MODULES
-
-    # Detect available GPU memory
-    if max_gpu_memory_gb is None and torch.cuda.is_available():
-        free_mem, total_mem = torch.cuda.mem_get_info(0)
-        max_gpu_bytes = int(free_mem * 0.85)  # Use 85% of free memory
-    else:
-        max_gpu_bytes = int((max_gpu_memory_gb or 24) * (1024**3))
-
-    # Calculate module sizes by aggregating parameter sizes
-    module_sizes = {}
-    for name, param in model.named_parameters():
-        # Get the immediate parent module name
-        parts = name.split('.')
-        # Build module path hierarchy
-        for i in range(1, len(parts)):
-            module_path = '.'.join(parts[:i])
-            if module_path not in module_sizes:
-                module_sizes[module_path] = 0
-            # Only count at the deepest level to avoid double-counting
-        # The parameter belongs to its immediate parent
-        if len(parts) > 1:
-            parent_module = '.'.join(parts[:-1])
-            module_sizes[parent_module] = module_sizes.get(parent_module, 0) + param.numel() * param.element_size()
-
-    # Classify modules and build device map
     device_map = {}
-    gpu_bytes = 0
-    cpu_bytes = 0
 
-    # Process leaf modules (those with parameters)
-    for module_name, module_size in sorted(module_sizes.items(), key=lambda x: x[0]):
-        name_lower = module_name.lower()
+    # Default: everything on GPU
+    device_map[""] = 0
 
-        # Check if this is an attention-related module that should stay on GPU
-        is_attention = any(pattern in name_lower for pattern in gpu_modules)
+    # MoE experts -> CPU (large, 64 experts per layer = 2048 total)
+    for layer_idx in range(num_layers):
+        device_map[f"model.layers.{layer_idx}.moe.experts"] = "cpu"
 
-        # Check if this is an MoE expert (large, can be offloaded)
-        is_moe_expert = '.experts.' in module_name or (
-            '.moe.' in name_lower and any(f'.{i}.' in module_name or module_name.endswith(f'.{i}') for i in range(64))
-        )
+    # Estimate GPU memory for non-MoE components
+    gpu_memory_gb = estimate_attention_gpu_memory(num_layers=num_layers)
 
-        if is_attention and not is_moe_expert:
-            # Attention layers: prioritize GPU
-            device_map[module_name] = 0
-            gpu_bytes += module_size
-        elif is_moe_expert:
-            # MoE experts: offload to CPU
-            device_map[module_name] = 'cpu'
-            cpu_bytes += module_size
-        else:
-            # Other modules: fit on GPU if space available
-            if gpu_bytes + module_size <= max_gpu_bytes:
-                device_map[module_name] = 0
-                gpu_bytes += module_size
-            else:
-                device_map[module_name] = 'cpu'
-                cpu_bytes += module_size
+    experts_on_cpu = num_layers * num_experts
+    print(f"[device_map] Attention-priority: ~{gpu_memory_gb:.1f}GB on GPU, {experts_on_cpu} MoE experts on CPU")
 
-    gpu_gb = gpu_bytes / (1024**3)
-    cpu_gb = cpu_bytes / (1024**3)
-    attn_count = sum(1 for k, v in device_map.items() if v == 0 and 'attn' in k.lower())
-    expert_count = sum(1 for k, v in device_map.items() if v == 'cpu' and 'expert' in k.lower())
-    print(f"[device_map] Attention-priority: {gpu_gb:.2f}GB on GPU, {cpu_gb:.2f}GB on CPU")
-    print(f"[device_map] {attn_count} attention modules on GPU, {expert_count} MoE experts on CPU")
-
-    return device_map
+    return device_map, gpu_memory_gb
 
 
 def _fp8_linear_forward(layer, input):
@@ -1146,7 +1141,38 @@ class HunyuanImage3Backend:
 
             use_auto_device_map = (actual_gpus > 1) or cpu_offload or (max_memory_per_gpu is not None and max_memory_per_gpu > 0)
 
-            if use_auto_device_map and self.num_gpus > 0:
+            # Use attention-priority device map if requested
+            if keep_attention_on_gpu and cpu_offload and self.num_gpus > 0:
+                device_map, estimated_gpu_gb = create_attention_priority_device_map(num_layers=32, num_experts=64)
+
+                # Set max_memory based on estimated needs + headroom
+                max_memory = {}
+                required_gpu_gb = int(estimated_gpu_gb * 1.2) + 2  # 20% headroom + 2GB buffer
+
+                if max_memory_per_gpu is not None and max_memory_per_gpu > 0:
+                    # User specified, use it but warn if too low
+                    gpu_limit = max_memory_per_gpu
+                    if gpu_limit < required_gpu_gb:
+                        print(f"[hunyuan_image] Warning: {gpu_limit}GB may be too low, need ~{required_gpu_gb}GB for attention layers")
+                else:
+                    # Auto-detect available memory
+                    if torch.cuda.is_available():
+                        free_mem, total_mem = torch.cuda.mem_get_info(0)
+                        available_gb = free_mem / (1024**3)
+                        gpu_limit = max(required_gpu_gb, int(available_gb * 0.9))
+                    else:
+                        gpu_limit = required_gpu_gb
+
+                for i in range(actual_gpus):
+                    max_memory[i] = f"{gpu_limit}GiB"
+
+                if cpu_offload_ram and cpu_offload_ram > 0:
+                    max_memory["cpu"] = f"{cpu_offload_ram}GiB"
+                else:
+                    max_memory["cpu"] = "128GiB"
+
+                print(f"[hunyuan_image] Attention-priority: GPU={gpu_limit}GB, CPU={max_memory['cpu']}")
+            elif use_auto_device_map and self.num_gpus > 0:
                 device_map = "auto"
                 max_memory = {}
 
@@ -1346,26 +1372,6 @@ class HunyuanImage3Backend:
                 print("[hunyuan_image] Converting model to FP8 scaled...")
                 self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                 log_gpu_memory("After FP8 conversion")
-
-            # Re-dispatch with attention-priority device map if requested
-            if keep_attention_on_gpu and cpu_offload and ACCELERATE_AVAILABLE:
-                from accelerate import dispatch_model
-                from accelerate.utils import get_balanced_memory, infer_auto_device_map
-
-                print("[hunyuan_image] Re-dispatching with attention layers on GPU...")
-                log_gpu_memory("Before attention-priority dispatch")
-
-                # Create custom device_map keeping attention on GPU
-                custom_device_map = create_attention_priority_device_map(
-                    self.model,
-                    max_gpu_memory_gb=max_memory_per_gpu,
-                    gpu_modules=HUNYUAN_GPU_MODULES,
-                )
-
-                # Re-dispatch model with new device map
-                self.model = dispatch_model(self.model, device_map=custom_device_map)
-                device_map = custom_device_map
-                log_gpu_memory("After attention-priority dispatch")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8 or use_quanto:

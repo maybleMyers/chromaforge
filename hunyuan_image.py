@@ -1509,6 +1509,41 @@ def embed_png_metadata(
     return img_with_meta
 
 
+def save_hunyuan_image(
+    image: Image.Image,
+    infotext: str,
+    seed: int,
+    output_dir: str = "outputs/hunyuan",
+) -> str:
+    """
+    Save image as PNG with embedded metadata to disk.
+
+    Args:
+        image: PIL Image to save
+        infotext: Generation parameters string (stored in 'parameters' PNG chunk)
+        seed: Seed used for generation (used in filename)
+        output_dir: Directory to save images to
+
+    Returns:
+        Absolute path to the saved PNG file
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    timestamp = int(time.time())
+    filename = f"hunyuan_{timestamp}_{seed}.png"
+    filepath = os.path.join(output_dir, filename)
+
+    # Create PNG metadata
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("parameters", infotext)
+
+    # Save to disk as PNG with metadata
+    image.save(filepath, format="PNG", pnginfo=pnginfo)
+    print(f"[hunyuan_image] Saved image with metadata: {filepath}")
+
+    return os.path.abspath(filepath)
+
+
 def extract_video_frames(
     video_path: str,
     max_frames: int = 8,
@@ -2222,16 +2257,16 @@ class HunyuanImage3Backend:
                 cot_summary=cot_reasoning if cot_reasoning else None,
                 generation_time=generation_time,
             )
-            generated_image = embed_png_metadata(
-                image=generated_image,
-                infotext=infotext,
-                cot_full=cot_reasoning if cot_reasoning else None,
-            )
+            # Save to disk with PNG metadata
+            filepath = save_hunyuan_image(generated_image, infotext, actual_seed)
+
+            # Re-read the saved image to return
+            saved_image = Image.open(filepath)
 
             progress(1.0, desc="Done!")
             print(f"[hunyuan_image] Generation completed in {generation_time:.2f}s")
 
-            return generated_image, stats, cot_reasoning
+            return saved_image, stats, cot_reasoning
 
         except Exception as e:
             import traceback
@@ -2410,13 +2445,13 @@ class HunyuanImage3Backend:
                 cot_summary=cot_text if cot_text else None,
                 generation_time=total_time,
             )
-            image_with_meta = embed_png_metadata(
-                image=image,
-                infotext=infotext,
-                cot_full=cot_text if cot_text else None,
-            )
+            # Save to disk with PNG metadata
+            filepath = save_hunyuan_image(image, infotext, actual_seed)
 
-            yield cot_text, final_stats, image_with_meta
+            # Re-read the saved image to return to Gradio
+            saved_image = Image.open(filepath)
+
+            yield cot_text, final_stats, saved_image
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path, preserving metadata."""

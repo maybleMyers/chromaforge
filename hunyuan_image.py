@@ -1203,17 +1203,26 @@ class HunyuanImage3Backend:
             if use_quanto and not QUANTO_AVAILABLE:
                 return "Error: optimum-quanto not installed. Run: pip install optimum-quanto"
 
-            dtype_map = {
-                "bfloat16": torch.bfloat16,
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "fp8": torch.bfloat16,  # Load in bf16 first, then convert to FP8
-                "q8_partial": torch.bfloat16,
-                "q8_fp16": torch.float16,
-                "q4_nf4": torch.bfloat16,
-                "quanto_int4": torch.bfloat16,  # Load in bf16 first, then apply quanto
-            }
-            torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+            # Check if this is a pre-converted FP8 model
+            is_preconverted_fp8 = use_fp8 and is_fp8_converted_model(model_path)
+
+            if is_preconverted_fp8:
+                # For pre-converted FP8 models, don't specify torch_dtype
+                # This preserves FP8 weights as-is during loading
+                torch_dtype = None
+                print("[hunyuan_image] Detected pre-converted FP8 model, preserving FP8 weights")
+            else:
+                dtype_map = {
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
+                    "float32": torch.float32,
+                    "fp8": torch.bfloat16,  # Load in bf16 first, then convert to FP8 at runtime
+                    "q8_partial": torch.bfloat16,
+                    "q8_fp16": torch.float16,
+                    "q4_nf4": torch.bfloat16,
+                    "quanto_int4": torch.bfloat16,  # Load in bf16 first, then apply quanto
+                }
+                torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
             # Create device map for multi-GPU or CPU offloading
             actual_gpus = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 0
@@ -1320,7 +1329,9 @@ class HunyuanImage3Backend:
                 )
                 model_kwargs["quantization_config"] = quantization_config
             else:
-                model_kwargs["torch_dtype"] = torch_dtype
+                # Only set torch_dtype if specified (None for pre-converted FP8)
+                if torch_dtype is not None:
+                    model_kwargs["torch_dtype"] = torch_dtype
 
             if device_map is not None:
                 model_kwargs["device_map"] = device_map
@@ -1448,10 +1459,7 @@ class HunyuanImage3Backend:
 
             # Handle FP8: either apply hooks to pre-converted model or convert at runtime
             if use_fp8 and not use_quanto:
-                # Check if model was pre-converted to FP8
-                is_preconverted = is_fp8_converted_model(model_path)
-
-                if is_preconverted:
+                if is_preconverted_fp8:
                     log_gpu_memory("Before FP8 hook application")
                     print("[hunyuan_image] Detected pre-converted FP8 model, applying forward hooks...")
                     self.model = apply_fp8_hooks_to_model(self.model, computation_dtype=torch.bfloat16)

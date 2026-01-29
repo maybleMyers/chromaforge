@@ -1171,6 +1171,13 @@ class HunyuanImage3Backend:
                         torch_dtype=torch.bfloat16,
                     )
 
+                # Load generation_config (not loaded by from_config)
+                from transformers import GenerationConfig
+                gen_config_path = os.path.join(model_path, "generation_config.json")
+                if os.path.exists(gen_config_path):
+                    self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                    print(f"[hunyuan_image] Loaded generation_config")
+
                 progress(0.5, desc="Loading quantized weights...")
                 log_gpu_memory("After model structure, before quanto weights")
 

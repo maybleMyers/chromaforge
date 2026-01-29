@@ -2260,13 +2260,10 @@ class HunyuanImage3Backend:
             # Save to disk with PNG metadata
             filepath = save_hunyuan_image(generated_image, infotext, actual_seed)
 
-            # Re-read the saved image to return
-            saved_image = Image.open(filepath)
-
             progress(1.0, desc="Done!")
             print(f"[hunyuan_image] Generation completed in {generation_time:.2f}s")
 
-            return saved_image, stats, cot_reasoning
+            return filepath, stats, cot_reasoning
 
         except Exception as e:
             import traceback
@@ -2448,10 +2445,7 @@ class HunyuanImage3Backend:
             # Save to disk with PNG metadata
             filepath = save_hunyuan_image(image, infotext, actual_seed)
 
-            # Re-read the saved image to return to Gradio
-            saved_image = Image.open(filepath)
-
-            yield cot_text, final_stats, saved_image
+            yield cot_text, final_stats, filepath
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """Save PIL image to temporary file and return path, preserving metadata."""
@@ -2670,7 +2664,7 @@ def create_ui():
                     with gr.Column(scale=1):
                         output_image = gr.Image(
                             label="Generated Image",
-                            type="pil",
+                            type="filepath",
                             format="png",
                             height=400,
                         )

@@ -237,6 +237,14 @@ def convert_model_sharded(
             output_tensors = {}
             shard_converted = 0
 
+            # Debug: show first few tensor decisions
+            if shard_idx == 0:
+                print("  DEBUG: First 5 tensor conversion decisions:")
+                for debug_name in tensor_names[:5]:
+                    debug_tensor = f.get_tensor(debug_name)
+                    should = should_convert_weight(debug_name, skip_patterns)
+                    print(f"    {debug_name}: should_convert={should}, shape={debug_tensor.shape}, ndim={debug_tensor.ndim}")
+
             for name in tqdm(tensor_names, desc=f"Shard {shard_idx + 1}", leave=False):
                 tensor = f.get_tensor(name)
 

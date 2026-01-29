@@ -419,7 +419,7 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
 
     Based on HunyuanImage-3.0 model structure:
     - model.layers.X.self_attn: attention -> GPU
-    - model.layers.X.moe.experts.Y: MoE FFN experts -> CPU
+    - model.layers.X.mlp.experts.Y: MoE FFN experts -> CPU
     - Everything else: GPU (default)
 
     Args:
@@ -435,8 +435,9 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
     device_map[""] = 0
 
     # MoE experts -> CPU (large, 64 experts per layer = 2048 total)
+    # Note: path is model.layers.X.mlp.experts (not moe.experts)
     for layer_idx in range(num_layers):
-        device_map[f"model.layers.{layer_idx}.moe.experts"] = "cpu"
+        device_map[f"model.layers.{layer_idx}.mlp.experts"] = "cpu"
 
     # Estimate GPU memory for non-MoE components
     gpu_memory_gb = estimate_attention_gpu_memory(num_layers=num_layers)

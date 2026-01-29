@@ -365,10 +365,12 @@ HUNYUAN_AVAILABLE = TRANSFORMERS_AVAILABLE  # Available if transformers is insta
 
 try:
     import accelerate
+    from accelerate import init_empty_weights
     ACCELERATE_AVAILABLE = True
     print(f"Accelerate version: {accelerate.__version__}")
 except ImportError:
     ACCELERATE_AVAILABLE = False
+    init_empty_weights = None
     print("Warning: accelerate not installed. Multi-GPU support will be limited.")
 
 try:
@@ -1133,12 +1135,62 @@ class HunyuanImage3Backend:
             print(f"[hunyuan_image] Loading model from {model_path}")
             log_gpu_memory("Before model load")
 
-            # Load the model using AutoModelForCausalLM with trust_remote_code
-            # This loads model classes directly from the model directory
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                **model_kwargs,
-            )
+            # Handle Quanto loading specially - load structure only, then apply quantized weights
+            if use_quanto:
+                # Check for quantized weights (either in model_path directly or in quanto_int4 subfolder)
+                quanto_weights_path = os.path.join(model_path, "model_quanto_int4.safetensors")
+                quanto_map_path = os.path.join(model_path, "quantization_map.json")
+
+                # Also check subfolder for backwards compatibility
+                if not os.path.exists(quanto_weights_path):
+                    quanto_dir = os.path.join(model_path, "quanto_int4")
+                    quanto_weights_path = os.path.join(quanto_dir, "model_quanto_int4.safetensors")
+                    quanto_map_path = os.path.join(quanto_dir, "quantization_map.json")
+
+                if not os.path.exists(quanto_weights_path) or not os.path.exists(quanto_map_path):
+                    return (f"Error: No pre-quantized weights found.\n"
+                            f"Expected: {quanto_weights_path}\n"
+                            f"Run: python quantize_hunyuan.py --model-path <original_model_path>")
+
+                print(f"[hunyuan_image] Loading pre-quantized model (skipping bf16 weights)...")
+                progress(0.3, desc="Creating model structure...")
+
+                # Load model structure WITHOUT weights using init_empty_weights
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True,
+                        attn_implementation=model_kwargs.get("attn_implementation", "sdpa"),
+                        moe_impl=moe_impl,
+                        moe_drop_tokens=moe_drop_tokens,
+                    )
+
+                progress(0.5, desc="Loading quantized weights...")
+                log_gpu_memory("After model structure, before quanto weights")
+
+                # Load quantization map
+                with open(quanto_map_path, 'r') as f:
+                    qmap = json.load(f)
+
+                # Load quantized state dict
+                print(f"[hunyuan_image] Loading quantized weights from {quanto_weights_path}...")
+                state_dict = safetensors_load(quanto_weights_path, device="cpu")
+
+                progress(0.7, desc="Applying quantized weights...")
+
+                # Apply quantized weights - this materializes the model with quanto tensors
+                requantize(self.model, state_dict, qmap, device="cuda")
+
+                log_gpu_memory("After Quanto loading")
+                print(f"[hunyuan_image] Loaded pre-quantized model successfully")
+
+            else:
+                # Normal loading for non-quanto models
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    **model_kwargs,
+                )
 
             progress(0.8, desc="Loading tokenizer into model...")
             log_gpu_memory("After model load, before tokenizer")
@@ -1150,44 +1202,12 @@ class HunyuanImage3Backend:
             # Apply dynamic resolution patch to support multiple base sizes (512, 768, 1024, etc.)
             self.model = apply_dynamic_resolution_patch(self.model)
 
-            # Apply FP8 conversion if requested
-            if use_fp8:
+            # Apply FP8 conversion if requested (only for non-quanto)
+            if use_fp8 and not use_quanto:
                 log_gpu_memory("Before FP8 conversion")
                 print("[hunyuan_image] Converting model to FP8 scaled...")
                 self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                 log_gpu_memory("After FP8 conversion")
-
-            # Apply Quanto int4 quantization if requested (requires pre-quantized weights)
-            if use_quanto:
-                log_gpu_memory("Before Quanto loading")
-
-                # Define paths for saved quantized weights (from quantize_hunyuan.py script)
-                quanto_dir = os.path.join(model_path, "quanto_int4")
-                quanto_weights_path = os.path.join(quanto_dir, "model_quanto_int4.safetensors")
-                quanto_map_path = os.path.join(quanto_dir, "quantization_map.json")
-
-                # Check if pre-quantized weights exist (from quantize_hunyuan.py)
-                if os.path.exists(quanto_weights_path) and os.path.exists(quanto_map_path) and SAFETENSORS_AVAILABLE:
-                    print(f"[hunyuan_image] Loading pre-quantized weights from {quanto_dir}...")
-                    progress(0.7, desc="Loading pre-quantized weights...")
-
-                    # Load quantization map
-                    with open(quanto_map_path, 'r') as f:
-                        qmap = json.load(f)
-
-                    # Load quantized state dict
-                    state_dict = safetensors_load(quanto_weights_path, device="cpu")
-
-                    # Apply requantization
-                    requantize(self.model, state_dict, qmap)
-
-                    print(f"[hunyuan_image] Loaded pre-quantized weights successfully")
-                else:
-                    # No pre-quantized weights found - user needs to run quantization script first
-                    return (f"Error: No pre-quantized weights found at {quanto_dir}\n"
-                            f"Run: python quantize_hunyuan.py --model-path {model_path}")
-
-                log_gpu_memory("After Quanto loading")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8 or use_quanto:

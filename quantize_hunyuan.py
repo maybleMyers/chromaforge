@@ -11,9 +11,11 @@ Requirements:
 """
 
 import os
+import shutil
 import argparse
 import json
 import torch
+from pathlib import Path
 from tqdm import tqdm
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
@@ -138,9 +140,31 @@ def main():
         json.dump(qmap, f, indent=2)
     print(f"Saved: {map_path}")
 
+    # Copy config and model files to make a standalone model folder
+    print("\nCopying config and model files...")
+    model_path = Path(args.model_path)
+    output_path = Path(output_dir)
+
+    # Config files to copy
+    config_files = [
+        'config.json', 'generation_config.json',
+        'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json',
+    ]
+    for f in config_files:
+        src = model_path / f
+        if src.exists():
+            shutil.copy(src, output_path / f)
+            print(f"  Copied: {f}")
+
+    # Copy Python model files (needed for trust_remote_code)
+    for py_file in model_path.glob('*.py'):
+        shutil.copy(py_file, output_path / py_file.name)
+        print(f"  Copied: {py_file.name}")
+
     # Print file sizes
     weights_size = os.path.getsize(weights_path) / (1024**3)
     print(f"\nQuantized model size: {weights_size:.2f} GB")
+    print(f"Output folder: {output_dir}")
     print("Done! You can now load the quantized model in hunyuan_image.py")
 
 

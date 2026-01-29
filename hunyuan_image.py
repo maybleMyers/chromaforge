@@ -32,18 +32,39 @@ from dataclasses import dataclass
 import copy
 
 # Image size options for generation
+# With dynamic resolution patch, multiple base sizes are supported (256, 512, 768, 1024, 1536, 2048)
+# Each base_size generates a ResolutionGroup with different aspect ratios around that size.
 IMAGE_SIZE_OPTIONS = [
+    # Small (base_size=512)
     "512x512",
-    "640x640",
+    "512x384",
+    "384x512",
+    "512x288",
+    "288x512",
+    # Medium (base_size=768)
     "768x768",
-    "896x896",
+    "768x576",
+    "576x768",
+    "768x432",
+    "432x768",
+    # Standard (base_size=1024)
     "1024x1024",
     "1024x768",
     "768x1024",
     "1280x720",
     "720x1280",
-    "1536x1024",
-    "1024x1536",
+    "1152x896",
+    "896x1152",
+    # Large (base_size=1536)
+    "1536x1536",
+    "1536x1152",
+    "1152x1536",
+    "1920x1080",
+    "1080x1920",
+    # Extra Large (base_size=2048)
+    "2048x2048",
+    "2048x1536",
+    "1536x2048",
 ]
 
 # Settings file path
@@ -347,6 +368,14 @@ except ImportError:
     ACCELERATE_AVAILABLE = False
     print("Warning: accelerate not installed. Multi-GPU support will be limited.")
 
+try:
+    from optimum.quanto import quantize, qint4, freeze
+    QUANTO_AVAILABLE = True
+    print("Quanto available")
+except ImportError:
+    QUANTO_AVAILABLE = False
+    print("Warning: optimum-quanto not installed. Quanto quantization unavailable.")
+
 
 def apply_quantization_dtype_fix(model):
     """
@@ -612,6 +641,140 @@ def apply_global_scatter_dtype_fix():
     print("[hunyuan_image] Applied global scatter_ dtype fix")
 
 
+# Supported base sizes from the tokenizer vocabulary
+SUPPORTED_BASE_SIZES = [256, 512, 768, 1024, 1536, 2048]
+
+
+def get_best_base_size(width: int, height: int) -> int:
+    """
+    Determine the best base_size for a given resolution.
+    The base_size should be close to max(width, height) but from supported values.
+    """
+    max_dim = max(width, height)
+
+    # Find the closest supported base_size
+    best_base = SUPPORTED_BASE_SIZES[0]
+    min_diff = abs(max_dim - best_base)
+
+    for base in SUPPORTED_BASE_SIZES:
+        diff = abs(max_dim - base)
+        if diff < min_diff:
+            min_diff = diff
+            best_base = base
+
+    return best_base
+
+
+def apply_dynamic_resolution_patch(model):
+    """
+    Patch the model's image_processor to support dynamic base_size selection.
+    This allows generating images at different resolutions (512x512, 768x768, etc.)
+    instead of always snapping to the default 1024-based resolutions.
+    """
+    import numpy as np
+    import importlib
+
+    # Get the tokenization module to access Resolution and ResolutionGroup classes
+    model_module = type(model).__module__
+    hunyuan_module = importlib.import_module(model_module)
+    tokenization_module_name = model_module.rsplit('.', 1)[0] + '.tokenization_hunyuan_image_3'
+
+    try:
+        tokenization_module = importlib.import_module(tokenization_module_name)
+        Resolution = tokenization_module.Resolution
+        ResolutionGroup = tokenization_module.ResolutionGroup
+        ImageInfo = tokenization_module.ImageInfo
+    except (ImportError, AttributeError) as e:
+        print(f"[hunyuan_image] Warning: Could not import tokenization module: {e}")
+        return model
+
+    # Cache for ResolutionGroups by base_size
+    resolution_group_cache = {}
+
+    def get_resolution_group(base_size: int) -> ResolutionGroup:
+        """Get or create a ResolutionGroup for the given base_size."""
+        if base_size not in resolution_group_cache:
+            extra_resolutions = []
+            # Add common aspect ratio resolutions for this base_size
+            if base_size >= 720:
+                # 16:9 and 9:16 for video-like aspect ratios
+                w16_9 = int(base_size * 16 / 9 / 16) * 16  # Align to 16
+                h16_9 = int(base_size * 9 / 16 / 16) * 16
+                extra_resolutions.extend([
+                    Resolution(base_size, int(base_size * 3 / 4 / 16) * 16),  # 4:3
+                    Resolution(int(base_size * 3 / 4 / 16) * 16, base_size),  # 3:4
+                ])
+            resolution_group_cache[base_size] = ResolutionGroup(
+                base_size=base_size,
+                align=16,
+                extra_resolutions=extra_resolutions if extra_resolutions else None
+            )
+        return resolution_group_cache[base_size]
+
+    # Store reference to original build_gen_image_info
+    original_build_gen_image_info = model.image_processor.build_gen_image_info
+
+    def patched_build_gen_image_info(image_size, add_guidance_token=False, add_timestep_r_token=False):
+        """
+        Patched version that selects appropriate base_size based on requested resolution.
+        """
+        # Parse image size to get dimensions
+        if isinstance(image_size, str):
+            if image_size.startswith("<img_ratio_"):
+                # Use original for ratio-based sizes
+                return original_build_gen_image_info(image_size, add_guidance_token, add_timestep_r_token)
+            elif 'x' in image_size:
+                h, w = [int(s) for s in image_size.split('x')]
+            elif ':' in image_size:
+                parts = [int(s) for s in image_size.split(':')]
+                w, h = parts[0], parts[1]
+            else:
+                return original_build_gen_image_info(image_size, add_guidance_token, add_timestep_r_token)
+        elif isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+            h, w = image_size[0], image_size[1]
+        else:
+            return original_build_gen_image_info(image_size, add_guidance_token, add_timestep_r_token)
+
+        # Determine the best base_size for this resolution
+        best_base = get_best_base_size(w, h)
+
+        # Get or create the appropriate ResolutionGroup
+        reso_group = get_resolution_group(best_base)
+
+        # Get target size and ratio index from this resolution group
+        target_w, target_h = reso_group.get_target_size(w, h)
+        base_size, ratio_idx = reso_group.get_base_size_and_ratio_index(w, h)
+
+        # Calculate token dimensions
+        vae_h_factor = model.image_processor.vae_info.h_factor
+        vae_w_factor = model.image_processor.vae_info.w_factor
+        token_height = target_h // vae_h_factor
+        token_width = target_w // vae_w_factor
+
+        # Create ImageInfo with the correct base_size
+        image_info = ImageInfo(
+            image_type="gen_image",
+            image_width=target_w,
+            image_height=target_h,
+            token_width=token_width,
+            token_height=token_height,
+            base_size=base_size,
+            ratio_index=ratio_idx,
+            add_guidance_token=add_guidance_token,
+            add_timestep_r_token=add_timestep_r_token,
+        )
+
+        return image_info
+
+    # Apply the patch
+    model.image_processor.build_gen_image_info = patched_build_gen_image_info
+    model.image_processor._resolution_group_cache = resolution_group_cache
+    model.image_processor._get_resolution_group = get_resolution_group
+
+    print(f"[hunyuan_image] Applied dynamic resolution patch (supported base sizes: {SUPPORTED_BASE_SIZES})")
+    return model
+
+
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
     gpus = []
@@ -845,6 +1008,11 @@ class HunyuanImage3Backend:
             use_q8 = dtype in ["q8_partial", "q8_fp16"]
             use_q4_nf4 = dtype == "q4_nf4"
             use_fp8 = dtype == "fp8"
+            use_quanto = dtype == "quanto_int4"
+
+            # Check Quanto availability early
+            if use_quanto and not QUANTO_AVAILABLE:
+                return "Error: optimum-quanto not installed. Run: pip install optimum-quanto"
 
             dtype_map = {
                 "bfloat16": torch.bfloat16,
@@ -854,6 +1022,7 @@ class HunyuanImage3Backend:
                 "q8_partial": torch.bfloat16,
                 "q8_fp16": torch.float16,
                 "q4_nf4": torch.bfloat16,
+                "quanto_int4": torch.bfloat16,  # Load in bf16 first, then apply quanto
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
@@ -968,6 +1137,9 @@ class HunyuanImage3Backend:
             self.model.load_tokenizer(tokenizer_path)
             log_gpu_memory("After tokenizer load")
 
+            # Apply dynamic resolution patch to support multiple base sizes (512, 768, 1024, etc.)
+            self.model = apply_dynamic_resolution_patch(self.model)
+
             # Apply FP8 conversion if requested
             if use_fp8:
                 log_gpu_memory("Before FP8 conversion")
@@ -975,8 +1147,28 @@ class HunyuanImage3Backend:
                 self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                 log_gpu_memory("After FP8 conversion")
 
+            # Apply Quanto int4 quantization if requested
+            if use_quanto:
+                log_gpu_memory("Before Quanto quantization")
+                print("[hunyuan_image] Applying Quanto qint4 quantization...")
+
+                # Get modules to exclude from quantization (keep vision/VAE in full precision)
+                exclude_modules = []
+                for name, module in self.model.named_modules():
+                    for skip_name in HUNYUAN_SKIP_MODULES:
+                        if skip_name in name:
+                            exclude_modules.append(name)
+                            break
+
+                # Apply quantization (excludes specified modules)
+                quantize(self.model, weights=qint4, exclude=exclude_modules)
+                freeze(self.model)  # Freeze quantized weights
+
+                print(f"[hunyuan_image] Quanto quantization applied, excluded {len(exclude_modules)} modules")
+                log_gpu_memory("After Quanto quantization")
+
             # Apply quantization compatibility patches if using quantization
-            if use_q4_nf4 or use_q8:
+            if use_q4_nf4 or use_q8 or use_quanto:
                 self.model = apply_quantization_dtype_fix(self.model)
                 apply_global_scatter_dtype_fix()
 
@@ -1673,7 +1865,7 @@ def create_ui():
 
                 with gr.Row():
                     dtype_dropdown = gr.Dropdown(
-                        choices=["bfloat16", "float16", "fp8", "q4_nf4", "q8_fp16"],
+                        choices=["bfloat16", "float16", "fp8", "q4_nf4", "q8_fp16", "quanto_int4"],
                         value=saved_settings.get("dtype", "bfloat16"),
                         label="Precision",
                     )

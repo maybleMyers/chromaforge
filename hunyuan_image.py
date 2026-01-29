@@ -113,6 +113,14 @@ SYSTEM_PROMPT_OPTIONS = ["en_unified", "en_recaption", "en_think_recaption", "en
 # MoE implementation options
 MOE_IMPL_OPTIONS = ["eager", "flashinfer"]
 
+# SDNQ dtype mapping: UI option -> SDNQ weights_dtype
+SDNQ_DTYPE_MAP = {
+    "sdnq_int8": "int8",
+    "sdnq_fp8": "float8_e4m3fn",
+    "sdnq_int4": "int4",
+    "sdnq_uint4": "uint4",
+}
+
 # Default settings values
 DEFAULT_SETTINGS = {
     # Model Settings
@@ -925,11 +933,56 @@ except ImportError:
     print("Warning: optimum-quanto not installed. Quanto quantization unavailable.")
 
 try:
+    from sdnq import SDNQConfig
+    from sdnq.common import use_torch_compile as sdnq_triton_available
+    SDNQ_AVAILABLE = True
+    print("SDNQ available")
+except ImportError:
+    SDNQ_AVAILABLE = False
+    sdnq_triton_available = False
+    print("Warning: sdnq not installed. SDNQ quantization unavailable.")
+
+try:
     from safetensors.torch import save_file as safetensors_save, load_file as safetensors_load
     SAFETENSORS_AVAILABLE = True
 except ImportError:
     SAFETENSORS_AVAILABLE = False
     print("Warning: safetensors not installed. Quantized model saving unavailable.")
+
+
+def create_sdnq_config(weights_dtype: str = "int8", use_quantized_matmul: bool = True) -> "SDNQConfig":
+    """
+    Create SDNQConfig for HunyuanImage-3.0 with appropriate skip modules.
+
+    Args:
+        weights_dtype: Quantization dtype (int8, int4, uint4, float8_e4m3fn)
+        use_quantized_matmul: Use Triton-optimized quantized matmul kernels
+
+    Returns:
+        SDNQConfig instance
+    """
+    return SDNQConfig(
+        weights_dtype=weights_dtype,
+        group_size=0,  # auto
+        use_quantized_matmul=use_quantized_matmul and sdnq_triton_available,
+        modules_to_not_convert=[
+            # VAE - pixel reconstruction
+            'vae',
+            # Vision encoder
+            'vision_model', 'vision_aligner',
+            # Image generation head
+            'final_layer', 'patch_embed',
+            # Timestep/guidance embeddings
+            'time_embed', 'time_embed_2', 'timestep_emb', 'guidance_emb', 'timestep_r_emb',
+            # MoE gates - must stay fp32
+            'wg',
+            # Token embeddings
+            'wte', 'lm_head',
+            # LayerNorms
+            'ln_f', 'layernorm', 'input_layernorm', 'post_attention_layernorm',
+            'key_layernorm', 'query_layernorm',
+        ],
+    )
 
 
 def apply_quantization_dtype_fix(model):
@@ -1684,7 +1737,7 @@ class HunyuanImage3Backend:
 
         Args:
             model_name: Name of the model to load
-            dtype: Data type (bfloat16, float16, q4_nf4, q8_fp16, fp8)
+            dtype: Data type (bfloat16, float16, q4_nf4, q8_fp16, fp8, sdnq_int8, sdnq_fp8, sdnq_int4, sdnq_uint4)
             num_gpus: Number of GPUs to use
             max_memory_per_gpu: Max memory per GPU in GB (None = auto)
             cpu_offload: Enable CPU offloading for large models
@@ -1726,10 +1779,15 @@ class HunyuanImage3Backend:
             use_q4_nf4 = dtype == "q4_nf4"
             use_fp8 = dtype == "fp8"
             use_quanto = dtype == "quanto_int4"
+            use_sdnq = dtype in SDNQ_DTYPE_MAP
 
             # Check Quanto availability early
             if use_quanto and not QUANTO_AVAILABLE:
                 return "Error: optimum-quanto not installed. Run: pip install optimum-quanto"
+
+            # Check SDNQ availability early
+            if use_sdnq and not SDNQ_AVAILABLE:
+                return "Error: sdnq not installed. Run: pip install sdnq"
 
             # Check if this is a pre-converted FP8 model
             is_preconverted_fp8 = use_fp8 and is_fp8_converted_model(model_path)
@@ -1739,6 +1797,9 @@ class HunyuanImage3Backend:
                 # Don't set torch_dtype - it would cast FP8 weights to bf16
                 # We'll manually handle dtype consistency after loading
                 torch_dtype = None
+            elif use_sdnq:
+                # SDNQ handles dtype internally, use bfloat16 for compute
+                torch_dtype = torch.bfloat16
             else:
                 dtype_map = {
                     "bfloat16": torch.bfloat16,
@@ -1836,7 +1897,17 @@ class HunyuanImage3Backend:
             if device_map == "auto":
                 model_kwargs["low_cpu_mem_usage"] = True
 
-            if use_q4_nf4:
+            if use_sdnq:
+                # Use SDNQ quantization
+                sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
+                print(f"[hunyuan_image] Using SDNQ quantization: {sdnq_weights_dtype}")
+                quantization_config = create_sdnq_config(
+                    weights_dtype=sdnq_weights_dtype,
+                    use_quantized_matmul=True,
+                )
+                model_kwargs["quantization_config"] = quantization_config
+                # SDNQ handles dtype internally, don't set torch_dtype
+            elif use_q4_nf4:
                 print("[hunyuan_image] Using 4-bit NF4 quantization")
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -2016,7 +2087,7 @@ class HunyuanImage3Backend:
 
             # Apply quantization/FP8 compatibility patches for dtype mismatches
             # FP8 also has mixed dtypes: FP8 layers output bf16, but VAE/embeddings may be float32
-            if use_q4_nf4 or use_q8 or use_quanto or use_fp8:
+            if use_q4_nf4 or use_q8 or use_quanto or use_fp8 or use_sdnq:
                 self.model = apply_quantization_dtype_fix(self.model)
                 apply_global_scatter_dtype_fix()
 
@@ -2774,7 +2845,11 @@ def create_ui():
 
                 with gr.Row():
                     dtype_dropdown = gr.Dropdown(
-                        choices=["bfloat16", "float16", "fp8", "q4_nf4", "q8_fp16", "quanto_int4"],
+                        choices=[
+                            "bfloat16", "float16",
+                            "fp8", "q4_nf4", "q8_fp16", "quanto_int4",
+                            "sdnq_int8", "sdnq_fp8", "sdnq_int4", "sdnq_uint4",
+                        ],
                         value=saved_settings.get("dtype", "bfloat16"),
                         label="Precision",
                     )

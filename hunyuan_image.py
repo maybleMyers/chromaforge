@@ -622,6 +622,21 @@ def print_gpu_status():
         print("No CUDA GPUs available.")
 
 
+def log_gpu_memory(label: str = "", device: int = 0):
+    """Log current GPU memory usage for debugging memory spikes."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        allocated = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved = torch.cuda.memory_reserved(device) / (1024**3)
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        free_gb = free_mem / (1024**3)
+        total_gb = total_mem / (1024**3)
+        used_gb = total_gb - free_gb
+        print(f"[GPU Memory] {label}: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB, used={used_gb:.2f}GB/{total_gb:.2f}GB")
+        return {"allocated": allocated, "reserved": reserved, "used": used_gb, "total": total_gb}
+    return None
+
+
 def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     """Convert PIL Image to base64 data URL."""
     buffer = BytesIO()
@@ -808,11 +823,13 @@ class HunyuanImage3Backend:
             # Determine torch dtype and quantization mode
             use_q8 = dtype in ["q8_partial", "q8_fp16"]
             use_q4_nf4 = dtype == "q4_nf4"
+            use_fp8 = dtype == "fp8"
 
             dtype_map = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
                 "float32": torch.float32,
+                "fp8": torch.bfloat16,  # Load in bf16 first, then convert to FP8
                 "q8_partial": torch.bfloat16,
                 "q8_fp16": torch.float16,
                 "q4_nf4": torch.bfloat16,
@@ -851,8 +868,8 @@ class HunyuanImage3Backend:
 
                 print(f"[hunyuan_image] Using device_map='auto' for {actual_gpus} GPU(s)")
             else:
-                device_map = {"": 0} if self.num_gpus > 0 else "cpu"
-                print(f"[hunyuan_image] Using single device: {device_map}")
+                device_map = "all" if self.num_gpus > 0 else "cpu"
+                print(f"[hunyuan_image] Using device_map='{device_map}'")
 
             progress(0.2, desc="Loading tokenizer...")
 
@@ -866,8 +883,10 @@ class HunyuanImage3Backend:
             quantization_config = None
             model_kwargs = {
                 "trust_remote_code": True,
-                "low_cpu_mem_usage": True,
             }
+            # Only use low_cpu_mem_usage with device_map="auto" (can interfere with "all")
+            if device_map == "auto":
+                model_kwargs["low_cpu_mem_usage"] = True
 
             if use_q4_nf4:
                 print("[hunyuan_image] Using 4-bit NF4 quantization")
@@ -911,6 +930,7 @@ class HunyuanImage3Backend:
 
             progress(0.4, desc="Loading HunyuanImage-3.0 model...")
             print(f"[hunyuan_image] Loading model from {model_path}")
+            log_gpu_memory("Before model load")
 
             # Load the model using AutoModelForCausalLM with trust_remote_code
             # This loads model classes directly from the model directory
@@ -920,9 +940,18 @@ class HunyuanImage3Backend:
             )
 
             progress(0.8, desc="Loading tokenizer into model...")
+            log_gpu_memory("After model load, before tokenizer")
 
             # Load tokenizer into model
             self.model.load_tokenizer(tokenizer_path)
+            log_gpu_memory("After tokenizer load")
+
+            # Apply FP8 conversion if requested
+            if use_fp8:
+                log_gpu_memory("Before FP8 conversion")
+                print("[hunyuan_image] Converting model to FP8 scaled...")
+                self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
+                log_gpu_memory("After FP8 conversion")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8:
@@ -939,7 +968,9 @@ class HunyuanImage3Backend:
             print_gpu_status()
 
             dtype_str = dtype
-            if use_q4_nf4:
+            if use_fp8:
+                dtype_str = "fp8"
+            elif use_q4_nf4:
                 dtype_str = "q4_nf4"
             elif use_q8:
                 dtype_str = "q8"
@@ -1101,8 +1132,14 @@ class HunyuanImage3Backend:
 
             print(f"[hunyuan_image] Generation kwargs: guidance={guidance_scale}, flow_shift={flow_shift}, taylor_cache={use_taylor_cache}")
 
+            # Log memory before generation
+            log_gpu_memory("Before generation")
+
             # Generate image using the model's generate_image API
             cot_text, outputs = self.model.generate_image(**gen_kwargs)
+
+            # Log memory after generation
+            log_gpu_memory("After generation")
 
             progress(0.9, desc="Processing output...")
 
@@ -1227,6 +1264,9 @@ class HunyuanImage3Backend:
 
         print(f"[hunyuan_image] Streaming with guidance={guidance_scale}, flow_shift={flow_shift}")
 
+        # Log memory before generation
+        log_gpu_memory("Before streaming generation")
+
         # Store generation result from thread
         generation_result = {"image": None, "error": None, "cot_text": None}
 
@@ -1283,6 +1323,7 @@ class HunyuanImage3Backend:
 
         # Wait for thread to complete (image generation phase)
         print("[hunyuan_image] Text generation complete, waiting for image...")
+        log_gpu_memory("After text generation, before diffusion")
 
         # Yield status during diffusion phase
         while thread.is_alive():
@@ -1292,6 +1333,9 @@ class HunyuanImage3Backend:
             time.sleep(0.5)  # Check every 0.5 seconds
 
         thread.join()
+
+        # Log memory after generation complete
+        log_gpu_memory("After diffusion complete")
 
         # Final result
         total_time = time.perf_counter() - start_time
@@ -1621,7 +1665,7 @@ def create_ui():
 
                 with gr.Row():
                     dtype_dropdown = gr.Dropdown(
-                        choices=["bfloat16", "float16", "q4_nf4", "q8_fp16"],
+                        choices=["bfloat16", "float16", "fp8", "q4_nf4", "q8_fp16"],
                         value=saved_settings.get("dtype", "bfloat16"),
                         label="Precision",
                     )

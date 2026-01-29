@@ -889,7 +889,8 @@ class HunyuanImage3Backend:
 
                 print(f"[hunyuan_image] Using device_map='auto' for {actual_gpus} GPU(s)")
             else:
-                device_map = "all" if self.num_gpus > 0 else "cpu"
+                # Use cuda:0 for single GPU without offloading ("all" is not a valid device_map value)
+                device_map = "cuda:0" if self.num_gpus > 0 else "cpu"
                 print(f"[hunyuan_image] Using device_map='{device_map}'")
 
             progress(0.2, desc="Loading tokenizer...")

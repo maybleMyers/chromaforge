@@ -1909,16 +1909,14 @@ class HunyuanImage3Backend:
             if use_sdnq:
                 # Use SDNQ quantization
                 sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
-                # When CPU offload is enabled: quantize on GPU (fast), return to CPU (for offload)
-                sdnq_return_device = "cpu" if cpu_offload else None
                 print(f"[hunyuan_image] Using SDNQ quantization: {sdnq_weights_dtype}")
-                if cpu_offload:
-                    print(f"[hunyuan_image] SDNQ: quantizing on GPU, placing weights in RAM for offload")
+                # Don't override return_device - let device_map control placement
+                # SDNQ will quantize on whatever device the weight is loaded to
                 quantization_config = create_sdnq_config(
                     weights_dtype=sdnq_weights_dtype,
                     use_quantized_matmul=True,
-                    quantization_device=None,  # Use GPU for fast quantization
-                    return_device=sdnq_return_device,
+                    quantization_device=None,
+                    return_device=None,  # Let device_map handle placement
                 )
                 model_kwargs["quantization_config"] = quantization_config
                 # SDNQ handles dtype internally, don't set torch_dtype
@@ -2075,32 +2073,28 @@ class HunyuanImage3Backend:
                 )
 
             elif use_sdnq and cpu_offload:
-                # SDNQ with CPU offload: load to CPU, then dispatch with explicit device_map
-                print("[hunyuan_image] SDNQ + CPU offload: loading to CPU, then dispatching...")
+                # SDNQ with CPU offload: quantize on GPU, place on CPU, then dispatch
+                print("[hunyuan_image] SDNQ + CPU offload mode...")
 
-                # Load entirely to CPU first (bypasses transformers' broken dispatch)
+                # Create explicit device_map: attention on GPU, MoE experts on CPU
+                explicit_device_map, gpu_gb = create_attention_priority_device_map(
+                    num_layers=32, num_experts=64
+                )
+                print(f"[hunyuan_image] Target: ~{gpu_gb:.1f}GB on GPU, MoE experts on CPU")
+
+                # Update SDNQ config: quantize on GPU, but let device_map handle placement
                 sdnq_kwargs = model_kwargs.copy()
-                sdnq_kwargs["device_map"] = {"": "cpu"}
-                sdnq_kwargs.pop("max_memory", None)
+                # Use our explicit device_map instead of "auto"
+                sdnq_kwargs["device_map"] = explicit_device_map
+                sdnq_kwargs.pop("max_memory", None)  # Not needed with explicit map
 
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     **sdnq_kwargs,
                 )
-
-                progress(0.7, desc="Dispatching to GPU/CPU...")
-
-                # Create explicit device_map: attention on GPU, MoE experts on CPU
-                from accelerate import dispatch_model
-                explicit_device_map, gpu_gb = create_attention_priority_device_map(
-                    num_layers=32, num_experts=64
-                )
-                print(f"[hunyuan_image] Dispatching: ~{gpu_gb:.1f}GB to GPU, MoE experts to CPU")
-
-                self.model = dispatch_model(self.model, device_map=explicit_device_map)
                 device_map = explicit_device_map
 
-                log_gpu_memory("After SDNQ load and dispatch")
+                log_gpu_memory("After SDNQ load with explicit device_map")
 
             else:
                 # Normal loading for non-quanto, non-FP8 models

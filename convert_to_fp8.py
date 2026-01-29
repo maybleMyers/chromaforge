@@ -2,8 +2,9 @@
 """
 Convert HunyuanImage-3.0 model to FP8 format.
 
-This script loads the model, converts eligible Linear layers to FP8 with per-tensor scaling,
-and saves the result as a new checkpoint. Vision components are kept in bf16.
+This script processes weights shard-by-shard using the GPU for fast conversion,
+converting eligible Linear layers to FP8 with per-tensor scaling.
+Vision components are kept in bf16.
 
 Usage:
     python convert_to_fp8.py --input models/LLM/HunyuanImage-3.0-Instruct --output models/LLM/HunyuanImage-3.0-Instruct-FP8
@@ -17,7 +18,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from tqdm import tqdm
 
 
@@ -42,70 +42,88 @@ SKIP_PATTERNS = [
 ]
 
 
-def should_convert_layer(name: str, skip_patterns: list[str]) -> bool:
-    """Check if a layer should be converted to FP8."""
+def should_convert_weight(name: str, skip_patterns: list[str]) -> bool:
+    """Check if a weight tensor should be converted to FP8."""
+    # Only convert .weight tensors from linear layers (not biases, not norms)
+    if not name.endswith('.weight'):
+        return False
+
+    # Skip non-2D tensors (embeddings, norms, etc.)
+    # We'll check tensor shape during conversion
+
     name_lower = name.lower()
     return not any(pattern in name_lower for pattern in skip_patterns)
 
 
-def convert_linear_to_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def convert_tensor_to_fp8(weight: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Convert a weight tensor to FP8 with per-tensor scaling.
+    Convert a weight tensor to FP8 with per-tensor scaling on GPU.
 
     Returns:
-        tuple of (fp8_weight, scale)
+        tuple of (fp8_weight, scale) on CPU
     """
+    # Move to GPU for fast computation
+    weight_gpu = weight.to(device).float()
+
     # Compute scale factor (FP8 E4M3 max value is ~448)
-    weight_float = weight.float()
-    abs_max = weight_float.abs().max()
+    abs_max = weight_gpu.abs().max()
 
     if abs_max == 0:
-        abs_max = torch.tensor(1.0, dtype=torch.float32)
+        abs_max = torch.tensor(1.0, dtype=torch.float32, device=device)
 
     scale = (abs_max / 448.0).float()
 
     # Convert to FP8
-    fp8_weight = (weight_float / scale).to(torch.float8_e4m3fn)
+    fp8_weight = (weight_gpu / scale).to(torch.float8_e4m3fn)
 
-    return fp8_weight, scale
+    # Return on CPU to save GPU memory
+    return fp8_weight.cpu(), scale.cpu()
 
 
-def check_dynamic_range(weight: torch.Tensor, threshold: float = 1e6) -> bool:
+def check_dynamic_range(weight: torch.Tensor, device: torch.device, threshold: float = 1e6) -> bool:
     """Check if weight has acceptable dynamic range for FP8."""
-    weight_float = weight.float()
-    abs_max = weight_float.abs().max()
-    non_zero = weight_float[weight_float != 0]
+    weight_gpu = weight.to(device).float()
+    abs_max = weight_gpu.abs().max()
 
-    if non_zero.numel() == 0:
+    # Find non-zero minimum
+    non_zero_mask = weight_gpu != 0
+    if not non_zero_mask.any():
         return True
 
-    abs_min = non_zero.abs().min()
+    abs_min = weight_gpu.abs()[non_zero_mask].min()
 
     if abs_max > 0 and abs_min > 0:
-        dynamic_range = abs_max / abs_min
+        dynamic_range = (abs_max / abs_min).item()
         return dynamic_range <= threshold
 
     return True
 
 
-def convert_model(
+def convert_model_sharded(
     input_path: str,
     output_path: str,
     skip_patterns: Optional[list[str]] = None,
-    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
     verbose: bool = False,
 ):
     """
-    Convert a model to FP8 format.
+    Convert a model to FP8 format by processing shards directly.
+
+    This approach:
+    - Loads one shard at a time
+    - Converts weights on GPU
+    - Saves converted shard
+    - Uses minimal memory (~5GB GPU, ~10GB RAM)
 
     Args:
         input_path: Path to input model directory
         output_path: Path to output model directory
         skip_patterns: Layer name patterns to skip (keep in original precision)
-        dtype: Data type for non-FP8 layers
+        device: Device for conversion (cuda or cpu)
         verbose: Print detailed conversion info
     """
-    from transformers import AutoModelForCausalLM, AutoConfig
+    from safetensors import safe_open
+    from safetensors.torch import save_file
 
     if skip_patterns is None:
         skip_patterns = SKIP_PATTERNS
@@ -116,124 +134,181 @@ def convert_model(
     input_path = Path(input_path)
     output_path = Path(output_path)
 
+    # Setup device
+    if device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"[FP8 Convert] Using GPU: {torch.cuda.get_device_name()}")
+    else:
+        device = torch.device("cpu")
+        print(f"[FP8 Convert] Using CPU (slower)")
+
     print(f"[FP8 Convert] Input: {input_path}")
     print(f"[FP8 Convert] Output: {output_path}")
-    print(f"[FP8 Convert] Base dtype: {dtype}")
     print(f"[FP8 Convert] Skip patterns: {skip_patterns}")
 
     # Create output directory
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Copy non-weight files (config, tokenizer, etc.)
-    print("\n[FP8 Convert] Copying config and tokenizer files...")
+    # Copy all non-weight files (config, tokenizer, Python files, etc.)
+    print("\n[FP8 Convert] Copying model files...")
+    copied_files = []
+    skipped_files = []
+
     for file in input_path.iterdir():
-        if file.is_file() and not file.name.endswith('.safetensors') and not file.name.endswith('.bin'):
-            if file.name != 'model.safetensors.index.json':  # We'll regenerate this
-                shutil.copy2(file, output_path / file.name)
-                print(f"  Copied: {file.name}")
+        if file.is_file():
+            # Skip weight files (we'll create new ones)
+            if file.name.endswith('.safetensors') or file.name.endswith('.bin'):
+                skipped_files.append(file.name)
+                continue
+            # Skip index file (we'll regenerate it)
+            if file.name == 'model.safetensors.index.json':
+                skipped_files.append(file.name)
+                continue
 
-    # Copy subdirectories (like __pycache__, .cache)
+            # Copy everything else (Python files, configs, tokenizer, README, etc.)
+            shutil.copy2(file, output_path / file.name)
+            copied_files.append(file.name)
+
+    # Copy subdirectories (excluding __pycache__ and .cache)
     for subdir in input_path.iterdir():
-        if subdir.is_dir() and subdir.name not in ['__pycache__', '.cache']:
-            if (output_path / subdir.name).exists():
-                shutil.rmtree(output_path / subdir.name)
-            shutil.copytree(subdir, output_path / subdir.name)
-            print(f"  Copied dir: {subdir.name}")
+        if subdir.is_dir():
+            if subdir.name in ['__pycache__', '.cache']:
+                continue
+            dest = output_path / subdir.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(subdir, dest, ignore=shutil.ignore_patterns('__pycache__', '.cache', '*.pyc'))
+            copied_files.append(f"{subdir.name}/")
 
-    # Load model
-    print("\n[FP8 Convert] Loading model (this may take a while)...")
-    print("  Note: Loading in bf16 without device_map to ensure all weights are accessible")
+    print(f"  Copied {len(copied_files)} files/directories:")
+    for f in sorted(copied_files):
+        print(f"    - {f}")
+    if verbose and skipped_files:
+        print(f"  Skipped (will be regenerated): {', '.join(skipped_files)}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        input_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        device_map=None,  # Load to CPU, no offloading
-        low_cpu_mem_usage=True,
-    )
+    # Find all safetensor shards
+    index_path = input_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path, 'r') as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        # Get unique shard files in order
+        shard_files = sorted(set(weight_map.values()))
+    else:
+        # Single file model
+        single_file = input_path / "model.safetensors"
+        if single_file.exists():
+            shard_files = ["model.safetensors"]
+            weight_map = None
+        else:
+            raise FileNotFoundError(f"No safetensors files found in {input_path}")
 
-    print(f"[FP8 Convert] Model loaded successfully")
+    print(f"\n[FP8 Convert] Found {len(shard_files)} shard(s) to process")
 
-    # Collect all linear layers
-    linear_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            linear_layers.append((name, module))
-
-    print(f"[FP8 Convert] Found {len(linear_layers)} linear layers")
-
-    # Convert layers
+    # Statistics
     converted_count = 0
     skipped_pattern = 0
+    skipped_shape = 0
     skipped_range = 0
     total_original_bytes = 0
     total_fp8_bytes = 0
 
-    # Track which parameters were converted (for state_dict modification)
-    converted_params = {}  # name -> (fp8_weight, scale)
+    # New weight map for output
+    new_weight_map = {}
+    total_size = 0
 
-    print("\n[FP8 Convert] Converting layers...")
-    for name, module in tqdm(linear_layers, desc="Converting"):
-        weight = module.weight.data
+    # Process each shard
+    for shard_idx, shard_name in enumerate(shard_files):
+        shard_path = input_path / shard_name
+        output_shard_path = output_path / shard_name
 
-        # Check skip patterns
-        if not should_convert_layer(name, skip_patterns):
-            skipped_pattern += 1
-            if verbose:
-                print(f"  Skip (pattern): {name}")
-            continue
+        print(f"\n[FP8 Convert] Processing shard {shard_idx + 1}/{len(shard_files)}: {shard_name}")
 
-        # Check dynamic range
-        if not check_dynamic_range(weight):
-            skipped_range += 1
-            if verbose:
-                print(f"  Skip (range): {name}")
-            continue
+        # Load shard
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            tensor_names = list(f.keys())
 
-        # Track original size
-        original_bytes = weight.numel() * weight.element_size()
-        total_original_bytes += original_bytes
+            # Process tensors
+            output_tensors = {}
 
-        # Convert to FP8
-        fp8_weight, scale = convert_linear_to_fp8(weight)
+            for name in tqdm(tensor_names, desc=f"Shard {shard_idx + 1}", leave=False):
+                tensor = f.get_tensor(name)
 
-        # Track FP8 size
-        fp8_bytes = fp8_weight.numel() * fp8_weight.element_size() + 4  # +4 for scale
-        total_fp8_bytes += fp8_bytes
+                # Check if this should be converted
+                if should_convert_weight(name, skip_patterns):
+                    # Must be 2D (linear layer weight)
+                    if tensor.ndim != 2:
+                        skipped_shape += 1
+                        output_tensors[name] = tensor
+                        if verbose:
+                            print(f"  Skip (shape {tensor.shape}): {name}")
+                    # Check dynamic range
+                    elif not check_dynamic_range(tensor, device):
+                        skipped_range += 1
+                        output_tensors[name] = tensor
+                        if verbose:
+                            print(f"  Skip (range): {name}")
+                    else:
+                        # Convert to FP8
+                        original_bytes = tensor.numel() * tensor.element_size()
+                        total_original_bytes += original_bytes
 
-        # Store converted weight and scale
-        converted_params[name + '.weight'] = fp8_weight
-        converted_params[name + '.scale_weight'] = scale.view(1)
+                        fp8_weight, scale = convert_tensor_to_fp8(tensor, device)
 
-        converted_count += 1
+                        fp8_bytes = fp8_weight.numel() * fp8_weight.element_size()
+                        total_fp8_bytes += fp8_bytes + 4  # +4 for scale
 
+                        # Store converted weight and scale
+                        output_tensors[name] = fp8_weight
+                        scale_name = name.replace('.weight', '.scale_weight')
+                        output_tensors[scale_name] = scale.view(1)
+
+                        converted_count += 1
+
+                        if verbose:
+                            print(f"  Converted: {name}")
+                else:
+                    # Keep original
+                    if name.endswith('.weight') and tensor.ndim == 2:
+                        skipped_pattern += 1
+                        if verbose:
+                            print(f"  Skip (pattern): {name}")
+                    output_tensors[name] = tensor
+
+            # Update weight map
+            for tensor_name, tensor in output_tensors.items():
+                new_weight_map[tensor_name] = shard_name
+                total_size += tensor.numel() * tensor.element_size()
+
+            # Save output shard
+            save_file(output_tensors, output_shard_path)
+
+        # Clear GPU cache between shards
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Save new index file
+    if len(shard_files) > 1:
+        new_index = {
+            "metadata": {"total_size": total_size},
+            "weight_map": new_weight_map
+        }
+        new_index_path = output_path / "model.safetensors.index.json"
+        with open(new_index_path, 'w') as f:
+            json.dump(new_index, f, indent=2)
+
+    # Print summary
     print(f"\n[FP8 Convert] Conversion complete:")
-    print(f"  Converted: {converted_count} layers")
+    print(f"  Converted: {converted_count} linear layers to FP8")
     print(f"  Skipped (pattern): {skipped_pattern} layers")
+    print(f"  Skipped (shape): {skipped_shape} tensors")
     print(f"  Skipped (range): {skipped_range} layers")
 
     if total_original_bytes > 0:
         original_gb = total_original_bytes / (1024**3)
         fp8_gb = total_fp8_bytes / (1024**3)
         reduction = (1 - fp8_gb / original_gb) * 100
-        print(f"  Memory: {original_gb:.2f}GB -> {fp8_gb:.2f}GB ({reduction:.1f}% reduction)")
-
-    # Get state dict and modify it
-    print("\n[FP8 Convert] Building state dict...")
-    state_dict = model.state_dict()
-
-    # Replace converted weights and add scales
-    for param_name, tensor in converted_params.items():
-        if param_name.endswith('.scale_weight'):
-            # Add new scale parameter
-            state_dict[param_name] = tensor
-        else:
-            # Replace original weight with FP8 version
-            state_dict[param_name] = tensor
-
-    # Save model in shards
-    print("\n[FP8 Convert] Saving model...")
-    save_sharded_model(state_dict, output_path, max_shard_size_gb=4.0)
+        print(f"  Converted layers: {original_gb:.2f}GB -> {fp8_gb:.2f}GB ({reduction:.1f}% reduction)")
 
     # Update config to mark as FP8
     config_path = output_path / 'config.json'
@@ -252,82 +327,20 @@ def convert_model(
     return converted_count
 
 
-def save_sharded_model(state_dict: dict, output_path: Path, max_shard_size_gb: float = 4.0):
-    """Save state dict as sharded safetensors files."""
-    from safetensors.torch import save_file
-
-    max_shard_bytes = int(max_shard_size_gb * 1024**3)
-
-    # Sort keys for deterministic sharding
-    sorted_keys = sorted(state_dict.keys())
-
-    # Group into shards
-    shards = []
-    current_shard = {}
-    current_size = 0
-
-    for key in sorted_keys:
-        tensor = state_dict[key]
-        tensor_size = tensor.numel() * tensor.element_size()
-
-        if current_size + tensor_size > max_shard_bytes and current_shard:
-            shards.append(current_shard)
-            current_shard = {}
-            current_size = 0
-
-        current_shard[key] = tensor
-        current_size += tensor_size
-
-    if current_shard:
-        shards.append(current_shard)
-
-    print(f"  Saving {len(shards)} shard(s)...")
-
-    # Save shards
-    weight_map = {}
-    total_size = 0
-
-    for i, shard in enumerate(tqdm(shards, desc="Saving shards")):
-        if len(shards) == 1:
-            shard_name = "model.safetensors"
-        else:
-            shard_name = f"model-{i+1:05d}-of-{len(shards):05d}.safetensors"
-
-        shard_path = output_path / shard_name
-
-        # Move tensors to CPU and ensure contiguous
-        shard_cpu = {}
-        for key, tensor in shard.items():
-            t = tensor.cpu().contiguous()
-            shard_cpu[key] = t
-            total_size += t.numel() * t.element_size()
-            weight_map[key] = shard_name
-
-        save_file(shard_cpu, shard_path)
-
-    # Save index file if sharded
-    if len(shards) > 1:
-        index = {
-            "metadata": {"total_size": total_size},
-            "weight_map": weight_map
-        }
-        index_path = output_path / "model.safetensors.index.json"
-        with open(index_path, 'w') as f:
-            json.dump(index, f, indent=2)
-        print(f"  Saved index: {index_path.name}")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Convert HunyuanImage-3.0 model to FP8 format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic conversion
+    # Basic conversion (uses GPU)
     python convert_to_fp8.py --input models/LLM/HunyuanImage-3.0-Instruct --output models/LLM/HunyuanImage-3.0-Instruct-FP8
 
     # With verbose output
     python convert_to_fp8.py --input models/LLM/HunyuanImage-3.0-Instruct --output models/LLM/HunyuanImage-3.0-Instruct-FP8 --verbose
+
+    # Force CPU (slower but works without GPU)
+    python convert_to_fp8.py --input models/LLM/HunyuanImage-3.0-Instruct --output models/LLM/HunyuanImage-3.0-Instruct-FP8 --device cpu
         """
     )
 
@@ -346,11 +359,11 @@ Examples:
     )
 
     parser.add_argument(
-        "--dtype",
+        "--device",
         type=str,
-        default="bfloat16",
-        choices=["bfloat16", "float16", "float32"],
-        help="Data type for non-FP8 layers (default: bfloat16)"
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device for conversion (default: cuda)"
     )
 
     parser.add_argument(
@@ -361,19 +374,11 @@ Examples:
 
     args = parser.parse_args()
 
-    # Parse dtype
-    dtype_map = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-    dtype = dtype_map[args.dtype]
-
     # Run conversion
-    convert_model(
+    convert_model_sharded(
         input_path=args.input,
         output_path=args.output,
-        dtype=dtype,
+        device=args.device,
         verbose=args.verbose,
     )
 

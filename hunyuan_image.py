@@ -439,6 +439,40 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
     return device_map, gpu_memory_gb
 
 
+def patch_accelerate_for_fp8():
+    """
+    Patch accelerate's disk offload to handle FP8 tensors.
+    FP8 stored as uint8 bytes (lossless), restored as FP8 when loading.
+    """
+    from accelerate.utils import offload as accel_offload
+
+    if hasattr(accel_offload, '_fp8_patched'):
+        return
+
+    original_offload_weight = accel_offload.offload_weight
+    original_load_offloaded_weight = accel_offload.load_offloaded_weight
+
+    # Track which weights are FP8
+    _fp8_weight_names = set()
+
+    def patched_offload_weight(weight, weight_name, offload_folder, index=None):
+        if weight.dtype == torch.float8_e4m3fn:
+            weight = weight.view(torch.uint8)
+            _fp8_weight_names.add(weight_name)
+        return original_offload_weight(weight, weight_name, offload_folder, index)
+
+    def patched_load_offloaded_weight(weight_file, weight_name):
+        weight = original_load_offloaded_weight(weight_file, weight_name)
+        if weight_name in _fp8_weight_names:
+            weight = weight.view(torch.float8_e4m3fn)
+        return weight
+
+    accel_offload.offload_weight = patched_offload_weight
+    accel_offload.load_offloaded_weight = patched_load_offloaded_weight
+    accel_offload._fp8_patched = True
+    print("[FP8] Patched accelerate disk offload for FP8 support")
+
+
 def apply_fp8_linear_forward_patch():
     """
     Patch nn.Linear.forward globally to handle FP8 dequantization.
@@ -573,6 +607,9 @@ def load_fp8_model_with_offload(
     from transformers import AutoConfig, AutoModelForCausalLM
     from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
     from accelerate.utils import set_module_tensor_to_device, get_balanced_memory
+
+    # Patch accelerate to handle FP8 disk offload
+    patch_accelerate_for_fp8()
 
     model_path = Path(model_path)
     print(f"[FP8 Loader] Loading FP8 model from {model_path}")

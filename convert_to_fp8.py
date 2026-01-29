@@ -224,12 +224,18 @@ def convert_model_sharded(
 
         print(f"\n[FP8 Convert] Processing shard {shard_idx + 1}/{len(shard_files)}: {shard_name}")
 
+        if not shard_path.exists():
+            print(f"  ERROR: Shard file not found: {shard_path}")
+            continue
+
         # Load shard
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             tensor_names = list(f.keys())
+            print(f"  Tensors in shard: {len(tensor_names)}")
 
             # Process tensors
             output_tensors = {}
+            shard_converted = 0
 
             for name in tqdm(tensor_names, desc=f"Shard {shard_idx + 1}", leave=False):
                 tensor = f.get_tensor(name)
@@ -264,6 +270,7 @@ def convert_model_sharded(
                         output_tensors[scale_name] = scale.view(1)
 
                         converted_count += 1
+                        shard_converted += 1
 
                         if verbose:
                             print(f"  Converted: {name}")
@@ -275,13 +282,17 @@ def convert_model_sharded(
                             print(f"  Skip (pattern): {name}")
                     output_tensors[name] = tensor
 
+            print(f"  Converted {shard_converted} tensors in this shard")
+
             # Update weight map
             for tensor_name, tensor in output_tensors.items():
                 new_weight_map[tensor_name] = shard_name
                 total_size += tensor.numel() * tensor.element_size()
 
             # Save output shard
+            print(f"  Saving to: {output_shard_path}")
             save_file(output_tensors, output_shard_path)
+            print(f"  Saved successfully")
 
         # Clear GPU cache between shards
         if device.type == "cuda":
@@ -310,7 +321,7 @@ def convert_model_sharded(
         reduction = (1 - fp8_gb / original_gb) * 100
         print(f"  Converted layers: {original_gb:.2f}GB -> {fp8_gb:.2f}GB ({reduction:.1f}% reduction)")
 
-    # Update config to mark as FP8
+    # Update config to mark as FP8 and remove torch_dtype to prevent auto-conversion on load
     config_path = output_path / 'config.json'
     if config_path.exists():
         with open(config_path, 'r') as f:
@@ -318,6 +329,10 @@ def convert_model_sharded(
         config['fp8_converted'] = True
         config['fp8_skip_patterns'] = skip_patterns
         config['fp8_converted_layers'] = converted_count
+        # CRITICAL: Remove torch_dtype so transformers doesn't convert FP8 back to bf16 on load
+        if 'torch_dtype' in config:
+            print(f"  Removing torch_dtype from config (was: {config['torch_dtype']})")
+            del config['torch_dtype']
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=4)
         print(f"  Updated config.json with FP8 metadata")

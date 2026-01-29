@@ -950,13 +950,20 @@ except ImportError:
     print("Warning: safetensors not installed. Quantized model saving unavailable.")
 
 
-def create_sdnq_config(weights_dtype: str = "int8", use_quantized_matmul: bool = True) -> "SDNQConfig":
+def create_sdnq_config(
+    weights_dtype: str = "int8",
+    use_quantized_matmul: bool = True,
+    quantization_device: str = None,
+    return_device: str = None,
+) -> "SDNQConfig":
     """
     Create SDNQConfig for HunyuanImage-3.0 with appropriate skip modules.
 
     Args:
         weights_dtype: Quantization dtype (int8, int4, uint4, float8_e4m3fn)
         use_quantized_matmul: Use Triton-optimized quantized matmul kernels
+        quantization_device: Device for quantization calculation (e.g., "cpu" to save VRAM)
+        return_device: Device for quantized weights (e.g., "cpu" for offloading)
 
     Returns:
         SDNQConfig instance
@@ -965,6 +972,8 @@ def create_sdnq_config(weights_dtype: str = "int8", use_quantized_matmul: bool =
         weights_dtype=weights_dtype,
         group_size=0,  # auto
         use_quantized_matmul=use_quantized_matmul and sdnq_triton_available,
+        quantization_device=quantization_device,
+        return_device=return_device,
         modules_to_not_convert=[
             # VAE - pixel reconstruction
             'vae',
@@ -1900,10 +1909,16 @@ class HunyuanImage3Backend:
             if use_sdnq:
                 # Use SDNQ quantization
                 sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
+                # When CPU offload is enabled: quantize on GPU (fast), return to CPU (for offload)
+                sdnq_return_device = "cpu" if cpu_offload else None
                 print(f"[hunyuan_image] Using SDNQ quantization: {sdnq_weights_dtype}")
+                if cpu_offload:
+                    print(f"[hunyuan_image] SDNQ: quantizing on GPU, placing weights in RAM for offload")
                 quantization_config = create_sdnq_config(
                     weights_dtype=sdnq_weights_dtype,
                     use_quantized_matmul=True,
+                    quantization_device=None,  # Use GPU for fast quantization
+                    return_device=sdnq_return_device,
                 )
                 model_kwargs["quantization_config"] = quantization_config
                 # SDNQ handles dtype internally, don't set torch_dtype

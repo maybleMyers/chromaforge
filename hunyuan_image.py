@@ -1262,7 +1262,9 @@ class HunyuanImage3Backend:
             self.model.generation_config.diff_infer_steps = num_inference_steps
             self.model.generation_config.diff_guidance_scale = guidance_scale
             self.model.generation_config.flow_shift = flow_shift
-            print(f"[hunyuan_image] Set generation_config: steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}")
+            # Set image_size as list of strings (model's expected format)
+            self.model.generation_config.image_size = [f"{width}x{height}"]
+            print(f"[hunyuan_image] Set generation_config: steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}, image_size={width}x{height}")
 
         # Add Taylor cache parameters when enabled
         if use_taylor_cache:

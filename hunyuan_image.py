@@ -369,12 +369,19 @@ except ImportError:
     print("Warning: accelerate not installed. Multi-GPU support will be limited.")
 
 try:
-    from optimum.quanto import quantize, qint4, freeze
+    from optimum.quanto import quantize, qint4, freeze, quantization_map, requantize
     QUANTO_AVAILABLE = True
     print("Quanto available")
 except ImportError:
     QUANTO_AVAILABLE = False
     print("Warning: optimum-quanto not installed. Quanto quantization unavailable.")
+
+try:
+    from safetensors.torch import save_file as safetensors_save, load_file as safetensors_load
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+    print("Warning: safetensors not installed. Quantized model saving unavailable.")
 
 
 def apply_quantization_dtype_fix(model):
@@ -1150,21 +1157,67 @@ class HunyuanImage3Backend:
             # Apply Quanto int4 quantization if requested
             if use_quanto:
                 log_gpu_memory("Before Quanto quantization")
-                print("[hunyuan_image] Applying Quanto qint4 quantization...")
 
-                # Get modules to exclude from quantization (keep vision/VAE in full precision)
-                exclude_modules = []
-                for name, module in self.model.named_modules():
-                    for skip_name in HUNYUAN_SKIP_MODULES:
-                        if skip_name in name:
-                            exclude_modules.append(name)
-                            break
+                # Define paths for saved quantized weights
+                quanto_dir = os.path.join(model_path, "quanto_int4")
+                quanto_weights_path = os.path.join(quanto_dir, "model_quanto_int4.safetensors")
+                quanto_map_path = os.path.join(quanto_dir, "quantization_map.json")
 
-                # Apply quantization (excludes specified modules)
-                quantize(self.model, weights=qint4, exclude=exclude_modules)
-                freeze(self.model)  # Freeze quantized weights
+                # Check if saved quantized weights exist
+                if os.path.exists(quanto_weights_path) and os.path.exists(quanto_map_path) and SAFETENSORS_AVAILABLE:
+                    print(f"[hunyuan_image] Loading saved Quanto weights from {quanto_dir}...")
+                    progress(0.7, desc="Loading saved quantized weights...")
 
-                print(f"[hunyuan_image] Quanto quantization applied, excluded {len(exclude_modules)} modules")
+                    # Load quantization map
+                    with open(quanto_map_path, 'r') as f:
+                        qmap = json.load(f)
+
+                    # Load quantized state dict (to CPU first, requantize will handle device placement)
+                    state_dict = safetensors_load(quanto_weights_path, device="cpu")
+
+                    # Apply requantization - uses model's existing device placement from device_map
+                    requantize(self.model, state_dict, qmap)
+
+                    print(f"[hunyuan_image] Loaded saved Quanto weights successfully")
+                else:
+                    print("[hunyuan_image] Applying Quanto qint4 quantization (this may take a while on first run)...")
+                    progress(0.6, desc="Quantizing model (first run, will be saved)...")
+
+                    # Get modules to exclude from quantization (keep vision/VAE in full precision)
+                    exclude_modules = []
+                    for name, module in self.model.named_modules():
+                        for skip_name in HUNYUAN_SKIP_MODULES:
+                            if skip_name in name:
+                                exclude_modules.append(name)
+                                break
+
+                    # Apply quantization (excludes specified modules)
+                    quantize(self.model, weights=qint4, exclude=exclude_modules)
+                    freeze(self.model)  # Freeze quantized weights
+
+                    print(f"[hunyuan_image] Quanto quantization applied, excluded {len(exclude_modules)} modules")
+
+                    # Save quantized weights for future use
+                    if SAFETENSORS_AVAILABLE:
+                        try:
+                            os.makedirs(quanto_dir, exist_ok=True)
+                            print(f"[hunyuan_image] Saving quantized weights to {quanto_dir}...")
+                            progress(0.75, desc="Saving quantized weights...")
+
+                            # Save state dict
+                            safetensors_save(self.model.state_dict(), quanto_weights_path)
+
+                            # Save quantization map
+                            qmap = quantization_map(self.model)
+                            with open(quanto_map_path, 'w') as f:
+                                json.dump(qmap, f)
+
+                            print(f"[hunyuan_image] Quantized weights saved. Next load will be faster.")
+                        except Exception as e:
+                            print(f"[hunyuan_image] Warning: Could not save quantized weights: {e}")
+                    else:
+                        print("[hunyuan_image] Warning: safetensors not installed, cannot save quantized weights")
+
                 log_gpu_memory("After Quanto quantization")
 
             # Apply quantization compatibility patches if using quantization

@@ -439,108 +439,86 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
     return device_map, gpu_memory_gb
 
 
-def _fp8_pre_forward_hook(module, args):
-    """Pre-forward hook: dequantize FP8 weight to bf16 for computation.
-
-    This works with accelerate's CPU offloading:
-    1. Accelerate's pre_forward hook loads weight from CPU to GPU
-    2. Our hook reads module.weight (now on GPU), dequantizes FP8->bf16
-    3. Forward runs with bf16 weight
-    4. Our post_forward restores FP8 weight
-    5. Accelerate's post_forward moves weight back to CPU
+def apply_fp8_linear_forward_patch():
     """
-    if not hasattr(module, 'scale_weight'):
-        return args
+    Patch nn.Linear.forward globally to handle FP8 dequantization.
 
-    # Get the CURRENT weight - accelerate may have just loaded it from CPU
-    fp8_weight = module.weight
-    scale = module.scale_weight
-    computation_dtype = getattr(module, 'computation_dtype', torch.bfloat16)
+    This approach doesn't modify module.weight, so it works with accelerate's
+    CPU offloading which manages weight tensors directly.
 
-    # Skip if weight is meta tensor (not loaded yet)
-    if fp8_weight.device.type == 'meta':
-        return args
+    The patched forward:
+    1. Checks if module has scale_weight (FP8 layer)
+    2. If weight is FP8, dequantizes on-the-fly for computation
+    3. Never modifies module.weight - accelerate can manage it normally
+    """
+    import torch.nn as nn
+    import torch.nn.functional as F
 
-    # Skip if weight is already dequantized (not FP8)
-    if fp8_weight.dtype != torch.float8_e4m3fn:
-        return args
+    if hasattr(nn.Linear, '_original_forward_fp8'):
+        print("[FP8] Linear forward already patched")
+        return
 
-    # Determine target device from input
-    input_tensor = args[0] if args else None
-    if input_tensor is not None:
-        target_device = input_tensor.device
-    else:
-        target_device = fp8_weight.device
+    original_forward = nn.Linear.forward
 
-    # Store the FP8 weight for restoration in post_forward
-    module._fp8_weight_backup = fp8_weight
+    def fp8_linear_forward(self, input):
+        weight = self.weight
 
-    # Move to target device if needed
-    weight_on_device = fp8_weight
-    scale_on_device = scale
-    if fp8_weight.device != target_device:
-        weight_on_device = fp8_weight.to(target_device)
-    if scale.device != target_device:
-        scale_on_device = scale.to(target_device)
+        # Check if this is an FP8 layer with scale
+        if hasattr(self, 'scale_weight') and weight.dtype == torch.float8_e4m3fn:
+            # Get scale, move to same device as input if needed
+            scale = self.scale_weight
+            if scale.device != input.device:
+                scale = scale.to(input.device)
 
-    # Dequantize: FP8 -> bf16
-    weight_dequant = weight_on_device.to(computation_dtype) * scale_on_device.to(computation_dtype)
+            # Move weight to input device if needed (accelerate may have it on different device)
+            if weight.device != input.device:
+                weight = weight.to(input.device)
 
-    # Temporarily replace weight with dequantized version
-    module.weight = torch.nn.Parameter(weight_dequant, requires_grad=False)
+            # Dequantize: FP8 * scale -> computation dtype
+            # Use input dtype for computation (typically bf16)
+            weight_dequant = weight.to(input.dtype) * scale.to(input.dtype)
 
-    return args
+            # Compute linear with dequantized weight
+            bias = self.bias
+            if bias is not None and bias.device != input.device:
+                bias = bias.to(input.device)
+            return F.linear(input, weight_dequant, bias)
 
+        # Non-FP8 layer: use original forward
+        return original_forward(self, input)
 
-def _fp8_post_forward_hook(module, args, output):
-    """Post-forward hook: restore FP8 weight to save memory."""
-    if hasattr(module, '_fp8_weight_backup'):
-        # Restore FP8 weight
-        module.weight = module._fp8_weight_backup
-        del module._fp8_weight_backup
-    return output
+    nn.Linear._original_forward_fp8 = original_forward
+    nn.Linear.forward = fp8_linear_forward
+    print("[FP8] Patched nn.Linear.forward for FP8 dequantization")
 
 
 def apply_fp8_hooks_to_model(model, computation_dtype=torch.bfloat16):
     """
-    Apply FP8 forward hooks to a pre-converted FP8 model.
+    Enable FP8 support for a pre-converted model.
 
-    Uses PyTorch's hook system instead of replacing forward methods,
-    which makes it compatible with accelerate's CPU offloading.
-
-    The hooks work with accelerate's lazy loading:
-    1. Accelerate loads weights from CPU/disk to GPU on-demand
-    2. Our pre_forward hook dequantizes FP8->bf16 after accelerate loads
-    3. Our post_forward hook restores FP8 weight before accelerate offloads
+    This patches nn.Linear.forward globally to dequantize FP8 weights on-the-fly.
+    Compatible with accelerate's CPU offloading since we don't modify module.weight.
 
     Args:
-        model: Model with pre-converted FP8 weights
+        model: Model with pre-converted FP8 weights and scale_weight buffers
         computation_dtype: Dtype to use for computation (default: bfloat16)
 
     Returns:
-        model with FP8 forward hooks applied
+        model (unchanged, but nn.Linear.forward is now patched globally)
     """
     import torch.nn as nn
 
-    hooked_count = 0
+    # Apply the global Linear forward patch
+    apply_fp8_linear_forward_patch()
 
+    # Count FP8 layers for logging
+    fp8_count = 0
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # Check if this layer has FP8 weights (has scale_weight buffer)
-            if hasattr(module, 'scale_weight'):
-                # Set computation dtype
-                module.computation_dtype = computation_dtype
+        if isinstance(module, nn.Linear) and hasattr(module, 'scale_weight'):
+            fp8_count += 1
 
-                # Only register hooks once
-                if not getattr(module, '_fp8_hooks_registered', False):
-                    # Register hooks (pre-forward dequantizes, post-forward restores)
-                    module.register_forward_pre_hook(_fp8_pre_forward_hook)
-                    module.register_forward_hook(_fp8_post_forward_hook)
-                    module._fp8_hooks_registered = True
-                    hooked_count += 1
-
-    if hooked_count > 0:
-        print(f"[FP8] Applied forward hooks to {hooked_count} pre-converted FP8 layers")
+    if fp8_count > 0:
+        print(f"[FP8] Model has {fp8_count} FP8 layers with scales (dequantization enabled)")
 
     return model
 

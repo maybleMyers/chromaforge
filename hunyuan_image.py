@@ -1213,20 +1213,21 @@ class HunyuanImage3Backend:
 
             if is_preconverted_fp8:
                 print("[hunyuan_image] Detected pre-converted FP8 model")
-
-            # Always set torch_dtype for consistency of non-FP8 tensors
-            # Safetensors preserves actual stored dtypes (FP8) regardless of this setting
-            dtype_map = {
-                "bfloat16": torch.bfloat16,
-                "float16": torch.float16,
-                "float32": torch.float32,
-                "fp8": torch.bfloat16,  # FP8 weights preserved, other tensors in bf16
-                "q8_partial": torch.bfloat16,
-                "q8_fp16": torch.float16,
-                "q4_nf4": torch.bfloat16,
-                "quanto_int4": torch.bfloat16,
-            }
-            torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+                # Don't set torch_dtype - it would cast FP8 weights to bf16
+                # We'll manually handle dtype consistency after loading
+                torch_dtype = None
+            else:
+                dtype_map = {
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
+                    "float32": torch.float32,
+                    "fp8": torch.bfloat16,  # Runtime conversion: load bf16 first
+                    "q8_partial": torch.bfloat16,
+                    "q8_fp16": torch.float16,
+                    "q4_nf4": torch.bfloat16,
+                    "quanto_int4": torch.bfloat16,
+                }
+                torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
             # Create device map for multi-GPU or CPU offloading
             actual_gpus = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 0
@@ -1333,7 +1334,9 @@ class HunyuanImage3Backend:
                 )
                 model_kwargs["quantization_config"] = quantization_config
             else:
-                model_kwargs["torch_dtype"] = torch_dtype
+                # Only set torch_dtype if specified (None for pre-converted FP8)
+                if torch_dtype is not None:
+                    model_kwargs["torch_dtype"] = torch_dtype
 
             if device_map is not None:
                 model_kwargs["device_map"] = device_map
@@ -1464,6 +1467,7 @@ class HunyuanImage3Backend:
                 # Debug: check what dtypes we have after loading
                 fp8_count = 0
                 bf16_count = 0
+                f32_count = 0
                 scale_count = 0
                 other_dtypes = {}
                 for name, param in self.model.named_parameters():
@@ -1471,17 +1475,84 @@ class HunyuanImage3Backend:
                         fp8_count += 1
                     elif param.dtype == torch.bfloat16:
                         bf16_count += 1
+                    elif param.dtype == torch.float32:
+                        f32_count += 1
                     else:
                         other_dtypes[param.dtype] = other_dtypes.get(param.dtype, 0) + 1
                 # Count scale buffers
                 for name, buf in self.model.named_buffers():
                     if 'scale_weight' in name:
                         scale_count += 1
-                print(f"[FP8] Model dtypes after load: {fp8_count} FP8, {bf16_count} bf16, {scale_count} scales, others: {other_dtypes}")
+                print(f"[FP8] Model dtypes after load: {fp8_count} FP8, {bf16_count} bf16, {f32_count} f32, {scale_count} scales")
+
+                # For pre-converted FP8 models, cast non-FP8 params to bf16 for consistency
+                if is_preconverted_fp8 and (f32_count > 0 or bf16_count > 0):
+                    print(f"[FP8] Casting non-FP8 parameters to bf16 for consistency...")
+                    cast_count = 0
+                    for name, param in self.model.named_parameters():
+                        if param.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16]:
+                            param.data = param.data.to(torch.bfloat16)
+                            cast_count += 1
+                    print(f"[FP8] Cast {cast_count} parameters to bf16")
 
                 if is_preconverted_fp8:
                     log_gpu_memory("Before FP8 hook application")
-                    print("[hunyuan_image] Detected pre-converted FP8 model, applying forward hooks...")
+
+                    # Load FP8 weights and scale_weight buffers manually
+                    # (transformers may have converted FP8 to bf16, and scales aren't in model architecture)
+                    from safetensors import safe_open
+
+                    # Find safetensors files
+                    index_path = os.path.join(model_path, "model.safetensors.index.json")
+                    if os.path.exists(index_path):
+                        with open(index_path, 'r') as f:
+                            index = json.load(f)
+                        weight_map = index.get("weight_map", {})
+                        shard_files = sorted(set(weight_map.values()))
+                    else:
+                        shard_files = ["model.safetensors"]
+
+                    # Check if we need to reload FP8 weights (if they were converted to bf16)
+                    need_fp8_reload = (fp8_count == 0 and scale_count == 0)
+
+                    if need_fp8_reload:
+                        print(f"[FP8] FP8 weights were converted during load, reloading from safetensors...")
+
+                    scales_loaded = 0
+                    fp8_reloaded = 0
+
+                    for shard_name in shard_files:
+                        shard_path = os.path.join(model_path, shard_name)
+                        if os.path.exists(shard_path):
+                            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                                for key in f.keys():
+                                    if key.endswith('.scale_weight'):
+                                        # Load scale buffer
+                                        module_name = key.rsplit('.scale_weight', 1)[0]
+                                        try:
+                                            module = self.model.get_submodule(module_name)
+                                            scale = f.get_tensor(key)
+                                            module.register_buffer('scale_weight', scale)
+                                            scales_loaded += 1
+                                        except AttributeError:
+                                            pass
+
+                                    elif need_fp8_reload and key.endswith('.weight'):
+                                        # Check if this is an FP8 weight we need to reload
+                                        tensor = f.get_tensor(key)
+                                        if tensor.dtype == torch.float8_e4m3fn:
+                                            module_name = key.rsplit('.weight', 1)[0]
+                                            try:
+                                                module = self.model.get_submodule(module_name)
+                                                # Replace the bf16 weight with FP8
+                                                module.weight = torch.nn.Parameter(tensor, requires_grad=False)
+                                                fp8_reloaded += 1
+                                            except AttributeError:
+                                                pass
+
+                    print(f"[FP8] Loaded {scales_loaded} scales, reloaded {fp8_reloaded} FP8 weights")
+
+                    print("[hunyuan_image] Applying FP8 forward hooks...")
                     self.model = apply_fp8_hooks_to_model(self.model, computation_dtype=torch.bfloat16)
                     log_gpu_memory("After FP8 hook application")
                 else:

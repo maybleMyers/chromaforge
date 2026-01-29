@@ -1155,15 +1155,20 @@ class HunyuanImage3Backend:
                 print(f"[hunyuan_image] Loading pre-quantized model (skipping bf16 weights)...")
                 progress(0.3, desc="Creating model structure...")
 
-                # Load model structure WITHOUT weights using init_empty_weights
+                # Load config and create model structure WITHOUT weights
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+                # Set model config options
+                config.attn_implementation = model_kwargs.get("attn_implementation", "sdpa")
+                config.moe_impl = moe_impl
+                config.moe_drop_tokens = moe_drop_tokens
+
                 with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        torch_dtype=torch.bfloat16,
+                    self.model = AutoModelForCausalLM.from_config(
+                        config,
                         trust_remote_code=True,
-                        attn_implementation=model_kwargs.get("attn_implementation", "sdpa"),
-                        moe_impl=moe_impl,
-                        moe_drop_tokens=moe_drop_tokens,
+                        torch_dtype=torch.bfloat16,
                     )
 
                 progress(0.5, desc="Loading quantized weights...")

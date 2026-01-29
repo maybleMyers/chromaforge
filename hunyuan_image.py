@@ -2074,6 +2074,34 @@ class HunyuanImage3Backend:
                     moe_drop_tokens=model_kwargs.get("moe_drop_tokens", False),
                 )
 
+            elif use_sdnq and cpu_offload:
+                # SDNQ with CPU offload: load to CPU, then dispatch with explicit device_map
+                print("[hunyuan_image] SDNQ + CPU offload: loading to CPU, then dispatching...")
+
+                # Load entirely to CPU first (bypasses transformers' broken dispatch)
+                sdnq_kwargs = model_kwargs.copy()
+                sdnq_kwargs["device_map"] = {"": "cpu"}
+                sdnq_kwargs.pop("max_memory", None)
+
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    **sdnq_kwargs,
+                )
+
+                progress(0.7, desc="Dispatching to GPU/CPU...")
+
+                # Create explicit device_map: attention on GPU, MoE experts on CPU
+                from accelerate import dispatch_model
+                explicit_device_map, gpu_gb = create_attention_priority_device_map(
+                    num_layers=32, num_experts=64
+                )
+                print(f"[hunyuan_image] Dispatching: ~{gpu_gb:.1f}GB to GPU, MoE experts to CPU")
+
+                self.model = dispatch_model(self.model, device_map=explicit_device_map)
+                device_map = explicit_device_map
+
+                log_gpu_memory("After SDNQ load and dispatch")
+
             else:
                 # Normal loading for non-quanto, non-FP8 models
                 self.model = AutoModelForCausalLM.from_pretrained(

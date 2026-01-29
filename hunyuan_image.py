@@ -2671,6 +2671,7 @@ def create_ui():
                         output_image = gr.Image(
                             label="Generated Image",
                             type="pil",
+                            format="png",
                             height=400,
                         )
 

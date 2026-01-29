@@ -237,13 +237,28 @@ def convert_model_sharded(
             output_tensors = {}
             shard_converted = 0
 
-            # Debug: show first few tensor decisions
+            # Debug: find and test a tensor that SHOULD convert
             if shard_idx == 0:
-                print("  DEBUG: First 5 tensor conversion decisions:")
-                for debug_name in tensor_names[:5]:
+                print("  DEBUG: Looking for convertible tensors...")
+                found_convertible = False
+                for debug_name in tensor_names:
                     debug_tensor = f.get_tensor(debug_name)
                     should = should_convert_weight(debug_name, skip_patterns)
-                    print(f"    {debug_name}: should_convert={should}, shape={debug_tensor.shape}, ndim={debug_tensor.ndim}")
+                    if should and debug_tensor.ndim == 2:
+                        print(f"    FOUND: {debug_name}")
+                        print(f"      should_convert={should}, shape={debug_tensor.shape}, dtype={debug_tensor.dtype}")
+                        # Test dynamic range
+                        range_ok = check_dynamic_range(debug_tensor, device)
+                        print(f"      dynamic_range_ok={range_ok}")
+                        found_convertible = True
+                        break
+                if not found_convertible:
+                    print("    NO CONVERTIBLE TENSORS FOUND IN SHARD 1!")
+                    # Show what's blocking conversion
+                    for debug_name in tensor_names[:20]:
+                        debug_tensor = f.get_tensor(debug_name)
+                        should = should_convert_weight(debug_name, skip_patterns)
+                        print(f"    {debug_name}: should={should}, ndim={debug_tensor.ndim}")
 
             for name in tqdm(tensor_names, desc=f"Shard {shard_idx + 1}", leave=False):
                 tensor = f.get_tensor(name)

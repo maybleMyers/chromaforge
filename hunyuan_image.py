@@ -73,6 +73,17 @@ SETTINGS_FILE = "hunyuan_image_settings.json"
 # Global stop flag for generation
 stop_generation: bool = False
 
+# Modules to keep on GPU during CPU offloading (for FP8 performance)
+# Attention layers are small but latency-sensitive - keeping them on GPU improves speed
+HUNYUAN_GPU_MODULES = [
+    'self_attn',  # Attention layers - small but latency-critical
+    'input_layernorm', 'post_attention_layernorm',  # LayerNorms before/after attention
+    'wte', 'ln_f',  # Embeddings and final norm
+    'vae',  # VAE should stay on GPU
+    'vision_model', 'vision_aligner',  # Vision encoder
+    'final_layer', 'patch_embed',  # Image generation head
+]
+
 # Modules to skip during quantization (keep in full precision)
 # These are small but critical for image quality and numerical stability
 HUNYUAN_SKIP_MODULES = [
@@ -114,6 +125,7 @@ DEFAULT_SETTINGS = {
     "flash_attention": False,
     "moe_impl": "eager",
     "moe_drop_tokens": True,
+    "keep_attention_on_gpu": False,
     # Generation Settings
     "default_steps": 50,
     "default_guidance": 2.5,  # Model default is 2.5
@@ -140,6 +152,7 @@ def save_settings(
     flash_attention: bool,
     moe_impl: str,
     moe_drop_tokens: bool,
+    keep_attention_on_gpu: bool,
     # Generation Settings
     default_steps: int,
     default_guidance: float,
@@ -165,6 +178,7 @@ def save_settings(
         "flash_attention": flash_attention,
         "moe_impl": moe_impl,
         "moe_drop_tokens": moe_drop_tokens,
+        "keep_attention_on_gpu": keep_attention_on_gpu,
         # Generation Settings
         "default_steps": default_steps,
         "default_guidance": default_guidance,
@@ -318,6 +332,91 @@ def convert_model_to_fp8_scaled(model, skip_patterns=None):
         torch.cuda.empty_cache()
 
     return model
+
+
+def create_attention_priority_device_map(model, max_gpu_memory_gb: float = None, gpu_modules: list = None):
+    """
+    Create a device_map that keeps attention layers on GPU while offloading MoE experts to CPU.
+
+    This improves inference speed for FP8 models by keeping latency-sensitive attention
+    computations on GPU while offloading the larger MoE FFN experts to CPU.
+
+    Args:
+        model: The loaded model to create a device_map for
+        max_gpu_memory_gb: Maximum GPU memory to use (None = auto-detect)
+        gpu_modules: List of module name patterns to keep on GPU
+
+    Returns:
+        dict: device_map with attention on GPU (0) and MoE experts on CPU
+    """
+    if gpu_modules is None:
+        gpu_modules = HUNYUAN_GPU_MODULES
+
+    # Detect available GPU memory
+    if max_gpu_memory_gb is None and torch.cuda.is_available():
+        free_mem, total_mem = torch.cuda.mem_get_info(0)
+        max_gpu_bytes = int(free_mem * 0.85)  # Use 85% of free memory
+    else:
+        max_gpu_bytes = int((max_gpu_memory_gb or 24) * (1024**3))
+
+    # Calculate module sizes by aggregating parameter sizes
+    module_sizes = {}
+    for name, param in model.named_parameters():
+        # Get the immediate parent module name
+        parts = name.split('.')
+        # Build module path hierarchy
+        for i in range(1, len(parts)):
+            module_path = '.'.join(parts[:i])
+            if module_path not in module_sizes:
+                module_sizes[module_path] = 0
+            # Only count at the deepest level to avoid double-counting
+        # The parameter belongs to its immediate parent
+        if len(parts) > 1:
+            parent_module = '.'.join(parts[:-1])
+            module_sizes[parent_module] = module_sizes.get(parent_module, 0) + param.numel() * param.element_size()
+
+    # Classify modules and build device map
+    device_map = {}
+    gpu_bytes = 0
+    cpu_bytes = 0
+
+    # Process leaf modules (those with parameters)
+    for module_name, module_size in sorted(module_sizes.items(), key=lambda x: x[0]):
+        name_lower = module_name.lower()
+
+        # Check if this is an attention-related module that should stay on GPU
+        is_attention = any(pattern in name_lower for pattern in gpu_modules)
+
+        # Check if this is an MoE expert (large, can be offloaded)
+        is_moe_expert = '.experts.' in module_name or (
+            '.moe.' in name_lower and any(f'.{i}.' in module_name or module_name.endswith(f'.{i}') for i in range(64))
+        )
+
+        if is_attention and not is_moe_expert:
+            # Attention layers: prioritize GPU
+            device_map[module_name] = 0
+            gpu_bytes += module_size
+        elif is_moe_expert:
+            # MoE experts: offload to CPU
+            device_map[module_name] = 'cpu'
+            cpu_bytes += module_size
+        else:
+            # Other modules: fit on GPU if space available
+            if gpu_bytes + module_size <= max_gpu_bytes:
+                device_map[module_name] = 0
+                gpu_bytes += module_size
+            else:
+                device_map[module_name] = 'cpu'
+                cpu_bytes += module_size
+
+    gpu_gb = gpu_bytes / (1024**3)
+    cpu_gb = cpu_bytes / (1024**3)
+    attn_count = sum(1 for k, v in device_map.items() if v == 0 and 'attn' in k.lower())
+    expert_count = sum(1 for k, v in device_map.items() if v == 'cpu' and 'expert' in k.lower())
+    print(f"[device_map] Attention-priority: {gpu_gb:.2f}GB on GPU, {cpu_gb:.2f}GB on CPU")
+    print(f"[device_map] {attn_count} attention modules on GPU, {expert_count} MoE experts on CPU")
+
+    return device_map
 
 
 def _fp8_linear_forward(layer, input):
@@ -974,6 +1073,7 @@ class HunyuanImage3Backend:
         flash_attention: bool = False,
         moe_impl: str = "eager",
         moe_drop_tokens: bool = True,
+        keep_attention_on_gpu: bool = False,
         progress=gr.Progress(),
     ) -> str:
         """
@@ -981,18 +1081,20 @@ class HunyuanImage3Backend:
 
         Args:
             model_name: Name of the model to load
-            dtype: Data type (bfloat16, float16, q4_nf4, q8_fp16)
+            dtype: Data type (bfloat16, float16, q4_nf4, q8_fp16, fp8)
             num_gpus: Number of GPUs to use
             max_memory_per_gpu: Max memory per GPU in GB (None = auto)
             cpu_offload: Enable CPU offloading for large models
             cpu_offload_ram: Max CPU RAM to use for offloading in GB
             flash_attention: Use Flash Attention 2 for faster inference
+            keep_attention_on_gpu: Keep attention layers on GPU when offloading (faster for FP8)
             progress: Gradio progress callback
 
         Returns:
             Status message
         """
         self.use_flash_attention = flash_attention
+        self.keep_attention_on_gpu = keep_attention_on_gpu
 
         if not TRANSFORMERS_AVAILABLE:
             return "Error: transformers not installed"
@@ -1244,6 +1346,26 @@ class HunyuanImage3Backend:
                 print("[hunyuan_image] Converting model to FP8 scaled...")
                 self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                 log_gpu_memory("After FP8 conversion")
+
+            # Re-dispatch with attention-priority device map if requested
+            if keep_attention_on_gpu and cpu_offload and ACCELERATE_AVAILABLE:
+                from accelerate import dispatch_model
+                from accelerate.utils import get_balanced_memory, infer_auto_device_map
+
+                print("[hunyuan_image] Re-dispatching with attention layers on GPU...")
+                log_gpu_memory("Before attention-priority dispatch")
+
+                # Create custom device_map keeping attention on GPU
+                custom_device_map = create_attention_priority_device_map(
+                    self.model,
+                    max_gpu_memory_gb=max_memory_per_gpu,
+                    gpu_modules=HUNYUAN_GPU_MODULES,
+                )
+
+                # Re-dispatch model with new device map
+                self.model = dispatch_model(self.model, device_map=custom_device_map)
+                device_map = custom_device_map
+                log_gpu_memory("After attention-priority dispatch")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8 or use_quanto:
@@ -1662,6 +1784,7 @@ def load_model_handler(
     flash_attention: bool = False,
     moe_impl: str = "eager",
     moe_drop_tokens: bool = True,
+    keep_attention_on_gpu: bool = False,
     progress=gr.Progress()
 ):
     """Handle model loading."""
@@ -1682,6 +1805,7 @@ def load_model_handler(
         flash_attention=flash_attention,
         moe_impl=moe_impl,
         moe_drop_tokens=moe_drop_tokens,
+        keep_attention_on_gpu=keep_attention_on_gpu,
         progress=progress,
     )
 
@@ -1990,6 +2114,11 @@ def create_ui():
                         value=saved_settings.get("moe_drop_tokens", True),
                         label="MoE Drop Tokens",
                     )
+                    keep_attn_gpu_check = gr.Checkbox(
+                        value=saved_settings.get("keep_attention_on_gpu", False),
+                        label="Keep Attention on GPU",
+                        info="Faster FP8 inference with CPU offload",
+                    )
 
                 with gr.Row():
                     load_btn = gr.Button("Load Model", variant="primary", elem_classes=["green-btn"])
@@ -2084,6 +2213,7 @@ def create_ui():
                 model_dropdown, dtype_dropdown, num_gpus_slider,
                 max_memory_slider, cpu_offload_check, cpu_ram_slider,
                 flash_attention_check, moe_impl_dropdown, moe_drop_tokens_check,
+                keep_attn_gpu_check,
             ],
             outputs=[status_display],
         )
@@ -2120,6 +2250,7 @@ def create_ui():
                 model_dropdown, dtype_dropdown, num_gpus_slider,
                 max_memory_slider, cpu_offload_check, cpu_ram_slider,
                 flash_attention_check, moe_impl_dropdown, moe_drop_tokens_check,
+                keep_attn_gpu_check,
                 default_steps, default_guidance, default_flow_shift, default_size,
                 default_infer_align_image_size, default_use_taylor_cache,
                 default_system_prompt_type, default_custom_system_prompt,

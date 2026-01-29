@@ -439,71 +439,85 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
     return device_map, gpu_memory_gb
 
 
-def patch_accelerate_for_fp8():
+def patch_accelerate_for_fp8(fp8_weight_names: set = None):
     """
     Patch accelerate's disk offload to handle FP8 tensors.
     FP8 stored as uint8 bytes (lossless), restored as FP8 when loading.
+
+    Args:
+        fp8_weight_names: Set of weight names that are FP8 (e.g., "model.layers.0.mlp.experts.0.down_proj.weight")
+                          If provided, these will be restored to FP8 when loaded from disk.
     """
     from accelerate.utils import offload as accel_offload
+    from accelerate.utils import modeling as accel_modeling
     import os
+
+    # Store FP8 weight names for lookup during load
+    if fp8_weight_names:
+        if not hasattr(accel_offload, '_fp8_weight_names'):
+            accel_offload._fp8_weight_names = set()
+        accel_offload._fp8_weight_names.update(fp8_weight_names)
+        print(f"[FP8] Registered {len(fp8_weight_names)} FP8 weight names for disk offload restoration")
 
     if hasattr(accel_offload, '_fp8_patched'):
         return
 
-    original_offload_weight = accel_offload.offload_weight
     original_load_offloaded_weight = accel_offload.load_offloaded_weight
 
-    # Track which weights are FP8 by normalized absolute file path
-    if not hasattr(accel_offload, '_fp8_weight_files'):
-        accel_offload._fp8_weight_files = set()
-    _fp8_weight_files = accel_offload._fp8_weight_files
-
-    _offload_count = [0]  # Use list for mutable counter in closure
     _load_count = [0]
     _fp8_restore_count = [0]
-    _path_mismatch_logged = [False]
-
-    def patched_offload_weight(weight, weight_name, offload_folder, index=None):
-        _offload_count[0] += 1
-        if weight.dtype == torch.float8_e4m3fn:
-            weight = weight.view(torch.uint8)
-            # Track by normalized absolute path
-            weight_file = os.path.normpath(os.path.abspath(os.path.join(offload_folder, f"{weight_name}.dat")))
-            _fp8_weight_files.add(weight_file)
-            if _offload_count[0] <= 5:
-                print(f"[FP8 Offload] Tracking FP8 weight: {weight_name}")
-                print(f"[FP8 Offload] File path: {weight_file}")
-        return original_offload_weight(weight, weight_name, offload_folder, index)
+    _fp8_already_count = [0]
+    _debug_logged = [0]
+    _dtype_counts = [{}]
 
     def patched_load_offloaded_weight(weight_file, weight_info):
         _load_count[0] += 1
         weight = original_load_offloaded_weight(weight_file, weight_info)
 
-        # Normalize path for matching
-        norm_path = os.path.normpath(os.path.abspath(weight_file))
+        # Track dtype distribution
+        dtype_str = str(weight.dtype)
+        _dtype_counts[0][dtype_str] = _dtype_counts[0].get(dtype_str, 0) + 1
 
-        # Check if this file was an FP8 weight
-        if norm_path in _fp8_weight_files:
-            weight = weight.view(torch.float8_e4m3fn)
-            _fp8_restore_count[0] += 1
-            if _fp8_restore_count[0] <= 5:
-                print(f"[FP8 Load] Restored FP8 weight from: {os.path.basename(weight_file)}")
-        elif _load_count[0] <= 3 and not _path_mismatch_logged[0]:
-            # Log path format for debugging
-            print(f"[FP8 Load Debug] Received path: {weight_file}")
-            print(f"[FP8 Load Debug] Normalized: {norm_path}")
-            if len(_fp8_weight_files) > 0:
-                sample = next(iter(_fp8_weight_files))
-                print(f"[FP8 Load Debug] Sample tracked: {sample}")
-            _path_mismatch_logged[0] = True
+        # Extract weight name from file path (e.g., "model.layers.0.mlp.weight.dat" -> "model.layers.0.mlp.weight")
+        weight_name = os.path.basename(weight_file)
+        if weight_name.endswith('.dat'):
+            weight_name = weight_name[:-4]
+
+        # Check if this weight should be FP8
+        fp8_names = getattr(accel_offload, '_fp8_weight_names', set())
+        is_fp8_weight = weight_name in fp8_names
+
+        if is_fp8_weight:
+            if weight.dtype == torch.uint8:
+                # FP8 was saved as uint8 bytes, restore it
+                weight = weight.view(torch.float8_e4m3fn)
+                _fp8_restore_count[0] += 1
+                if _fp8_restore_count[0] <= 3:
+                    print(f"[FP8 Load] Restored from uint8: {weight_name}")
+            elif weight.dtype == torch.float8_e4m3fn:
+                # Already FP8, no conversion needed
+                _fp8_already_count[0] += 1
+                if _fp8_already_count[0] <= 3:
+                    print(f"[FP8 Load] Already FP8: {weight_name}")
+            else:
+                # Unexpected dtype for FP8 weight - log for debug
+                if _debug_logged[0] < 5:
+                    print(f"[FP8 Load DEBUG] FP8 weight loaded as {weight.dtype}: {weight_name}")
+                    _debug_logged[0] += 1
+
         return weight
 
     def print_offload_stats():
-        print(f"[FP8 Offload Stats] Offloaded: {_offload_count[0]}, Loaded: {_load_count[0]}, FP8 Restored: {_fp8_restore_count[0]}")
-        print(f"[FP8 Offload Stats] Tracked FP8 files: {len(_fp8_weight_files)}")
+        fp8_names = getattr(accel_offload, '_fp8_weight_names', set())
+        print(f"[FP8 Offload Stats] Loaded: {_load_count[0]}, FP8 Restored: {_fp8_restore_count[0]}, Already FP8: {_fp8_already_count[0]}")
+        print(f"[FP8 Offload Stats] Registered FP8 weights: {len(fp8_names)}")
+        print(f"[FP8 Offload Stats] Loaded dtype distribution: {_dtype_counts[0]}")
 
-    accel_offload.offload_weight = patched_offload_weight
+    # Patch in BOTH modules to ensure it's used regardless of import order
     accel_offload.load_offloaded_weight = patched_load_offloaded_weight
+    if hasattr(accel_modeling, 'load_offloaded_weight'):
+        accel_modeling.load_offloaded_weight = patched_load_offloaded_weight
+
     accel_offload.print_fp8_offload_stats = print_offload_stats
     accel_offload._fp8_patched = True
     print("[FP8] Patched accelerate disk offload for FP8 support")
@@ -682,9 +696,6 @@ def load_fp8_model_with_offload(
     from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
     from accelerate.utils import set_module_tensor_to_device, get_balanced_memory
 
-    # Patch accelerate to handle FP8 disk offload
-    patch_accelerate_for_fp8()
-
     model_path = Path(model_path)
     print(f"[FP8 Loader] Loading FP8 model from {model_path}")
 
@@ -745,6 +756,7 @@ def load_fp8_model_with_offload(
     fp8_loaded = 0
     bf16_loaded = 0
     f32_loaded = 0
+    fp8_weight_names = set()  # Track FP8 weight names for disk offload restoration
 
     for shard_name in shard_files:
         shard_path = model_path / shard_name
@@ -770,9 +782,10 @@ def load_fp8_model_with_offload(
                         dtype=tensor.dtype,  # Preserve original dtype!
                     )
 
-                    # Count dtypes
+                    # Count dtypes and track FP8 weight names
                     if tensor.dtype == torch.float8_e4m3fn:
                         fp8_loaded += 1
+                        fp8_weight_names.add(key)
                     elif tensor.dtype == torch.bfloat16:
                         bf16_loaded += 1
                     elif tensor.dtype == torch.float32:
@@ -782,6 +795,16 @@ def load_fp8_model_with_offload(
                     pass
 
     print(f"[FP8 Loader] Loaded weights: {fp8_loaded} FP8, {bf16_loaded} bf16, {f32_loaded} f32")
+
+    # Patch accelerate BEFORE dispatch to handle FP8 disk offload
+    # Pass the FP8 weight names so they can be restored to FP8 when loaded from disk
+    if offload_folder and fp8_weight_names:
+        patch_accelerate_for_fp8(fp8_weight_names)
+
+    # CRITICAL: Apply FP8 Linear forward patch BEFORE dispatch_model
+    # dispatch_model creates hooks that store references to module.forward
+    # If we patch after dispatch, the hooks won't use our patched forward
+    apply_fp8_linear_forward_patch()
 
     # Dispatch model to devices with offloading
     # This moves weights from CPU to their target devices based on device_map
@@ -853,9 +876,6 @@ def load_fp8_model_with_offload(
     if gen_config_path.exists():
         model.generation_config = GenerationConfig.from_pretrained(model_path)
         print(f"[FP8 Loader] Loaded generation_config")
-
-    # Apply the FP8 Linear forward patch
-    apply_fp8_linear_forward_patch()
 
     print(f"[FP8 Loader] Model loaded successfully with FP8 weights preserved")
     print(f"[FP8 Loader] DEBUG: Look for '[FP8 Dequant #]' messages during generation to verify dequantization is working")

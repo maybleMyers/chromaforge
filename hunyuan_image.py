@@ -27,7 +27,7 @@ import base64
 import torch
 import gradio as gr
 from gradio import themes
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from dataclasses import dataclass
 import copy
 
@@ -1402,6 +1402,113 @@ def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:{mime_type};base64,{b64_data}"
 
 
+def quote(text: Any) -> Optional[str]:
+    """Quote text if it contains special characters (for infotext format)."""
+    if text is None:
+        return None
+    text = str(text)
+    if ',' not in text and '\n' not in text and ':' not in text:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def create_hunyuan_infotext(
+    prompt: str,
+    seed: int,
+    steps: int,
+    guidance_scale: float,
+    flow_shift: float,
+    image_size: str,
+    system_prompt_type: Optional[str] = None,
+    custom_system_prompt: Optional[str] = None,
+    bot_task: Optional[str] = None,
+    use_taylor_cache: bool = False,
+    model_name: Optional[str] = None,
+    cot_summary: Optional[str] = None,
+    generation_time: Optional[float] = None,
+) -> str:
+    """
+    Create infotext string for HunyuanImage-3.0 generated images.
+    Format is compatible with webui.py PNG Info tab.
+
+    Format:
+        {prompt}
+        Steps: 50, CFG scale: 2.5, Seed: 123456, Size: 1024x1024, Flow shift: 3.0, ...
+    """
+    params = {
+        "Steps": steps,
+        "CFG scale": guidance_scale,
+        "Seed": seed,
+        "Size": image_size,
+        "Flow shift": flow_shift,
+        "Sampler": "HunyuanImage Flow",
+    }
+
+    if model_name:
+        params["Model"] = model_name
+
+    if system_prompt_type and system_prompt_type != "None":
+        params["System prompt"] = system_prompt_type
+
+    if custom_system_prompt and system_prompt_type == "custom":
+        # Truncate long custom prompts
+        truncated = custom_system_prompt[:200]
+        if len(custom_system_prompt) > 200:
+            truncated += "..."
+        params["Custom system prompt"] = quote(truncated)
+
+    if bot_task:
+        params["Bot task"] = bot_task
+
+    if use_taylor_cache:
+        params["Taylor cache"] = "True"
+
+    if generation_time is not None:
+        params["Time"] = f"{generation_time:.1f}s"
+
+    if cot_summary:
+        # Truncate CoT to first 500 chars for readability
+        truncated = str(cot_summary)[:500].replace('\n', ' ').strip()
+        if len(str(cot_summary)) > 500:
+            truncated += "..."
+        params["CoT summary"] = quote(truncated)
+
+    # Build the parameters string
+    params_text = ", ".join(
+        f"{k}: {v}" for k, v in params.items() if v is not None
+    )
+
+    return f"{prompt}\n{params_text}"
+
+
+def embed_png_metadata(
+    image: Image.Image,
+    infotext: str,
+    cot_full: Optional[str] = None,
+) -> Image.Image:
+    """
+    Embed metadata into a PIL Image for PNG saving.
+
+    Args:
+        image: PIL Image to embed metadata into
+        infotext: The main parameters string (stored in 'parameters' key)
+        cot_full: Optional full CoT text (stored in 'hunyuan_cot' key)
+
+    Returns:
+        PIL Image with metadata attached (via image.info dict)
+    """
+    # Create a copy to avoid modifying the original
+    img_with_meta = image.copy()
+
+    # Store in image.info for PNG saving
+    img_with_meta.info['parameters'] = infotext
+
+    if cot_full:
+        img_with_meta.info['hunyuan_cot'] = str(cot_full)
+
+    return img_with_meta
+
+
 def extract_video_frames(
     video_path: str,
     max_frames: int = 8,
@@ -2098,6 +2205,29 @@ class HunyuanImage3Backend:
             elif isinstance(cot_text, str):
                 cot_reasoning = cot_text
 
+            # Embed PNG metadata for webui compatibility
+            model_name = Path(self.current_model_path).stem if self.current_model_path else None
+            infotext = create_hunyuan_infotext(
+                prompt=prompt,
+                seed=actual_seed,
+                steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                flow_shift=flow_shift,
+                image_size=f"{width}x{height}",
+                system_prompt_type=system_prompt_type,
+                custom_system_prompt=custom_system_prompt,
+                bot_task=bot_task,
+                use_taylor_cache=use_taylor_cache,
+                model_name=model_name,
+                cot_summary=cot_reasoning if cot_reasoning else None,
+                generation_time=generation_time,
+            )
+            generated_image = embed_png_metadata(
+                image=generated_image,
+                infotext=infotext,
+                cot_full=cot_reasoning if cot_reasoning else None,
+            )
+
             progress(1.0, desc="Done!")
             print(f"[hunyuan_image] Generation completed in {generation_time:.2f}s")
 
@@ -2262,13 +2392,46 @@ class HunyuanImage3Backend:
                 cot_text = str(cot_text) if cot_text else ""
             final_stats = f"{total_time:.1f}s | Seed: {actual_seed} | {width}x{height}"
             print(f"[hunyuan_image] Generation complete: {total_time:.1f}s")
-            yield cot_text, final_stats, image
+
+            # Embed PNG metadata for webui compatibility
+            model_name = Path(self.current_model_path).stem if self.current_model_path else None
+            infotext = create_hunyuan_infotext(
+                prompt=prompt,
+                seed=actual_seed,
+                steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                flow_shift=flow_shift,
+                image_size=f"{width}x{height}",
+                system_prompt_type=system_prompt_type,
+                custom_system_prompt=custom_system_prompt,
+                bot_task=bot_task,
+                use_taylor_cache=use_taylor_cache,
+                model_name=model_name,
+                cot_summary=cot_text if cot_text else None,
+                generation_time=total_time,
+            )
+            image_with_meta = embed_png_metadata(
+                image=image,
+                infotext=infotext,
+                cot_full=cot_text if cot_text else None,
+            )
+
+            yield cot_text, final_stats, image_with_meta
 
     def _save_temp_image(self, image: Image.Image) -> str:
-        """Save PIL image to temporary file and return path."""
+        """Save PIL image to temporary file and return path, preserving metadata."""
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"vlm_img_{int(time.time())}_{id(image)}.png")
-        image.save(temp_path)
+
+        # Preserve PNG metadata if present
+        pnginfo = None
+        if image.info:
+            pnginfo = PngImagePlugin.PngInfo()
+            for key, value in image.info.items():
+                if isinstance(value, str):
+                    pnginfo.add_text(key, value)
+
+        image.save(temp_path, pnginfo=pnginfo)
         return temp_path
 
 # Global backend instance

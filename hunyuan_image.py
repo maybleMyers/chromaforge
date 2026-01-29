@@ -74,20 +74,23 @@ SETTINGS_FILE = "hunyuan_image_settings.json"
 stop_generation: bool = False
 
 # Modules to skip during quantization (keep in full precision)
+# These are small but critical for image quality and numerical stability
 HUNYUAN_SKIP_MODULES = [
-    # VAE - pixel reconstruction quality
+    # VAE - pixel reconstruction quality (encoder + decoder)
     'vae',
-    # Vision Encoder - semantic understanding
+    # Vision Encoder - semantic understanding (SigLIP2)
     'vision_model', 'vision_aligner',
     # Image Generation Head - latent output
-    'final_layer', 'patch_embed', 'time_embed', 'time_embed_2',
-    # Timestep Embeddings - diffusion timing
-    'timestep_emb', 'guidance_emb', 'timestep_r_emb',
+    'final_layer', 'patch_embed',
+    # Timestep/Guidance Embeddings - diffusion timing
+    'time_embed', 'time_embed_2', 'timestep_emb', 'guidance_emb', 'timestep_r_emb',
     # MoE Router Gates - MUST stay FP32 for numerical stability
     'wg',
-    # Standard exclusions
-    'wte', 'lm_head', 'ln_f',
-    'layernorm', 'input_layernorm', 'post_attention_layernorm',
+    # Token Embeddings
+    'wte', 'lm_head',
+    # All LayerNorms - must stay FP32 for stability
+    'ln_f', 'layernorm', 'input_layernorm', 'post_attention_layernorm',
+    'key_layernorm', 'query_layernorm',  # QK attention layernorms
 ]
 
 # Bot task options for generation
@@ -369,7 +372,7 @@ except ImportError:
     print("Warning: accelerate not installed. Multi-GPU support will be limited.")
 
 try:
-    from optimum.quanto import quantize, qint4, freeze, quantization_map, requantize
+    from optimum.quanto import requantize
     QUANTO_AVAILABLE = True
     print("Quanto available")
 except ImportError:
@@ -1154,71 +1157,37 @@ class HunyuanImage3Backend:
                 self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                 log_gpu_memory("After FP8 conversion")
 
-            # Apply Quanto int4 quantization if requested
+            # Apply Quanto int4 quantization if requested (requires pre-quantized weights)
             if use_quanto:
-                log_gpu_memory("Before Quanto quantization")
+                log_gpu_memory("Before Quanto loading")
 
-                # Define paths for saved quantized weights
+                # Define paths for saved quantized weights (from quantize_hunyuan.py script)
                 quanto_dir = os.path.join(model_path, "quanto_int4")
                 quanto_weights_path = os.path.join(quanto_dir, "model_quanto_int4.safetensors")
                 quanto_map_path = os.path.join(quanto_dir, "quantization_map.json")
 
-                # Check if saved quantized weights exist
+                # Check if pre-quantized weights exist (from quantize_hunyuan.py)
                 if os.path.exists(quanto_weights_path) and os.path.exists(quanto_map_path) and SAFETENSORS_AVAILABLE:
-                    print(f"[hunyuan_image] Loading saved Quanto weights from {quanto_dir}...")
-                    progress(0.7, desc="Loading saved quantized weights...")
+                    print(f"[hunyuan_image] Loading pre-quantized weights from {quanto_dir}...")
+                    progress(0.7, desc="Loading pre-quantized weights...")
 
                     # Load quantization map
                     with open(quanto_map_path, 'r') as f:
                         qmap = json.load(f)
 
-                    # Load quantized state dict (to CPU first, requantize will handle device placement)
+                    # Load quantized state dict
                     state_dict = safetensors_load(quanto_weights_path, device="cpu")
 
-                    # Apply requantization - uses model's existing device placement from device_map
+                    # Apply requantization
                     requantize(self.model, state_dict, qmap)
 
-                    print(f"[hunyuan_image] Loaded saved Quanto weights successfully")
+                    print(f"[hunyuan_image] Loaded pre-quantized weights successfully")
                 else:
-                    print("[hunyuan_image] Applying Quanto qint4 quantization (this may take a while on first run)...")
-                    progress(0.6, desc="Quantizing model (first run, will be saved)...")
+                    # No pre-quantized weights found - user needs to run quantization script first
+                    return (f"Error: No pre-quantized weights found at {quanto_dir}\n"
+                            f"Run: python quantize_hunyuan.py --model-path {model_path}")
 
-                    # Get modules to exclude from quantization (keep vision/VAE in full precision)
-                    exclude_modules = []
-                    for name, module in self.model.named_modules():
-                        for skip_name in HUNYUAN_SKIP_MODULES:
-                            if skip_name in name:
-                                exclude_modules.append(name)
-                                break
-
-                    # Apply quantization (excludes specified modules)
-                    quantize(self.model, weights=qint4, exclude=exclude_modules)
-                    freeze(self.model)  # Freeze quantized weights
-
-                    print(f"[hunyuan_image] Quanto quantization applied, excluded {len(exclude_modules)} modules")
-
-                    # Save quantized weights for future use
-                    if SAFETENSORS_AVAILABLE:
-                        try:
-                            os.makedirs(quanto_dir, exist_ok=True)
-                            print(f"[hunyuan_image] Saving quantized weights to {quanto_dir}...")
-                            progress(0.75, desc="Saving quantized weights...")
-
-                            # Save state dict
-                            safetensors_save(self.model.state_dict(), quanto_weights_path)
-
-                            # Save quantization map
-                            qmap = quantization_map(self.model)
-                            with open(quanto_map_path, 'w') as f:
-                                json.dump(qmap, f)
-
-                            print(f"[hunyuan_image] Quantized weights saved. Next load will be faster.")
-                        except Exception as e:
-                            print(f"[hunyuan_image] Warning: Could not save quantized weights: {e}")
-                    else:
-                        print("[hunyuan_image] Warning: safetensors not installed, cannot save quantized weights")
-
-                log_gpu_memory("After Quanto quantization")
+                log_gpu_memory("After Quanto loading")
 
             # Apply quantization compatibility patches if using quantization
             if use_q4_nf4 or use_q8 or use_quanto:

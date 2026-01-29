@@ -538,6 +538,184 @@ def is_fp8_converted_model(model_path: str) -> bool:
             pass
     return False
 
+
+def load_fp8_model_with_offload(
+    model_path: str,
+    device_map: dict | str = "auto",
+    max_memory: dict | None = None,
+    offload_folder: str | None = None,
+    **model_kwargs
+):
+    """
+    Load a pre-converted FP8 model while preserving FP8 dtypes.
+
+    This bypasses transformers' from_pretrained which converts FP8 to f32 during
+    device placement. Instead we:
+    1. Create model structure with empty weights
+    2. Compute device map
+    3. Load weights directly from safetensors preserving dtype
+    4. Dispatch model to devices
+
+    Args:
+        model_path: Path to the FP8 model directory
+        device_map: Device map for model placement ("auto" or dict)
+        max_memory: Max memory per device
+        offload_folder: Folder for disk offloading
+        **model_kwargs: Additional kwargs for model config
+
+    Returns:
+        Model with FP8 weights preserved
+    """
+    import json
+    import os
+    from pathlib import Path
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
+    from accelerate.utils import set_module_tensor_to_device, get_balanced_memory
+
+    model_path = Path(model_path)
+    print(f"[FP8 Loader] Loading FP8 model from {model_path}")
+
+    # Load config
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    # Apply model kwargs to config
+    for key, value in model_kwargs.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+
+    # Create model with empty weights
+    print("[FP8 Loader] Creating model structure with empty weights...")
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    # Get model's tied weights info
+    model.tie_weights()
+
+    # Find all safetensors files
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path, 'r') as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        shard_files = sorted(set(weight_map.values()))
+    else:
+        shard_files = ["model.safetensors"]
+        weight_map = None
+
+    print(f"[FP8 Loader] Found {len(shard_files)} weight shard(s)")
+
+    # Compute device map if "auto"
+    if device_map == "auto":
+        print("[FP8 Loader] Computing device map...")
+
+        # Get balanced memory allocation
+        if max_memory is None:
+            max_memory = get_balanced_memory(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=getattr(model, "_no_split_modules", []),
+                dtype=torch.bfloat16,  # Use bf16 for memory estimation (FP8 is similar)
+                low_zero=False,
+            )
+
+        device_map = infer_auto_device_map(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=getattr(model, "_no_split_modules", []),
+            dtype=torch.bfloat16,
+        )
+
+    print(f"[FP8 Loader] Device map computed, loading weights to CPU...")
+
+    # Load ALL weights to CPU first, preserving dtypes
+    # dispatch_model will handle moving them to correct devices
+    fp8_loaded = 0
+    bf16_loaded = 0
+    f32_loaded = 0
+
+    for shard_name in shard_files:
+        shard_path = model_path / shard_name
+        if not shard_path.exists():
+            print(f"[FP8 Loader] Warning: shard {shard_name} not found")
+            continue
+
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                # Skip scale_weight buffers - we'll load them after dispatch
+                if key.endswith('.scale_weight'):
+                    continue
+
+                tensor = f.get_tensor(key)
+
+                # Load to CPU, preserving original dtype
+                try:
+                    set_module_tensor_to_device(
+                        model,
+                        key,
+                        "cpu",
+                        value=tensor,
+                        dtype=tensor.dtype,  # Preserve original dtype!
+                    )
+
+                    # Count dtypes
+                    if tensor.dtype == torch.float8_e4m3fn:
+                        fp8_loaded += 1
+                    elif tensor.dtype == torch.bfloat16:
+                        bf16_loaded += 1
+                    elif tensor.dtype == torch.float32:
+                        f32_loaded += 1
+                except Exception as e:
+                    # Some keys might not map to model parameters
+                    pass
+
+    print(f"[FP8 Loader] Loaded weights: {fp8_loaded} FP8, {bf16_loaded} bf16, {f32_loaded} f32")
+
+    # Dispatch model to devices with offloading
+    # This moves weights from CPU to their target devices based on device_map
+    print("[FP8 Loader] Dispatching model to devices...")
+    model = dispatch_model(
+        model,
+        device_map=device_map,
+        offload_dir=offload_folder,
+    )
+
+    # Now load scale_weight buffers AFTER dispatch
+    # This ensures scales are on the same device as their weights
+    scales_loaded = 0
+    for shard_name in shard_files:
+        shard_path = model_path / shard_name
+        if not shard_path.exists():
+            continue
+
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.endswith('.scale_weight'):
+                    module_name = key.rsplit('.scale_weight', 1)[0]
+                    try:
+                        module = model.get_submodule(module_name)
+                        scale = f.get_tensor(key)
+                        # Move scale to same device as the weight
+                        if hasattr(module, 'weight') and module.weight is not None:
+                            weight_device = module.weight.device
+                            if weight_device.type != 'meta':
+                                scale = scale.to(weight_device)
+                        module.register_buffer('scale_weight', scale)
+                        scales_loaded += 1
+                    except (AttributeError, Exception):
+                        pass
+
+    print(f"[FP8 Loader] Loaded {scales_loaded} scale buffers")
+
+    # Apply the FP8 Linear forward patch
+    apply_fp8_linear_forward_patch()
+
+    print(f"[FP8 Loader] Model loaded successfully with FP8 weights preserved")
+
+    return model
+
+
 # Try to import video processing utilities
 try:
     import cv2
@@ -1481,8 +1659,28 @@ class HunyuanImage3Backend:
                 log_gpu_memory("After Quanto loading and dispatch")
                 print(f"[hunyuan_image] Loaded pre-quantized model successfully")
 
+            elif is_preconverted_fp8:
+                # Use custom FP8 loader that preserves FP8 dtypes during loading
+                print("[hunyuan_image] Using custom FP8 loader to preserve dtypes...")
+
+                # Prepare offload folder if needed
+                offload_folder = None
+                if cpu_offload:
+                    offload_folder = os.path.join(os.path.dirname(model_path), ".offload_cache")
+                    os.makedirs(offload_folder, exist_ok=True)
+
+                self.model = load_fp8_model_with_offload(
+                    model_path=model_path,
+                    device_map=device_map if device_map else "auto",
+                    max_memory=max_memory,
+                    offload_folder=offload_folder,
+                    attn_implementation=model_kwargs.get("attn_implementation", "sdpa"),
+                    moe_impl=model_kwargs.get("moe_impl", "auto"),
+                    moe_drop_tokens=model_kwargs.get("moe_drop_tokens", False),
+                )
+
             else:
-                # Normal loading for non-quanto models
+                # Normal loading for non-quanto, non-FP8 models
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     **model_kwargs,
@@ -1498,108 +1696,14 @@ class HunyuanImage3Backend:
             # Apply dynamic resolution patch to support multiple base sizes (512, 768, 1024, etc.)
             self.model = apply_dynamic_resolution_patch(self.model)
 
-            # Handle FP8: either apply hooks to pre-converted model or convert at runtime
-            if use_fp8 and not use_quanto:
-                # Debug: check what dtypes we have after loading
-                fp8_count = 0
-                bf16_count = 0
-                f32_count = 0
-                scale_count = 0
-                other_dtypes = {}
-                for name, param in self.model.named_parameters():
-                    if param.dtype == torch.float8_e4m3fn:
-                        fp8_count += 1
-                    elif param.dtype == torch.bfloat16:
-                        bf16_count += 1
-                    elif param.dtype == torch.float32:
-                        f32_count += 1
-                    else:
-                        other_dtypes[param.dtype] = other_dtypes.get(param.dtype, 0) + 1
-                # Count scale buffers
-                for name, buf in self.model.named_buffers():
-                    if 'scale_weight' in name:
-                        scale_count += 1
-                print(f"[FP8] Model dtypes after load: {fp8_count} FP8, {bf16_count} bf16, {f32_count} f32, {scale_count} scales")
-
-                # For pre-converted FP8 models, cast non-FP8 params to bf16 for consistency
-                if is_preconverted_fp8 and (f32_count > 0 or bf16_count > 0):
-                    print(f"[FP8] Casting non-FP8 parameters to bf16 for consistency...")
-                    cast_count = 0
-                    for name, param in self.model.named_parameters():
-                        if param.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16]:
-                            param.data = param.data.to(torch.bfloat16)
-                            cast_count += 1
-                    print(f"[FP8] Cast {cast_count} parameters to bf16")
-
-                if is_preconverted_fp8:
-                    log_gpu_memory("Before FP8 hook application")
-
-                    # Load FP8 weights and scale_weight buffers manually
-                    # (transformers may have converted FP8 to bf16, and scales aren't in model architecture)
-                    from safetensors import safe_open
-
-                    # Find safetensors files
-                    index_path = os.path.join(model_path, "model.safetensors.index.json")
-                    if os.path.exists(index_path):
-                        with open(index_path, 'r') as f:
-                            index = json.load(f)
-                        weight_map = index.get("weight_map", {})
-                        shard_files = sorted(set(weight_map.values()))
-                    else:
-                        shard_files = ["model.safetensors"]
-
-                    # Check if we need to reload FP8 weights (if they were converted to bf16)
-                    need_fp8_reload = (fp8_count == 0 and scale_count == 0)
-
-                    if need_fp8_reload:
-                        print(f"[FP8] FP8 weights were converted during load, reloading from safetensors...")
-
-                    scales_loaded = 0
-                    fp8_reloaded = 0
-
-                    for shard_name in shard_files:
-                        shard_path = os.path.join(model_path, shard_name)
-                        if os.path.exists(shard_path):
-                            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                                for key in f.keys():
-                                    if key.endswith('.scale_weight'):
-                                        # Load scale buffer to same device as the weight
-                                        module_name = key.rsplit('.scale_weight', 1)[0]
-                                        try:
-                                            module = self.model.get_submodule(module_name)
-                                            scale = f.get_tensor(key)
-                                            # Move scale to same device as weight
-                                            if hasattr(module, 'weight') and module.weight is not None:
-                                                scale = scale.to(module.weight.device)
-                                            module.register_buffer('scale_weight', scale)
-                                            scales_loaded += 1
-                                        except AttributeError:
-                                            pass
-
-                                    elif need_fp8_reload and key.endswith('.weight'):
-                                        # Check if this is an FP8 weight we need to reload
-                                        tensor = f.get_tensor(key)
-                                        if tensor.dtype == torch.float8_e4m3fn:
-                                            module_name = key.rsplit('.weight', 1)[0]
-                                            try:
-                                                module = self.model.get_submodule(module_name)
-                                                # Replace the bf16 weight with FP8
-                                                module.weight = torch.nn.Parameter(tensor, requires_grad=False)
-                                                fp8_reloaded += 1
-                                            except AttributeError:
-                                                pass
-
-                    print(f"[FP8] Loaded {scales_loaded} scales, reloaded {fp8_reloaded} FP8 weights")
-
-                    print("[hunyuan_image] Applying FP8 forward hooks...")
-                    self.model = apply_fp8_hooks_to_model(self.model, computation_dtype=torch.bfloat16)
-                    log_gpu_memory("After FP8 hook application")
-                else:
-                    log_gpu_memory("Before FP8 conversion")
-                    print("[hunyuan_image] Converting model to FP8 at runtime...")
-                    print("[hunyuan_image] Note: For better results, use convert_to_fp8.py to pre-convert the model")
-                    self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
-                    log_gpu_memory("After FP8 conversion")
+            # Handle FP8: runtime conversion for non-preconverted models
+            # (Pre-converted FP8 models are handled by load_fp8_model_with_offload above)
+            if use_fp8 and not use_quanto and not is_preconverted_fp8:
+                log_gpu_memory("Before FP8 conversion")
+                print("[hunyuan_image] Converting model to FP8 at runtime...")
+                print("[hunyuan_image] Note: For better results, use convert_to_fp8.py to pre-convert the model")
+                self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
+                log_gpu_memory("After FP8 conversion")
 
             # Apply quantization/FP8 compatibility patches for dtype mismatches
             # FP8 also has mixed dtypes: FP8 layers output bf16, but VAE/embeddings may be float32

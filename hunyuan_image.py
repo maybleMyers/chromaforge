@@ -452,18 +452,22 @@ def patch_accelerate_for_fp8():
     original_offload_weight = accel_offload.offload_weight
     original_load_offloaded_weight = accel_offload.load_offloaded_weight
 
-    # Track which weights are FP8
-    _fp8_weight_names = set()
+    # Track which weights are FP8 by their file path
+    _fp8_weight_files = set()
 
     def patched_offload_weight(weight, weight_name, offload_folder, index=None):
         if weight.dtype == torch.float8_e4m3fn:
             weight = weight.view(torch.uint8)
-            _fp8_weight_names.add(weight_name)
+            # Track by the .dat file path that will be created
+            import os
+            weight_file = os.path.join(offload_folder, f"{weight_name}.dat")
+            _fp8_weight_files.add(weight_file)
         return original_offload_weight(weight, weight_name, offload_folder, index)
 
-    def patched_load_offloaded_weight(weight_file, weight_name):
-        weight = original_load_offloaded_weight(weight_file, weight_name)
-        if weight_name in _fp8_weight_names:
+    def patched_load_offloaded_weight(weight_file, weight_info):
+        weight = original_load_offloaded_weight(weight_file, weight_info)
+        # Check if this file was an FP8 weight
+        if weight_file in _fp8_weight_files:
             weight = weight.view(torch.float8_e4m3fn)
         return weight
 

@@ -445,6 +445,7 @@ def patch_accelerate_for_fp8():
     FP8 stored as uint8 bytes (lossless), restored as FP8 when loading.
     """
     from accelerate.utils import offload as accel_offload
+    import os
 
     if hasattr(accel_offload, '_fp8_patched'):
         return
@@ -452,27 +453,58 @@ def patch_accelerate_for_fp8():
     original_offload_weight = accel_offload.offload_weight
     original_load_offloaded_weight = accel_offload.load_offloaded_weight
 
-    # Track which weights are FP8 by their file path
-    _fp8_weight_files = set()
+    # Track which weights are FP8 by normalized absolute file path
+    if not hasattr(accel_offload, '_fp8_weight_files'):
+        accel_offload._fp8_weight_files = set()
+    _fp8_weight_files = accel_offload._fp8_weight_files
+
+    _offload_count = [0]  # Use list for mutable counter in closure
+    _load_count = [0]
+    _fp8_restore_count = [0]
+    _path_mismatch_logged = [False]
 
     def patched_offload_weight(weight, weight_name, offload_folder, index=None):
+        _offload_count[0] += 1
         if weight.dtype == torch.float8_e4m3fn:
             weight = weight.view(torch.uint8)
-            # Track by the .dat file path that will be created
-            import os
-            weight_file = os.path.join(offload_folder, f"{weight_name}.dat")
+            # Track by normalized absolute path
+            weight_file = os.path.normpath(os.path.abspath(os.path.join(offload_folder, f"{weight_name}.dat")))
             _fp8_weight_files.add(weight_file)
+            if _offload_count[0] <= 5:
+                print(f"[FP8 Offload] Tracking FP8 weight: {weight_name}")
+                print(f"[FP8 Offload] File path: {weight_file}")
         return original_offload_weight(weight, weight_name, offload_folder, index)
 
     def patched_load_offloaded_weight(weight_file, weight_info):
+        _load_count[0] += 1
         weight = original_load_offloaded_weight(weight_file, weight_info)
+
+        # Normalize path for matching
+        norm_path = os.path.normpath(os.path.abspath(weight_file))
+
         # Check if this file was an FP8 weight
-        if weight_file in _fp8_weight_files:
+        if norm_path in _fp8_weight_files:
             weight = weight.view(torch.float8_e4m3fn)
+            _fp8_restore_count[0] += 1
+            if _fp8_restore_count[0] <= 5:
+                print(f"[FP8 Load] Restored FP8 weight from: {os.path.basename(weight_file)}")
+        elif _load_count[0] <= 3 and not _path_mismatch_logged[0]:
+            # Log path format for debugging
+            print(f"[FP8 Load Debug] Received path: {weight_file}")
+            print(f"[FP8 Load Debug] Normalized: {norm_path}")
+            if len(_fp8_weight_files) > 0:
+                sample = next(iter(_fp8_weight_files))
+                print(f"[FP8 Load Debug] Sample tracked: {sample}")
+            _path_mismatch_logged[0] = True
         return weight
+
+    def print_offload_stats():
+        print(f"[FP8 Offload Stats] Offloaded: {_offload_count[0]}, Loaded: {_load_count[0]}, FP8 Restored: {_fp8_restore_count[0]}")
+        print(f"[FP8 Offload Stats] Tracked FP8 files: {len(_fp8_weight_files)}")
 
     accel_offload.offload_weight = patched_offload_weight
     accel_offload.load_offloaded_weight = patched_load_offloaded_weight
+    accel_offload.print_fp8_offload_stats = print_offload_stats
     accel_offload._fp8_patched = True
     print("[FP8] Patched accelerate disk offload for FP8 support")
 
@@ -498,11 +530,22 @@ def apply_fp8_linear_forward_patch():
 
     original_forward = nn.Linear.forward
 
+    # Debug counters
+    _fp8_dequant_count = [0]
+    _non_fp8_count = [0]
+    _has_scale_no_fp8 = [0]
+    _debug_printed = [False]
+    _dequant_values_logged = [0]
+
     def fp8_linear_forward(self, input):
         weight = self.weight
 
         # Check if this is an FP8 layer with scale
-        if hasattr(self, 'scale_weight') and weight.dtype == torch.float8_e4m3fn:
+        has_scale = hasattr(self, 'scale_weight')
+        is_fp8 = weight.dtype == torch.float8_e4m3fn
+
+        if has_scale and is_fp8:
+            _fp8_dequant_count[0] += 1
             # Get scale, move to same device as input if needed
             scale = self.scale_weight
             if scale.device != input.device:
@@ -516,14 +559,41 @@ def apply_fp8_linear_forward_patch():
             # Use input dtype for computation (typically bf16)
             weight_dequant = weight.to(input.dtype) * scale.to(input.dtype)
 
+            # Log first few dequantizations to verify values
+            if _dequant_values_logged[0] < 3:
+                scale_val = scale.item() if scale.numel() == 1 else scale.mean().item()
+                w_min = weight_dequant.min().item()
+                w_max = weight_dequant.max().item()
+                w_mean = weight_dequant.mean().item()
+                print(f"[FP8 Dequant #{_dequant_values_logged[0]}] scale={scale_val:.6f}, dequant range=[{w_min:.4f}, {w_max:.4f}], mean={w_mean:.6f}")
+                _dequant_values_logged[0] += 1
+
             # Compute linear with dequantized weight
             bias = self.bias
             if bias is not None and bias.device != input.device:
                 bias = bias.to(input.device)
             return F.linear(input, weight_dequant, bias)
+        elif has_scale and not is_fp8:
+            _has_scale_no_fp8[0] += 1
+            # Log first few cases of scale but no FP8
+            if _has_scale_no_fp8[0] <= 3:
+                print(f"[FP8 DEBUG] Has scale but weight is {weight.dtype}: {type(self).__name__}")
+        else:
+            _non_fp8_count[0] += 1
+
+        # Print stats periodically
+        total = _fp8_dequant_count[0] + _non_fp8_count[0] + _has_scale_no_fp8[0]
+        if total > 0 and total % 1000 == 0 and not _debug_printed[0]:
+            print(f"[FP8 Forward Stats] Dequant: {_fp8_dequant_count[0]}, Non-FP8: {_non_fp8_count[0]}, Scale+NoFP8: {_has_scale_no_fp8[0]}")
+            _debug_printed[0] = True
 
         # Non-FP8 layer: use original forward
         return original_forward(self, input)
+
+    def print_fp8_forward_stats():
+        print(f"[FP8 Forward Stats] Dequant: {_fp8_dequant_count[0]}, Non-FP8: {_non_fp8_count[0]}, Scale+NoFP8: {_has_scale_no_fp8[0]}")
+
+    nn.Linear._print_fp8_stats = staticmethod(print_fp8_forward_stats)
 
     nn.Linear._original_forward_fp8 = original_forward
     nn.Linear.forward = fp8_linear_forward
@@ -715,7 +785,10 @@ def load_fp8_model_with_offload(
 
     # Dispatch model to devices with offloading
     # This moves weights from CPU to their target devices based on device_map
-    print("[FP8 Loader] Dispatching model to devices...")
+    if offload_folder:
+        print(f"[FP8 Loader] Dispatching model with DISK offload to: {offload_folder}")
+    else:
+        print("[FP8 Loader] Dispatching model with CPU offload (no disk)")
     model = dispatch_model(
         model,
         device_map=device_map,
@@ -725,6 +798,8 @@ def load_fp8_model_with_offload(
     # Now load scale_weight buffers AFTER dispatch
     # This ensures scales are on the same device as their weights
     scales_loaded = 0
+    scales_failed = 0
+    scales_debug_logged = 0
     for shard_name in shard_files:
         shard_path = model_path / shard_name
         if not shard_path.exists():
@@ -740,14 +815,37 @@ def load_fp8_model_with_offload(
                         # Move scale to same device as the weight
                         if hasattr(module, 'weight') and module.weight is not None:
                             weight_device = module.weight.device
+                            weight_dtype = module.weight.dtype
                             if weight_device.type != 'meta':
                                 scale = scale.to(weight_device)
+                            # Log first few for debugging
+                            if scales_debug_logged < 3:
+                                print(f"[FP8 Scale Debug] {module_name}: weight={weight_dtype}@{weight_device}, scale={scale.shape}@{scale.device}")
+                                scales_debug_logged += 1
                         module.register_buffer('scale_weight', scale)
                         scales_loaded += 1
-                    except (AttributeError, Exception):
-                        pass
+                    except (AttributeError, Exception) as e:
+                        scales_failed += 1
+                        if scales_failed <= 3:
+                            print(f"[FP8 Scale Debug] Failed to load scale for {module_name}: {e}")
 
     print(f"[FP8 Loader] Loaded {scales_loaded} scale buffers")
+
+    # Diagnostic: check actual weight dtypes after dispatch
+    dtype_counts = {}
+    scale_count = 0
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            dtype_key = str(module.weight.dtype)
+            device_key = str(module.weight.device)
+            key = f"{dtype_key}@{device_key}"
+            dtype_counts[key] = dtype_counts.get(key, 0) + 1
+        if hasattr(module, 'scale_weight'):
+            scale_count += 1
+    print(f"[FP8 Loader] After dispatch - weight dtype distribution:")
+    for key, count in sorted(dtype_counts.items()):
+        print(f"  {key}: {count}")
+    print(f"[FP8 Loader] Modules with scale_weight: {scale_count}")
 
     # Load generation_config
     from transformers import GenerationConfig
@@ -760,6 +858,7 @@ def load_fp8_model_with_offload(
     apply_fp8_linear_forward_patch()
 
     print(f"[FP8 Loader] Model loaded successfully with FP8 weights preserved")
+    print(f"[FP8 Loader] DEBUG: Look for '[FP8 Dequant #]' messages during generation to verify dequantization is working")
 
     return model
 
@@ -2118,6 +2217,14 @@ class HunyuanImage3Backend:
 
         # Log memory after generation complete
         log_gpu_memory("After diffusion complete")
+
+        # Print FP8 stats after generation
+        import torch.nn as nn
+        if hasattr(nn.Linear, '_print_fp8_stats'):
+            nn.Linear._print_fp8_stats()
+        from accelerate.utils import offload as accel_offload
+        if hasattr(accel_offload, 'print_fp8_offload_stats'):
+            accel_offload.print_fp8_offload_stats()
 
         # Final result
         total_time = time.perf_counter() - start_time

@@ -439,39 +439,65 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
     return device_map, gpu_memory_gb
 
 
-def _fp8_linear_forward(layer, input):
-    """FP8 linear forward with dequantization."""
-    weight = layer.weight
-    scale = layer.scale_weight
-    input_dtype = input.dtype
-    input_device = input.device
-    computation_dtype = getattr(layer, 'computation_dtype', torch.bfloat16)
+def _fp8_pre_forward_hook(module, args):
+    """Pre-forward hook: dequantize FP8 weight to bf16 for computation.
 
-    # Ensure weight and scale are on the same device as input
-    if weight.device != input_device:
-        weight = weight.to(input_device)
-    if scale.device != input_device:
-        scale = scale.to(input_device)
+    This works with accelerate's CPU offloading:
+    1. Accelerate's pre_forward hook loads weight from CPU to GPU
+    2. Our hook reads module.weight (now on GPU), dequantizes FP8->bf16
+    3. Forward runs with bf16 weight
+    4. Our post_forward restores FP8 weight
+    5. Accelerate's post_forward moves weight back to CPU
+    """
+    if not hasattr(module, 'scale_weight'):
+        return args
 
-    # Dequantize weight to computation dtype
-    weight_dequant = weight.to(computation_dtype) * scale.to(computation_dtype)
+    # Get the CURRENT weight - accelerate may have just loaded it from CPU
+    fp8_weight = module.weight
+    scale = module.scale_weight
+    computation_dtype = getattr(module, 'computation_dtype', torch.bfloat16)
 
-    # Compute in computation dtype
-    input_cast = input.to(computation_dtype) if input_dtype != computation_dtype else input
+    # Skip if weight is meta tensor (not loaded yet)
+    if fp8_weight.device.type == 'meta':
+        return args
 
-    # Standard linear
-    if layer.bias is not None:
-        bias = layer.bias
-        if bias.device != input_device:
-            bias = bias.to(input_device)
-        output = torch.nn.functional.linear(input_cast, weight_dequant, bias.to(computation_dtype))
+    # Skip if weight is already dequantized (not FP8)
+    if fp8_weight.dtype != torch.float8_e4m3fn:
+        return args
+
+    # Determine target device from input
+    input_tensor = args[0] if args else None
+    if input_tensor is not None:
+        target_device = input_tensor.device
     else:
-        output = torch.nn.functional.linear(input_cast, weight_dequant, None)
+        target_device = fp8_weight.device
 
-    # Return in same dtype as input for consistency
-    if output.dtype != input_dtype:
-        output = output.to(input_dtype)
+    # Store the FP8 weight for restoration in post_forward
+    module._fp8_weight_backup = fp8_weight
 
+    # Move to target device if needed
+    weight_on_device = fp8_weight
+    scale_on_device = scale
+    if fp8_weight.device != target_device:
+        weight_on_device = fp8_weight.to(target_device)
+    if scale.device != target_device:
+        scale_on_device = scale.to(target_device)
+
+    # Dequantize: FP8 -> bf16
+    weight_dequant = weight_on_device.to(computation_dtype) * scale_on_device.to(computation_dtype)
+
+    # Temporarily replace weight with dequantized version
+    module.weight = torch.nn.Parameter(weight_dequant, requires_grad=False)
+
+    return args
+
+
+def _fp8_post_forward_hook(module, args, output):
+    """Post-forward hook: restore FP8 weight to save memory."""
+    if hasattr(module, '_fp8_weight_backup'):
+        # Restore FP8 weight
+        module.weight = module._fp8_weight_backup
+        del module._fp8_weight_backup
     return output
 
 
@@ -479,9 +505,13 @@ def apply_fp8_hooks_to_model(model, computation_dtype=torch.bfloat16):
     """
     Apply FP8 forward hooks to a pre-converted FP8 model.
 
-    This function finds all Linear layers that have a 'scale_weight' buffer
-    (indicating they were pre-converted to FP8) and replaces their forward
-    method with the FP8 dequantization forward.
+    Uses PyTorch's hook system instead of replacing forward methods,
+    which makes it compatible with accelerate's CPU offloading.
+
+    The hooks work with accelerate's lazy loading:
+    1. Accelerate loads weights from CPU/disk to GPU on-demand
+    2. Our pre_forward hook dequantizes FP8->bf16 after accelerate loads
+    3. Our post_forward hook restores FP8 weight before accelerate offloads
 
     Args:
         model: Model with pre-converted FP8 weights
@@ -501,11 +531,12 @@ def apply_fp8_hooks_to_model(model, computation_dtype=torch.bfloat16):
                 # Set computation dtype
                 module.computation_dtype = computation_dtype
 
-                # Replace forward method if not already done
-                if not hasattr(module, 'fp8_converted'):
-                    module.original_forward = module.forward
-                    module.forward = lambda x, m=module: _fp8_linear_forward(m, x)
-                    module.fp8_converted = True
+                # Only register hooks once
+                if not getattr(module, '_fp8_hooks_registered', False):
+                    # Register hooks (pre-forward dequantizes, post-forward restores)
+                    module.register_forward_pre_hook(_fp8_pre_forward_hook)
+                    module.register_forward_hook(_fp8_post_forward_hook)
+                    module._fp8_hooks_registered = True
                     hooked_count += 1
 
     if hooked_count > 0:
@@ -822,24 +853,41 @@ def apply_quantization_dtype_fix(model):
 
 def apply_global_scatter_dtype_fix():
     """
-    Patch torch.Tensor.scatter_ to automatically cast src tensor to destination dtype.
-    This fixes dtype mismatches when using BitsAndBytes quantization with image generation.
+    Patch torch.Tensor.scatter_ and scatter to automatically cast src tensor to destination dtype.
+    This fixes dtype mismatches when using BitsAndBytes quantization or FP8 with image generation.
     The existing apply_quantization_dtype_fix only patches 5 methods, but there are 20+
     scatter operations in the image generation pipeline that also need dtype casting.
     """
-    if hasattr(torch.Tensor, '_original_scatter_'):
-        return  # Already patched
+    patched_count = 0
 
-    original_scatter = torch.Tensor.scatter_
+    # Patch in-place scatter_
+    if not hasattr(torch.Tensor, '_original_scatter_'):
+        original_scatter_ = torch.Tensor.scatter_
 
-    def patched_scatter_(self, dim, index, src, **kwargs):
-        if isinstance(src, torch.Tensor) and src.dtype != self.dtype:
-            src = src.to(self.dtype)
-        return original_scatter(self, dim, index, src, **kwargs)
+        def patched_scatter_(self, dim, index, src, **kwargs):
+            if isinstance(src, torch.Tensor) and src.dtype != self.dtype:
+                src = src.to(self.dtype)
+            return original_scatter_(self, dim, index, src, **kwargs)
 
-    torch.Tensor._original_scatter_ = original_scatter
-    torch.Tensor.scatter_ = patched_scatter_
-    print("[hunyuan_image] Applied global scatter_ dtype fix")
+        torch.Tensor._original_scatter_ = original_scatter_
+        torch.Tensor.scatter_ = patched_scatter_
+        patched_count += 1
+
+    # Also patch non-in-place scatter (for completeness)
+    if hasattr(torch.Tensor, 'scatter') and not hasattr(torch.Tensor, '_original_scatter'):
+        original_scatter = torch.Tensor.scatter
+
+        def patched_scatter(self, dim, index, src, **kwargs):
+            if isinstance(src, torch.Tensor) and src.dtype != self.dtype:
+                src = src.to(self.dtype)
+            return original_scatter(self, dim, index, src, **kwargs)
+
+        torch.Tensor._original_scatter = original_scatter
+        torch.Tensor.scatter = patched_scatter
+        patched_count += 1
+
+    if patched_count > 0:
+        print(f"[hunyuan_image] Applied global scatter dtype fix ({patched_count} methods patched)")
 
 
 # Supported base sizes from the tokenizer vocabulary

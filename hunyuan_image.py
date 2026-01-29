@@ -745,6 +745,13 @@ def load_fp8_model_with_offload(
 
     print(f"[FP8 Loader] Loaded {scales_loaded} scale buffers")
 
+    # Load generation_config
+    from transformers import GenerationConfig
+    gen_config_path = model_path / "generation_config.json"
+    if gen_config_path.exists():
+        model.generation_config = GenerationConfig.from_pretrained(model_path)
+        print(f"[FP8 Loader] Loaded generation_config")
+
     # Apply the FP8 Linear forward patch
     apply_fp8_linear_forward_patch()
 

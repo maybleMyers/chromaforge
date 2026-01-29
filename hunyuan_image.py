@@ -443,19 +443,24 @@ def _fp8_linear_forward(layer, input):
     """FP8 linear forward with dequantization."""
     weight = layer.weight
     scale = layer.scale_weight
+    input_dtype = input.dtype
     computation_dtype = getattr(layer, 'computation_dtype', torch.bfloat16)
 
     # Dequantize weight to computation dtype
     weight_dequant = weight.to(computation_dtype) * scale.to(computation_dtype)
 
-    # Compute in original dtype
-    input_cast = input.to(computation_dtype) if input.dtype != computation_dtype else input
+    # Compute in computation dtype
+    input_cast = input.to(computation_dtype) if input_dtype != computation_dtype else input
 
     # Standard linear
     if layer.bias is not None:
         output = torch.nn.functional.linear(input_cast, weight_dequant, layer.bias.to(computation_dtype))
     else:
         output = torch.nn.functional.linear(input_cast, weight_dequant, None)
+
+    # Return in same dtype as input for consistency
+    if output.dtype != input_dtype:
+        output = output.to(input_dtype)
 
     return output
 
@@ -1207,22 +1212,21 @@ class HunyuanImage3Backend:
             is_preconverted_fp8 = use_fp8 and is_fp8_converted_model(model_path)
 
             if is_preconverted_fp8:
-                # For pre-converted FP8 models, don't specify torch_dtype
-                # This preserves FP8 weights as-is during loading
-                torch_dtype = None
-                print("[hunyuan_image] Detected pre-converted FP8 model, preserving FP8 weights")
-            else:
-                dtype_map = {
-                    "bfloat16": torch.bfloat16,
-                    "float16": torch.float16,
-                    "float32": torch.float32,
-                    "fp8": torch.bfloat16,  # Load in bf16 first, then convert to FP8 at runtime
-                    "q8_partial": torch.bfloat16,
-                    "q8_fp16": torch.float16,
-                    "q4_nf4": torch.bfloat16,
-                    "quanto_int4": torch.bfloat16,  # Load in bf16 first, then apply quanto
-                }
-                torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+                print("[hunyuan_image] Detected pre-converted FP8 model")
+
+            # Always set torch_dtype for consistency of non-FP8 tensors
+            # Safetensors preserves actual stored dtypes (FP8) regardless of this setting
+            dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "fp8": torch.bfloat16,  # FP8 weights preserved, other tensors in bf16
+                "q8_partial": torch.bfloat16,
+                "q8_fp16": torch.float16,
+                "q4_nf4": torch.bfloat16,
+                "quanto_int4": torch.bfloat16,
+            }
+            torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
             # Create device map for multi-GPU or CPU offloading
             actual_gpus = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 0
@@ -1329,9 +1333,7 @@ class HunyuanImage3Backend:
                 )
                 model_kwargs["quantization_config"] = quantization_config
             else:
-                # Only set torch_dtype if specified (None for pre-converted FP8)
-                if torch_dtype is not None:
-                    model_kwargs["torch_dtype"] = torch_dtype
+                model_kwargs["torch_dtype"] = torch_dtype
 
             if device_map is not None:
                 model_kwargs["device_map"] = device_map
@@ -1459,6 +1461,24 @@ class HunyuanImage3Backend:
 
             # Handle FP8: either apply hooks to pre-converted model or convert at runtime
             if use_fp8 and not use_quanto:
+                # Debug: check what dtypes we have after loading
+                fp8_count = 0
+                bf16_count = 0
+                scale_count = 0
+                other_dtypes = {}
+                for name, param in self.model.named_parameters():
+                    if param.dtype == torch.float8_e4m3fn:
+                        fp8_count += 1
+                    elif param.dtype == torch.bfloat16:
+                        bf16_count += 1
+                    else:
+                        other_dtypes[param.dtype] = other_dtypes.get(param.dtype, 0) + 1
+                # Count scale buffers
+                for name, buf in self.model.named_buffers():
+                    if 'scale_weight' in name:
+                        scale_count += 1
+                print(f"[FP8] Model dtypes after load: {fp8_count} FP8, {bf16_count} bf16, {scale_count} scales, others: {other_dtypes}")
+
                 if is_preconverted_fp8:
                     log_gpu_memory("Before FP8 hook application")
                     print("[hunyuan_image] Detected pre-converted FP8 model, applying forward hooks...")
@@ -1471,8 +1491,9 @@ class HunyuanImage3Backend:
                     self.model = convert_model_to_fp8_scaled(self.model, skip_patterns=HUNYUAN_SKIP_MODULES)
                     log_gpu_memory("After FP8 conversion")
 
-            # Apply quantization compatibility patches if using quantization
-            if use_q4_nf4 or use_q8 or use_quanto:
+            # Apply quantization/FP8 compatibility patches for dtype mismatches
+            # FP8 also has mixed dtypes: FP8 layers output bf16, but VAE/embeddings may be float32
+            if use_q4_nf4 or use_q8 or use_quanto or use_fp8:
                 self.model = apply_quantization_dtype_fix(self.model)
                 apply_global_scatter_dtype_fix()
 

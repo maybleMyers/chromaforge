@@ -1006,6 +1006,20 @@ def create_sdnq_config(
     )
 
 
+def clear_gpu_memory(sync: bool = True):
+    """
+    Aggressively clear GPU memory to reduce memory spikes.
+
+    Args:
+        sync: Whether to synchronize CUDA before clearing (ensures all ops complete)
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        if sync:
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def apply_quantization_dtype_fix(model):
     """
     Monkey-patch the model to fix dtype mismatches when using quantization.
@@ -1015,6 +1029,9 @@ def apply_quantization_dtype_fix(model):
     timestep_emb, etc.). The scatter_ operations require matching dtypes.
 
     This patch wraps the problematic methods to cast src tensors before scatter.
+
+    Also adds memory clearing after each major embedding operation to reduce
+    memory spikes during the initial phase of image generation.
     """
     import types
 
@@ -1026,7 +1043,7 @@ def apply_quantization_dtype_fix(model):
     original_instantiate_timestep_r_tokens = model.instantiate_timestep_r_tokens
 
     def patched_instantiate_vae_image_tokens(self, hidden_states, timesteps, images, image_mask, guidance=None, timesteps_r=None):
-        """Patched version with dtype casting for quantization compatibility."""
+        """Patched version with dtype casting for quantization compatibility and memory clearing."""
         # Handle the hidden_states is None case - no scatter ops, just call original
         if hidden_states is None:
             return original_instantiate_vae_image_tokens(hidden_states, timesteps, images, image_mask, guidance, timesteps_r)
@@ -1050,6 +1067,8 @@ def apply_quantization_dtype_fix(model):
                 index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
                 src=image_seq.to(target_dtype),  # Cast for quantization compatibility
             )
+            # Clear intermediate tensors to reduce memory spike
+            del image_seq, t_emb, index, image_scatter_index
         else:  # list
             index = torch.arange(seqlen, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
             for i, (image_i, t_i) in enumerate(zip(images, timesteps)):
@@ -1065,6 +1084,7 @@ def apply_quantization_dtype_fix(model):
                         image_i_seq_j = self.patch_embed(image_ij, t_i_emb[j:j + 1])[0]
                         image_i_seq_list.append(image_i_seq_j)
                     image_i_seq = torch.cat(image_i_seq_list, dim=1)
+                    del image_i_seq_list
                 else:
                     raise TypeError(f"image_i should be a torch.Tensor or a list, got {type(image_i)}")
 
@@ -1074,11 +1094,15 @@ def apply_quantization_dtype_fix(model):
                     index=image_i_index.unsqueeze(-1).repeat(1, 1, n_embd),
                     src=image_i_seq.reshape(1, -1, n_embd).to(target_dtype),  # Cast for quantization compatibility
                 )
+                del image_i_seq, t_i_emb, image_i_index
+            del index
 
+        # Clear GPU memory after VAE token instantiation (major memory consumer)
+        clear_gpu_memory(sync=False)
         return hidden_states
 
     def patched_instantiate_vit_image_tokens(self, hidden_states, images, image_masks, **image_kwargs):
-        """Patched version with dtype casting for quantization compatibility."""
+        """Patched version with dtype casting for quantization compatibility and memory clearing."""
         if images is None:
             return hidden_states
 
@@ -1100,6 +1124,8 @@ def apply_quantization_dtype_fix(model):
                 index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
                 src=image_embeds.reshape(bsz, n * image_seqlen, n_embd).to(target_dtype),  # Cast
             )
+            # Clear intermediate tensors
+            del image_embeds, image_scatter_index
         elif isinstance(images, list):
             for i, (image, image_mask) in enumerate(zip(images, image_masks)):
                 cur_kwargs = {k: v[i] for k, v in image_kwargs.items()} if image_kwargs is not None else {}
@@ -1113,13 +1139,17 @@ def apply_quantization_dtype_fix(model):
                     index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
                     src=image_embed.reshape(1, -1, n_embd).to(target_dtype),  # Cast
                 )
+                del image_embed, image_scatter_index
         else:
             raise ValueError(f"und_images should be Tensor or List, but got {type(images)}")
 
+        del index
+        # Clear GPU memory after VIT token instantiation (vision encoder is memory-heavy)
+        clear_gpu_memory(sync=False)
         return hidden_states
 
     def patched_instantiate_continuous_tokens(self, hidden_states, timesteps=None, timesteps_index=None):
-        """Patched version with dtype casting for quantization compatibility."""
+        """Patched version with dtype casting for quantization compatibility and memory clearing."""
         bsz, seqlen, n_embd = hidden_states.shape
         target_dtype = hidden_states.dtype
 
@@ -1131,6 +1161,7 @@ def apply_quantization_dtype_fix(model):
                     index=timesteps_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
                     src=timestep_src.reshape(1, -1, n_embd).to(target_dtype),  # Cast
                 )
+                del timestep_src
         else:
             timesteps_src = self.timestep_emb(timesteps.reshape(-1))
             hidden_states.scatter_(
@@ -1138,11 +1169,12 @@ def apply_quantization_dtype_fix(model):
                 index=timesteps_index.unsqueeze(-1).repeat(1, 1, n_embd),
                 src=timesteps_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
             )
+            del timesteps_src
 
         return hidden_states
 
     def patched_instantiate_guidance_tokens(self, hidden_states, guidance=None, guidance_index=None):
-        """Patched version with dtype casting for quantization compatibility."""
+        """Patched version with dtype casting for quantization compatibility and memory clearing."""
         bsz, seqlen, n_embd = hidden_states.shape
         target_dtype = hidden_states.dtype
 
@@ -1152,11 +1184,12 @@ def apply_quantization_dtype_fix(model):
             index=guidance_index.unsqueeze(-1).repeat(1, 1, n_embd),
             src=guidance_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
         )
+        del guidance_src
 
         return hidden_states
 
     def patched_instantiate_timestep_r_tokens(self, hidden_states, timesteps_r=None, timesteps_r_index=None):
-        """Patched version with dtype casting for quantization compatibility."""
+        """Patched version with dtype casting for quantization compatibility and memory clearing."""
         bsz, seqlen, n_embd = hidden_states.shape
         target_dtype = hidden_states.dtype
 
@@ -1168,6 +1201,7 @@ def apply_quantization_dtype_fix(model):
                     index=timesteps_r_index[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, n_embd),
                     src=timestep_r_src.reshape(1, -1, n_embd).to(target_dtype),  # Cast
                 )
+                del timestep_r_src
         else:
             timesteps_r_src = self.timestep_r_emb(timesteps_r.reshape(-1))
             hidden_states.scatter_(
@@ -1175,6 +1209,7 @@ def apply_quantization_dtype_fix(model):
                 index=timesteps_r_index.unsqueeze(-1).repeat(1, 1, n_embd),
                 src=timesteps_r_src.reshape(bsz, -1, n_embd).to(target_dtype),  # Cast
             )
+            del timesteps_r_src
 
         return hidden_states
 
@@ -1185,8 +1220,9 @@ def apply_quantization_dtype_fix(model):
     model.instantiate_guidance_tokens = types.MethodType(patched_instantiate_guidance_tokens, model)
     model.instantiate_timestep_r_tokens = types.MethodType(patched_instantiate_timestep_r_tokens, model)
 
-    # === Patch HunyuanStaticCache.update for index_copy_ dtype compatibility ===
+    # === Patch HunyuanStaticCache for chunked initialization and dtype compatibility ===
     # The KV cache buffers may be in a different dtype than key/value states with CPU offload
+    # Chunked initialization reduces memory spikes by allocating cache incrementally
     import importlib
     model_module = type(model).__module__
     hunyuan_module = importlib.import_module(model_module)
@@ -1194,13 +1230,100 @@ def apply_quantization_dtype_fix(model):
     if hasattr(hunyuan_module, 'HunyuanStaticCache'):
         HunyuanStaticCache = hunyuan_module.HunyuanStaticCache
 
+        # Configuration for chunked cache
+        INITIAL_CACHE_SIZE = 512  # Start with smaller allocation
+        CACHE_GROWTH_FACTOR = 2.0  # Double when growing
+        MIN_GROWTH_SIZE = 256  # Minimum growth increment
+
+        def chunked_lazy_initialization(layer_cache, key_states, initial_size=INITIAL_CACHE_SIZE):
+            """
+            Initialize cache with a smaller initial size instead of full max_seq_len.
+            This reduces the initial memory spike significantly.
+            """
+            batch_size, num_heads, seq_len, head_dim = key_states.shape
+            device = key_states.device
+            dtype = key_states.dtype
+
+            # Use smaller initial size, but at least as large as the current sequence
+            cache_size = max(initial_size, seq_len)
+
+            # Store the actual allocated size for growth tracking
+            layer_cache._allocated_size = cache_size
+
+            # Allocate smaller initial buffers
+            layer_cache.keys = torch.zeros(
+                (batch_size, num_heads, cache_size, head_dim),
+                device=device,
+                dtype=dtype
+            )
+            layer_cache.values = torch.zeros(
+                (batch_size, num_heads, cache_size, head_dim),
+                device=device,
+                dtype=dtype
+            )
+
+        def grow_cache(layer_cache, required_size):
+            """
+            Grow the cache to accommodate more tokens.
+            Uses growth factor to avoid frequent reallocations.
+            """
+            current_size = layer_cache._allocated_size
+            if required_size <= current_size:
+                return  # No growth needed
+
+            # Calculate new size with growth factor
+            new_size = max(
+                int(current_size * CACHE_GROWTH_FACTOR),
+                current_size + MIN_GROWTH_SIZE,
+                required_size
+            )
+
+            old_keys = layer_cache.keys
+            old_values = layer_cache.values
+            batch_size, num_heads, _, head_dim = old_keys.shape
+
+            # Allocate new larger buffers
+            layer_cache.keys = torch.zeros(
+                (batch_size, num_heads, new_size, head_dim),
+                device=old_keys.device,
+                dtype=old_keys.dtype
+            )
+            layer_cache.values = torch.zeros(
+                (batch_size, num_heads, new_size, head_dim),
+                device=old_values.device,
+                dtype=old_values.dtype
+            )
+
+            # Copy existing data
+            layer_cache.keys[:, :, :current_size, :] = old_keys
+            layer_cache.values[:, :, :current_size, :] = old_values
+
+            # Update allocated size
+            layer_cache._allocated_size = new_size
+
+            # Free old buffers
+            del old_keys, old_values
+
         def patched_cache_update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-            """Patched update with dtype casting for quantization compatibility."""
+            """Patched update with chunked initialization and dtype casting."""
             cache_position = cache_kwargs.get("cache_position") if cache_kwargs else None
 
-            # Lazy initialization if needed
+            # Chunked lazy initialization - start with smaller allocation
             if self.layers[layer_idx].keys is None:
-                self.layers[layer_idx].lazy_initialization(key_states)
+                chunked_lazy_initialization(self.layers[layer_idx], key_states)
+
+            # Check if we need to grow the cache
+            if cache_position is not None:
+                if cache_position.dim() == 1:
+                    max_pos = cache_position[-1].item() + 1
+                else:
+                    max_pos = cache_position.max().item() + 1
+
+                current_allocated = getattr(self.layers[layer_idx], '_allocated_size',
+                                           self.layers[layer_idx].keys.size(2))
+
+                if max_pos > current_allocated:
+                    grow_cache(self.layers[layer_idx], max_pos)
 
             k_out = self.layers[layer_idx].keys
             v_out = self.layers[layer_idx].values
@@ -1242,7 +1365,7 @@ def apply_quantization_dtype_fix(model):
 
         # Replace the class method (affects all instances)
         HunyuanStaticCache.update = patched_cache_update
-        print("[hunyuan_image] Applied KV cache dtype compatibility patch")
+        print(f"[hunyuan_image] Applied chunked KV cache patch (initial={INITIAL_CACHE_SIZE}, growth={CACHE_GROWTH_FACTOR}x)")
 
     print("[hunyuan_image] Applied quantization dtype compatibility patches")
     return model
@@ -2343,14 +2466,18 @@ class HunyuanImage3Backend:
 
             print(f"[hunyuan_image] Generation kwargs: guidance={guidance_scale}, flow_shift={flow_shift}, taylor_cache={use_taylor_cache}")
 
-            # Log memory before generation
-            log_gpu_memory("Before generation")
+            # Clear GPU memory before generation to minimize spike
+            clear_gpu_memory(sync=True)
+            log_gpu_memory("Before generation (after cleanup)")
 
             # Generate image using the model's generate_image API
             cot_text, outputs = self.model.generate_image(**gen_kwargs)
 
             # Log memory after generation
             log_gpu_memory("After generation")
+
+            # Clear GPU memory after generation to release intermediate tensors
+            clear_gpu_memory(sync=True)
 
             progress(0.9, desc="Processing output...")
 
@@ -2496,8 +2623,9 @@ class HunyuanImage3Backend:
 
         print(f"[hunyuan_image] Streaming with steps={num_inference_steps}, guidance={guidance_scale}, flow_shift={flow_shift}")
 
-        # Log memory before generation
-        log_gpu_memory("Before streaming generation")
+        # Clear GPU memory before generation to minimize spike
+        clear_gpu_memory(sync=True)
+        log_gpu_memory("Before streaming generation (after cleanup)")
 
         # Store generation result from thread
         generation_result = {"image": None, "error": None, "cot_text": None}
@@ -2513,6 +2641,8 @@ class HunyuanImage3Backend:
                 else:
                     generation_result["image"] = outputs
                 generation_result["cot_text"] = cot_text
+                # Clear intermediate tensors after generation
+                clear_gpu_memory(sync=False)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -2540,6 +2670,8 @@ class HunyuanImage3Backend:
 
         # Log memory after generation complete
         log_gpu_memory("After diffusion complete")
+        # Final cleanup
+        clear_gpu_memory(sync=True)
 
         # Print FP8 stats after generation
         import torch.nn as nn

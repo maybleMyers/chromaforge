@@ -5,7 +5,6 @@ The pre-trained versions of Chroma, known as chroma-unlocked/chroma-unlocked-det
 These staging nodes are known as base, fast and large, the latter being an off shoot trained at 1024x. The primary pretraining consists of base and fast while the detail-calibrated one consists of base, fast and large.
 # Software
 ### Generation/Inference
-- [ComfyUI](https://www.comfy.org/) is the only officially supported software for inferencing Chroma. A basic workflow can be found in the templates.
 - [SD webui Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge) also supports Chroma, with the [chromaforge](https://github.com/maybleMyers/chromaforge) fork to support more features and Radiance.
 - [SD.Next](https://github.com/vladmandic/sdnext) supports Chroma as well.
 ### Training

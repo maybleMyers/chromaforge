@@ -419,31 +419,40 @@ def create_attention_priority_device_map(num_layers: int = 32, num_experts: int 
 
     Based on HunyuanImage-3.0 model structure:
     - model.layers.X.self_attn: attention -> GPU
-    - model.layers.X.mlp.experts.Y: MoE FFN experts -> CPU
-    - Everything else: GPU (default)
-
-    Args:
-        num_layers: Number of transformer layers (default 32)
-        num_experts: Number of MoE experts per layer (default 64)
-
-    Returns:
-        tuple: (device_map dict, estimated GPU memory in GB)
+    - model.layers.X.mlp: MoE block (experts + gate + shared) -> CPU
+    - Global embeddings/heads -> GPU
     """
     device_map = {}
 
-    # Default: everything on GPU
-    device_map[""] = 0
+    # 1. Global modules to GPU (Lightweight components)
+    gpu_modules = [
+        'model.wte', 'model.ln_f',
+        'vae', 'vision_model', 'vision_aligner',
+        'final_layer', 'patch_embed',
+        'time_embed', 'time_embed_2',
+        'timestep_emb', 'guidance_emb', 'timestep_r_emb',
+        'lm_head',
+    ]
+    for module in gpu_modules:
+        device_map[module] = 0
 
-    # MoE experts -> CPU (large, 64 experts per layer = 2048 total)
-    # Note: path is model.layers.X.mlp.experts (not moe.experts)
-    for layer_idx in range(num_layers):
-        device_map[f"model.layers.{layer_idx}.mlp.experts"] = "cpu"
+    # 2. Per-layer mapping
+    for i in range(num_layers):
+        # Attention components -> GPU (Latency sensitive, relatively small)
+        device_map[f'model.layers.{i}.self_attn'] = 0
+        device_map[f'model.layers.{i}.input_layernorm'] = 0
+        device_map[f'model.layers.{i}.post_attention_layernorm'] = 0
+        
+        # Whole MLP block (Experts + Gate + Shared) -> CPU
+        # Mapping the parent 'mlp' to CPU is safer than mapping just 'mlp.experts'
+        # because it prevents the parent container from defaulting to GPU.
+        device_map[f'model.layers.{i}.mlp'] = 'cpu'
 
     # Estimate GPU memory for non-MoE components
     gpu_memory_gb = estimate_attention_gpu_memory(num_layers=num_layers)
 
     experts_on_cpu = num_layers * num_experts
-    print(f"[device_map] Attention-priority: ~{gpu_memory_gb:.1f}GB on GPU, {experts_on_cpu} MoE experts on CPU")
+    print(f"[device_map] Attention-priority: ~{gpu_memory_gb:.1f}GB on GPU, {experts_on_cpu} MoE experts on CPU (entire MLP block offloaded)")
 
     return device_map, gpu_memory_gb
 
@@ -2074,16 +2083,16 @@ class HunyuanImage3Backend:
                 )
 
             elif use_sdnq and cpu_offload:
-                # SDNQ with CPU offload: load to CPU, then dispatch to GPU/CPU
-                print("[hunyuan_image] SDNQ + CPU offload: loading all weights to CPU...")
+                # SDNQ with CPU offload: quantize on GPU (fast), store on CPU (avoids OOM)
+                print("[hunyuan_image] SDNQ + CPU offload: GPU quantization with CPU storage...")
 
-                # Override SDNQ config to force all weights to CPU during loading
+                # Use GPU for fast quantization, but store weights on CPU
                 sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
                 cpu_quantization_config = create_sdnq_config(
                     weights_dtype=sdnq_weights_dtype,
                     use_quantized_matmul=True,
-                    quantization_device=None,  # Quantize on target device
-                    return_device="cpu",  # Force all quantized weights to CPU
+                    quantization_device="cuda:0" if self.num_gpus > 0 else None,  # Quantize on GPU (fast)
+                    return_device="cpu",  # Store quantized weights on CPU (avoids OOM)
                 )
 
                 sdnq_kwargs = model_kwargs.copy()
@@ -2097,6 +2106,13 @@ class HunyuanImage3Backend:
                 )
 
                 log_gpu_memory("After SDNQ load to CPU")
+
+                # Free GPU memory used during quantization before dispatching
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                log_gpu_memory("After cleanup, before dispatch")
+
                 progress(0.7, desc="Dispatching to GPU/CPU...")
 
                 # Now dispatch: attention to GPU, MoE experts stay on CPU

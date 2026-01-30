@@ -1,5 +1,16 @@
 ![GUI Screenshot](images/screenshot.png)
 
+
+## VLM FORK
+  
+  I made this fork for LLM/VLM expiraments. You can run vlm.py, vlm_diffusers.py and hunyuan_image.py. For instance python hunyuan_image.py. Requirements will be varied and might take some work to make particular models work with each engine.
+
+  Place the root diffusers model in the models/LLM subfolder. For hunyuan image 3 you should install sdnq for quanting.
+    
+git clone https://github.com/Disty0/sdnq
+  
+pip install -e ./sdnq
+  
 ## Fork of forge to use Chroma!
 
 This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks Thanks to [@croquelois](https://github.com/croquelois) && [@lllyasviel](https://github.com/lllyasviel)!   

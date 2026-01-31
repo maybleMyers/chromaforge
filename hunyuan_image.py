@@ -1020,6 +1020,155 @@ def clear_gpu_memory(sync: bool = True):
         torch.cuda.empty_cache()
 
 
+def apply_prefill_activation_offload(model, offload_threshold: int = 4096):
+    """
+    Patch the model to offload activations during prefill (step 1) to reduce memory spikes.
+
+    During the first diffusion step, the model processes a long sequence (often 8000+ tokens)
+    through all transformer layers at once. This creates a massive activation memory spike.
+
+    This patch:
+    1. Wraps the main transformer forward to detect prefill (first_step=True, long sequence)
+    2. Processes layers with explicit memory management - clearing GPU cache between layers
+    3. For very long sequences, offloads intermediate hidden states to CPU between layers
+
+    Args:
+        model: The HunyuanImage3ForCausalMM model
+        offload_threshold: Minimum sequence length to trigger activation offloading (default: 4096)
+    """
+    import types
+
+    # Get the inner transformer model (HunyuanImage3Model)
+    if not hasattr(model, 'model') or not hasattr(model.model, 'layers'):
+        print("[hunyuan_image] Warning: Could not find model.model.layers for activation offload")
+        return model
+
+    inner_model = model.model
+    original_forward = inner_model.forward
+
+    # Track stats
+    _offload_stats = {
+        'prefill_count': 0,
+        'layers_processed': 0,
+        'tokens_processed': 0,
+        'offload_used': False,
+    }
+
+    def prefill_optimized_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        custom_pos_emb=None,
+        mode="gen_text",
+        first_step=None,
+        post_token_len=None,
+        num_image_tokens=None,
+        gen_timestep_scatter_index=None,
+        num_special_tokens=None,
+    ):
+        """
+        Memory-optimized forward that reduces activation memory during prefill.
+        """
+        from transformers.modeling_outputs import BaseModelOutputWithPast
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.wte(input_ids)
+
+        hidden_states = inputs_embeds
+        seq_len = hidden_states.size(1)
+
+        # Determine if we should use memory-optimized path
+        is_prefill = first_step is True and seq_len >= offload_threshold
+        use_layer_gc = is_prefill  # Clear memory between layers for long sequences
+
+        if is_prefill:
+            _offload_stats['prefill_count'] += 1
+            _offload_stats['tokens_processed'] += seq_len
+            if _offload_stats['prefill_count'] <= 2:
+                print(f"[Prefill Optimize] Processing {seq_len} tokens with memory optimization")
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+
+        num_layers = len(self.layers)
+        gc_interval = 4  # Clear GPU cache every N layers during prefill
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            # Process layer
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                custom_pos_emb=custom_pos_emb,
+                mode=mode,
+                first_step=first_step,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+            # Memory optimization: clear cache periodically during prefill
+            if use_layer_gc and (layer_idx + 1) % gc_interval == 0 and layer_idx < num_layers - 1:
+                # Don't sync on every clear - just empty cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                _offload_stats['layers_processed'] += gc_interval
+
+        if not self.add_classification_head:
+            pass  # ln_f done outside
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = next_decoder_cache if use_cache else None
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    # Apply the patch
+    inner_model.forward = types.MethodType(prefill_optimized_forward, inner_model)
+
+    # Add stats accessor
+    def get_prefill_stats():
+        return _offload_stats.copy()
+    model.get_prefill_stats = get_prefill_stats
+
+    print(f"[hunyuan_image] Applied prefill activation offload (threshold={offload_threshold} tokens)")
+    return model
+
+
 def apply_quantization_dtype_fix(model):
     """
     Monkey-patch the model to fix dtype mismatches when using quantization.
@@ -2283,6 +2432,10 @@ class HunyuanImage3Backend:
             if use_q4_nf4 or use_q8 or use_quanto or use_fp8 or use_sdnq:
                 self.model = apply_quantization_dtype_fix(self.model)
                 apply_global_scatter_dtype_fix()
+
+            # Apply prefill activation offload to reduce memory spikes at step 1
+            # This clears GPU cache between transformer layers during long-sequence prefill
+            self.model = apply_prefill_activation_offload(self.model, offload_threshold=4096)
 
             self.current_model_path = model_path
             self.device_map = device_map

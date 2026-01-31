@@ -45,11 +45,23 @@ except ImportError:
 # Import llama-cpp-python
 try:
     from llama_cpp import Llama
+    from llama_cpp import llama_cpp as llama_cpp_lib
     from llama_cpp.llama_chat_format import (
         Llava15ChatHandler,
         Llava16ChatHandler,
     )
     LLAMA_CPP_AVAILABLE = True
+
+    # Mapping from string type names to GGML type constants
+    GGML_TYPE_MAP = {
+        "f16": llama_cpp_lib.GGML_TYPE_F16,
+        "f32": llama_cpp_lib.GGML_TYPE_F32,
+        "q4_0": llama_cpp_lib.GGML_TYPE_Q4_0,
+        "q4_1": llama_cpp_lib.GGML_TYPE_Q4_1,
+        "q5_0": llama_cpp_lib.GGML_TYPE_Q5_0,
+        "q5_1": llama_cpp_lib.GGML_TYPE_Q5_1,
+        "q8_0": llama_cpp_lib.GGML_TYPE_Q8_0,
+    }
 
     # Try to import Qwen3VLChatHandler first (for Qwen3-VL models), then fall back to Qwen25VLChatHandler
     Qwen3VLChatHandler = None
@@ -75,6 +87,7 @@ except ImportError:
     LLAMA_CPP_AVAILABLE = False
     QWEN_VL_AVAILABLE = False
     QWEN3_VL_AVAILABLE = False
+    GGML_TYPE_MAP = {}
     Llama = None
     Qwen25VLChatHandler = None
     Qwen3VLChatHandler = None
@@ -89,6 +102,57 @@ def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     b64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
     mime_type = f"image/{format.lower()}"
     return f"data:{mime_type};base64,{b64_data}"
+
+
+def clean_harmony_tags(content: str) -> str:
+    """
+    Clean GPT-OSS Harmony format tags from content.
+    Extracts the final channel content if present, otherwise removes all tags.
+    """
+    if not content or not isinstance(content, str):
+        return content
+
+    # Try to extract just the final channel content
+    final_match = re.search(
+        r'<\|channel\|>final<\|message\|>(.*?)(?:<\|(?:end|return)\|>|$)',
+        content,
+        re.DOTALL
+    )
+    if final_match:
+        return final_match.group(1).strip()
+
+    # If no final channel, remove all harmony tags
+    cleaned = re.sub(r'<\|channel\|>(?:analysis|commentary|final)<\|message\|>', '', content)
+    cleaned = re.sub(r'<\|(?:start|end|return|call|message)\|>', '', cleaned)
+    return cleaned.strip()
+
+
+def format_gpt_oss_system_prompt(user_prompt: str, reasoning_level: str = "medium") -> str:
+    """
+    Format a system prompt for GPT-OSS models with proper Harmony format requirements.
+
+    Args:
+        user_prompt: The user's system prompt content
+        reasoning_level: Reasoning level (low, medium, high)
+
+    Returns:
+        Properly formatted system prompt for GPT-OSS
+    """
+    from datetime import datetime
+    current_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Build the GPT-OSS system prompt with required elements
+    harmony_header = f"""Knowledge cutoff: 2024-06
+Current date: {current_date}
+
+Reasoning: {reasoning_level}
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message."""
+
+    if user_prompt and user_prompt.strip():
+        return f"{user_prompt.strip()}\n\n{harmony_header}"
+    else:
+        return f"You are a helpful AI assistant.\n\n{harmony_header}"
 
 
 def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448), every_other_frame: bool = False) -> List[Image.Image]:
@@ -478,14 +542,34 @@ class LlamaCppVLM:
             if flash_attn:
                 llama_kwargs["flash_attn"] = True
 
-            # Add KV cache type parameters if specified
+            # Add KV cache type parameters if specified (convert string to GGML type constant)
             if type_k:
-                llama_kwargs["type_k"] = type_k
+                type_k_int = GGML_TYPE_MAP.get(type_k.lower())
+                if type_k_int is not None:
+                    llama_kwargs["type_k"] = type_k_int
+                else:
+                    print(f"[llama.cpp] Warning: Unknown type_k '{type_k}', ignoring")
             if type_v:
-                llama_kwargs["type_v"] = type_v
+                type_v_int = GGML_TYPE_MAP.get(type_v.lower())
+                if type_v_int is not None:
+                    llama_kwargs["type_v"] = type_v_int
+                else:
+                    print(f"[llama.cpp] Warning: Unknown type_v '{type_v}', ignoring")
 
             # Load the model
             self.model = Llama(**llama_kwargs)
+
+            # After loading, check the model's actual architecture from metadata
+            # This is more reliable than filename-based detection
+            try:
+                model_metadata = self.model.metadata
+                arch = model_metadata.get("general.architecture", "").lower()
+                if arch == "gpt-oss":
+                    self.model_type = "gpt-oss"
+                    self.is_text_only_model = True
+                    print(f"[llama.cpp] Detected GPT-OSS architecture from model metadata")
+            except Exception as e:
+                print(f"[llama.cpp] Could not read model metadata: {e}")
 
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path
@@ -494,7 +578,8 @@ class LlamaCppVLM:
             progress(1.0, desc="Model loaded!")
 
             vision_status = "with vision" if self.chat_handler else "text-only"
-            return f"Loaded: {model_name} ({vision_status}, ctx={n_ctx})"
+            model_type_info = f", type={self.model_type}" if self.model_type else ""
+            return f"Loaded: {model_name} ({vision_status}, ctx={n_ctx}{model_type_info})"
 
         except Exception as e:
             import traceback
@@ -1074,6 +1159,7 @@ class LlamaCppVLM:
         video_max_frames: int = 8,
         every_other_frame: bool = False,
         stream: bool = False,
+        reasoning_level: str = "medium",
     ):
         """
         Generate a response.
@@ -1086,6 +1172,7 @@ class LlamaCppVLM:
             video_max_frames: Max frames for video processing
             every_other_frame: If True, use every other frame from videos
             stream: If True, yields partial responses as a generator
+            reasoning_level: GPT-OSS reasoning level (low, medium, high)
 
         Returns:
             Generated response string, or generator if stream=True
@@ -1126,6 +1213,7 @@ class LlamaCppVLM:
             # For text-only models (like GPT-OSS), we need to convert all content to plain text
             # The chat templates for these models expect string content, not list content
             use_text_only = self.is_text_only_model
+            is_gpt_oss = self.model_type == "gpt-oss"
 
             for msg in messages:
                 role = msg.get("role", "user")
@@ -1142,7 +1230,30 @@ class LlamaCppVLM:
                             elif isinstance(item, str):
                                 text_parts.append(item)
                         content = " ".join(text_parts) if text_parts else str(content)
+
+                    # For GPT-OSS models, the built-in Jinja template handles Harmony formatting
+                    # Don't add manual Harmony headers - just pass clean system prompt
                     llama_messages.append({"role": "system", "content": str(content)})
+
+                elif role == "assistant":
+                    # For GPT-OSS models, clean harmony tags from previous assistant responses
+                    if isinstance(content, str):
+                        if is_gpt_oss:
+                            content = clean_harmony_tags(content)
+                        llama_messages.append({"role": "assistant", "content": content})
+                    elif isinstance(content, list):
+                        # Extract text from list content
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                text_parts.append(item)
+                        text_content = " ".join(text_parts) if text_parts else ""
+                        if is_gpt_oss:
+                            text_content = clean_harmony_tags(text_content)
+                        if text_content:
+                            llama_messages.append({"role": "assistant", "content": text_content})
 
                 elif role == "user":
                     if isinstance(content, list):
@@ -1238,20 +1349,36 @@ class LlamaCppVLM:
 
             # Debug logging for GPT-OSS and other text-only models
             if self.model_type == "gpt-oss":
-                print(f"[llama.cpp] GPT-OSS: Building request with {len(llama_messages)} messages")
+                print(f"[llama.cpp] GPT-OSS: Building request with {len(llama_messages)} messages, reasoning_effort={reasoning_level}")
                 for i, msg in enumerate(llama_messages):
                     content_preview = str(msg.get('content', ''))[:100]
-                    print(f"[llama.cpp]   [{i}] {msg['role']}: {content_preview}...")
+                    # Check for any channel tags that shouldn't be there
+                    if '<|channel|>' in str(msg.get('content', '')):
+                        print(f"[llama.cpp]   [{i}] {msg['role']}: WARNING - contains <|channel|> tags!")
+                        print(f"[llama.cpp]   Full content: {msg.get('content', '')[:500]}")
+                    else:
+                        print(f"[llama.cpp]   [{i}] {msg['role']}: {content_preview}...")
 
             # Generate response
             start_time = time.perf_counter()
 
+            # Build chat completion kwargs
+            chat_kwargs = {
+                "messages": llama_messages,
+                "max_tokens": max_new_tokens,
+                "temperature": temperature if temperature > 0 else 0.001,
+            }
+
+            # Note: reasoning_effort for GPT-OSS is only supported via llama-server backend
+            # The llama-cpp-python library doesn't support chat_template_kwargs
+            # The template will use its default "medium" reasoning level
+            if is_gpt_oss:
+                print(f"[llama.cpp] GPT-OSS: Using template default reasoning (reasoning_level={reasoning_level} only works with llama-server)")
+
             if stream:
                 # Streaming mode - yield partial responses
                 response_stream = self.model.create_chat_completion(
-                    messages=llama_messages,
-                    max_tokens=max_new_tokens,
-                    temperature=temperature if temperature > 0 else 0.001,
+                    **chat_kwargs,
                     stream=True,
                 )
 
@@ -1319,11 +1446,7 @@ class LlamaCppVLM:
 
             else:
                 # Non-streaming mode
-                response = self.model.create_chat_completion(
-                    messages=llama_messages,
-                    max_tokens=max_new_tokens,
-                    temperature=temperature if temperature > 0 else 0.001,
-                )
+                response = self.model.create_chat_completion(**chat_kwargs)
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
@@ -1416,6 +1539,7 @@ DEFAULT_SETTINGS = {
     "video_max_frames": 8,
     "every_other_frame": False,
     "show_thinking": True,
+    "reasoning_level": "medium",  # GPT-OSS reasoning level: low, medium, high
     # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
     "batch_prompt": "Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
@@ -1445,6 +1569,7 @@ def save_settings(
     video_max_frames: int,
     every_other_frame: bool,
     show_thinking: bool,
+    reasoning_level: str,
     # Batch Caption Settings
     batch_system_prompt: str,
     batch_prompt: str,
@@ -1473,6 +1598,7 @@ def save_settings(
         "video_max_frames": video_max_frames,
         "every_other_frame": every_other_frame,
         "show_thinking": show_thinking,
+        "reasoning_level": reasoning_level,
         # Batch Caption Settings
         "batch_system_prompt": batch_system_prompt,
         "batch_prompt": batch_prompt,
@@ -1629,6 +1755,7 @@ def chat_handler(
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     show_thinking: bool = False,
+    reasoning_level: str = "medium",
 ):
     """Handle chat messages from UI with streaming support."""
     # Check if any model is loaded (either local or server mode)
@@ -1736,6 +1863,7 @@ def chat_handler(
         video_max_frames=video_max_frames,
         every_other_frame=every_other_frame,
         stream=True,
+        reasoning_level=reasoning_level,
     ):
         # Check stop flag
         if stop_generation:
@@ -2205,6 +2333,12 @@ def create_ui():
                     label="Show Thinking",
                     value=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
                 )
+                reasoning_level = gr.Dropdown(
+                    label="Reasoning Level",
+                    choices=["low", "medium", "high"],
+                    value=saved_settings.get("reasoning_level", DEFAULT_SETTINGS["reasoning_level"]),
+                    info="GPT-OSS reasoning effort",
+                )
                 save_settings_btn = gr.Button("Save Settings", variant="secondary")
                 save_status = gr.Textbox(
                     label="",
@@ -2253,7 +2387,7 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, every_other, thinking):
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, every_other, thinking, reasoning):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
                 yield history, "", None, None, None, None, None, "", ""
                 return
@@ -2261,7 +2395,7 @@ def create_ui():
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid,
-                max_tok, temp, vid_frames, every_other, thinking
+                max_tok, temp, vid_frames, every_other, thinking, reasoning
             ):
                 yield new_history, "", None, None, None, None, None, stats, ctx_info
 
@@ -2270,7 +2404,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking
+                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
@@ -2280,7 +2414,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking
+                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
         )
@@ -2314,7 +2448,7 @@ def create_ui():
                 server_port, llama_server_path,
                 # Generation Settings
                 system_prompt, max_tokens, temperature, video_max_frames,
-                every_other_frame, show_thinking,
+                every_other_frame, show_thinking, reasoning_level,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt
             ],

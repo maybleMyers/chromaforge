@@ -2374,10 +2374,26 @@ class HunyuanImage3Backend:
                 sdnq_kwargs["device_map"] = "cpu"  # Load structure to CPU
                 sdnq_kwargs.pop("max_memory", None)
 
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    **sdnq_kwargs,
-                )
+                # Temporarily patch torch.Tensor.normal_ to handle int8 weights
+                # SDNQ quantizes to int8, but transformers tries to reinitialize with normal_()
+                original_normal_ = torch.Tensor.normal_
+
+                def safe_normal_(self, mean=0, std=1, *, generator=None):
+                    """Skip normal_ for integer dtypes (quantized weights)."""
+                    if self.dtype in (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64):
+                        return self  # No-op for quantized weights
+                    return original_normal_(self, mean, std, generator=generator)
+
+                torch.Tensor.normal_ = safe_normal_
+
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        **sdnq_kwargs,
+                    )
+                finally:
+                    # Restore original normal_
+                    torch.Tensor.normal_ = original_normal_
 
                 log_gpu_memory("After SDNQ load to CPU")
 

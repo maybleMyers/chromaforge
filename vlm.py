@@ -54,13 +54,13 @@ try:
 
     # Mapping from string type names to GGML type constants
     GGML_TYPE_MAP = {
-        "f16": llama_cpp_lib.GGML_TYPE_F16,
-        "f32": llama_cpp_lib.GGML_TYPE_F32,
-        "q4_0": llama_cpp_lib.GGML_TYPE_Q4_0,
-        "q4_1": llama_cpp_lib.GGML_TYPE_Q4_1,
-        "q5_0": llama_cpp_lib.GGML_TYPE_Q5_0,
-        "q5_1": llama_cpp_lib.GGML_TYPE_Q5_1,
-        "q8_0": llama_cpp_lib.GGML_TYPE_Q8_0,
+        "f16": 1,   # GGML_TYPE_F16
+        "f32": 0,   # GGML_TYPE_F32
+        "q4_0": 2,  # GGML_TYPE_Q4_0
+        "q4_1": 3,  # GGML_TYPE_Q4_1
+        "q5_0": 6,  # GGML_TYPE_Q5_0
+        "q5_1": 7,  # GGML_TYPE_Q5_1
+        "q8_0": 8,  # GGML_TYPE_Q8_0
     }
 
     # Try to import Qwen3VLChatHandler first (for Qwen3-VL models), then fall back to Qwen25VLChatHandler

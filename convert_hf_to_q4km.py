@@ -31,166 +31,15 @@ from gguf import GGUFWriter, GGMLQuantizationType
 # ---------------------------------------------------------------------------
 
 QK_K = 256  # Super-block size for K-quants
+Q4_K_BLOCK_SIZE = 144  # bytes per Q4_K block
+Q6_K_BLOCK_SIZE = 210  # bytes per Q6_K block
 
 
-def quantize_q4_k_cuda(data: np.ndarray) -> np.ndarray:
-    """CUDA-accelerated Q4_K quantization using PyTorch."""
-    assert data.dtype == np.float32
+def quantize_q4_k_rows(data: np.ndarray) -> np.ndarray:
+    """Quantize 2D float32 data to Q4_K format, row by row.
 
-    # Move to GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tensor = torch.from_numpy(data).to(device)
-
-    # Reshape to super-blocks of 256 elements
-    n_elements = tensor.numel()
-    n_blocks = (n_elements + QK_K - 1) // QK_K
-    padded_size = n_blocks * QK_K
-
-    if padded_size > n_elements:
-        tensor = torch.nn.functional.pad(tensor.view(-1), (0, padded_size - n_elements))
-    else:
-        tensor = tensor.view(-1)
-
-    tensor = tensor.view(n_blocks, QK_K)
-
-    # Divide into 8 sub-blocks of 32 elements each
-    sub_blocks = tensor.view(n_blocks, 8, 32)
-
-    # Find min/max per sub-block (vectorized)
-    sb_mins = sub_blocks.min(dim=2).values  # [n_blocks, 8]
-    sb_maxs = sub_blocks.max(dim=2).values  # [n_blocks, 8]
-
-    # Compute scales per sub-block
-    scales = (sb_maxs - sb_mins) / 15.0  # [n_blocks, 8]
-    scales = torch.where(sb_maxs != sb_mins, scales, torch.zeros_like(scales))
-    mins = sb_mins
-
-    # Super-block scales
-    max_scale = scales.abs().max(dim=1).values  # [n_blocks]
-    max_min = mins.abs().max(dim=1).values  # [n_blocks]
-
-    d = max_scale / 63.0  # [n_blocks]
-    dmin = max_min / 63.0  # [n_blocks]
-
-    # Avoid division by zero
-    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
-    inv_dmin = torch.where(dmin > 0, 1.0 / dmin, torch.zeros_like(dmin))
-
-    # Quantize scales/mins to 6-bit
-    q_scales = (scales * inv_d.unsqueeze(1)).round().clamp(0, 63).to(torch.uint8)
-    q_mins = ((-mins) * inv_dmin.unsqueeze(1)).round().clamp(0, 63).to(torch.uint8)
-
-    # Move back to CPU for packing
-    d_cpu = d.half().cpu().numpy()
-    dmin_cpu = dmin.half().cpu().numpy()
-    q_scales_cpu = q_scales.cpu().numpy()
-    q_mins_cpu = q_mins.cpu().numpy()
-
-    # Quantize values to 4-bit
-    # Reconstruct effective scales and mins
-    eff_scales = (d.unsqueeze(1) * q_scales.float()).unsqueeze(2)  # [n_blocks, 8, 1]
-    eff_mins = (dmin.unsqueeze(1) * q_mins.float()).unsqueeze(2)  # [n_blocks, 8, 1]
-
-    # Quantize: q = round((x + min) / scale)
-    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
-    qs = ((sub_blocks + eff_mins) * inv_eff_scales).round().clamp(0, 15).to(torch.uint8)
-    qs_cpu = qs.cpu().numpy()  # [n_blocks, 8, 32]
-
-    # Pack into output (144 bytes per block)
-    output = np.zeros((n_blocks, 144), dtype=np.uint8)
-
-    # Store d and dmin as float16 (bytes 0-4)
-    output[:, 0:2] = d_cpu.view(np.uint8).reshape(n_blocks, 2)
-    output[:, 2:4] = dmin_cpu.view(np.uint8).reshape(n_blocks, 2)
-
-    # Pack scales (6-bit) into 12 bytes (bytes 4-16)
-    for i in range(4):
-        output[:, 4 + i] = (q_scales_cpu[:, i] & 0xF) | ((q_scales_cpu[:, i + 4] & 0xF) << 4)
-    for i in range(4):
-        output[:, 8 + i] = (q_mins_cpu[:, i] & 0xF) | ((q_mins_cpu[:, i + 4] & 0xF) << 4)
-    for i in range(4):
-        output[:, 12 + i] = ((q_scales_cpu[:, i] >> 4) & 0x3) | \
-                           (((q_scales_cpu[:, i + 4] >> 4) & 0x3) << 2) | \
-                           (((q_mins_cpu[:, i] >> 4) & 0x3) << 4) | \
-                           (((q_mins_cpu[:, i + 4] >> 4) & 0x3) << 6)
-
-    # Pack quantized values (4-bit) into 128 bytes (bytes 16-144)
-    qs_flat = qs_cpu.reshape(n_blocks, 256)
-    for i in range(128):
-        output[:, 16 + i] = (qs_flat[:, i * 2] & 0xF) | ((qs_flat[:, i * 2 + 1] & 0xF) << 4)
-
-    return output.ravel()
-
-
-def quantize_q6_k_cuda(data: np.ndarray) -> np.ndarray:
-    """CUDA-accelerated Q6_K quantization using PyTorch."""
-    assert data.dtype == np.float32
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tensor = torch.from_numpy(data).to(device)
-
-    n_elements = tensor.numel()
-    n_blocks = (n_elements + QK_K - 1) // QK_K
-    padded_size = n_blocks * QK_K
-
-    if padded_size > n_elements:
-        tensor = torch.nn.functional.pad(tensor.view(-1), (0, padded_size - n_elements))
-    else:
-        tensor = tensor.view(-1)
-
-    tensor = tensor.view(n_blocks, QK_K)
-
-    # Divide into 16 sub-blocks of 16 elements
-    sub_blocks = tensor.view(n_blocks, 16, 16)
-
-    # Find max abs per sub-block (symmetric quantization)
-    max_abs = sub_blocks.abs().max(dim=2).values  # [n_blocks, 16]
-    scales = max_abs / 31.0  # 6-bit symmetric = -32 to 31
-
-    # Super-block scale
-    max_scale = scales.abs().max(dim=1).values  # [n_blocks]
-    d = max_scale / 127.0  # 8-bit scales
-
-    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
-
-    # Quantize scales to 8-bit signed
-    q_scales = (scales * inv_d.unsqueeze(1)).round().clamp(-128, 127).to(torch.int8)
-
-    # Quantize values
-    eff_scales = (d.unsqueeze(1) * q_scales.float()).unsqueeze(2)  # [n_blocks, 16, 1]
-    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
-    qs = (sub_blocks * inv_eff_scales).round().clamp(-32, 31).to(torch.int8) + 32  # shift to 0-63
-    qs = qs.to(torch.uint8)
-
-    # Move to CPU
-    d_cpu = d.half().cpu().numpy()
-    q_scales_cpu = q_scales.cpu().numpy()
-    qs_cpu = qs.cpu().numpy().reshape(n_blocks, 256)
-
-    # Pack into output (210 bytes per block)
-    output = np.zeros((n_blocks, 210), dtype=np.uint8)
-
-    # ql: lower 4 bits (128 bytes, positions 0-128)
-    for i in range(128):
-        output[:, i] = (qs_cpu[:, i * 2] & 0xF) | ((qs_cpu[:, i * 2 + 1] & 0xF) << 4)
-
-    # qh: upper 2 bits (64 bytes, positions 128-192)
-    for i in range(256):
-        qh_byte = i // 4
-        qh_shift = (i % 4) * 2
-        output[:, 128 + qh_byte] |= ((qs_cpu[:, i] >> 4) & 0x3) << qh_shift
-
-    # scales (16 bytes, positions 192-208)
-    output[:, 192:208] = q_scales_cpu.view(np.uint8).reshape(n_blocks, 16)
-
-    # d as float16 (2 bytes, positions 208-210)
-    output[:, 208:210] = d_cpu.view(np.uint8).reshape(n_blocks, 2)
-
-    return output.ravel()
-
-
-def quantize_q4_k(data: np.ndarray) -> np.ndarray:
-    """Quantize float32 data to Q4_K format.
+    Input: [n_rows, n_cols] float32 array where n_cols must be multiple of 256
+    Output: [n_rows, n_cols//256 * 144] uint8 array
 
     Q4_K block structure (144 bytes per 256 elements):
     - d: float16 (2 bytes) - super-block scale
@@ -199,125 +48,99 @@ def quantize_q4_k(data: np.ndarray) -> np.ndarray:
     - qs: uint8[128] - 4-bit quantized values (2 per byte)
     """
     assert data.dtype == np.float32
+    original_shape = data.shape
 
-    # Reshape to super-blocks of 256 elements
-    n_elements = data.size
-    n_blocks = (n_elements + QK_K - 1) // QK_K
+    # Handle 1D case
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
 
-    # Pad to multiple of QK_K
-    padded_size = n_blocks * QK_K
-    if padded_size > n_elements:
-        data = np.pad(data.ravel(), (0, padded_size - n_elements), mode='constant')
-    else:
-        data = data.ravel()
+    n_rows, n_cols = data.shape
+    assert n_cols % QK_K == 0, f"Columns ({n_cols}) must be multiple of {QK_K}"
 
-    data = data.reshape(n_blocks, QK_K)
+    n_blocks_per_row = n_cols // QK_K
+    bytes_per_row = n_blocks_per_row * Q4_K_BLOCK_SIZE
 
-    # Output: 144 bytes per block (2 + 2 + 12 + 128)
-    output = np.zeros((n_blocks, 144), dtype=np.uint8)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = torch.from_numpy(data).to(device)
 
-    for block_idx in range(n_blocks):
-        block = data[block_idx]
+    # Reshape to [n_rows, n_blocks_per_row, QK_K]
+    tensor = tensor.view(n_rows, n_blocks_per_row, QK_K)
 
-        # Divide into 8 sub-blocks of 32 elements
-        sub_blocks = block.reshape(8, 32)
+    # Reshape to [n_rows, n_blocks_per_row, 8, 32] for sub-blocks
+    sub_blocks = tensor.view(n_rows, n_blocks_per_row, 8, 32)
 
-        # Find scales and mins for each sub-block
-        scales = np.zeros(8, dtype=np.float32)
-        mins = np.zeros(8, dtype=np.float32)
+    # Find min/max per sub-block (vectorized)
+    sb_mins = sub_blocks.min(dim=3).values  # [n_rows, n_blocks, 8]
+    sb_maxs = sub_blocks.max(dim=3).values
 
-        for i in range(8):
-            sb = sub_blocks[i]
-            sb_min = sb.min()
-            sb_max = sb.max()
+    # Compute scales per sub-block
+    scales = (sb_maxs - sb_mins) / 15.0
+    scales = torch.where(sb_maxs != sb_mins, scales, torch.zeros_like(scales))
+    mins = sb_mins
 
-            mins[i] = sb_min
-            if sb_max != sb_min:
-                scales[i] = (sb_max - sb_min) / 15.0  # 4-bit = 0-15
-            else:
-                scales[i] = 0.0
+    # Super-block scales
+    max_scale = scales.abs().max(dim=2).values  # [n_rows, n_blocks]
+    max_min = mins.abs().max(dim=2).values
 
-        # Find super-block scale for scales
-        max_scale = np.abs(scales).max()
-        max_min = np.abs(mins).max()
+    d = max_scale / 63.0
+    dmin = max_min / 63.0
 
-        if max_scale > 0:
-            d = max_scale / 63.0  # 6-bit scales
-            inv_d = 1.0 / d
-        else:
-            d = 0.0
-            inv_d = 0.0
+    # Avoid division by zero
+    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+    inv_dmin = torch.where(dmin > 0, 1.0 / dmin, torch.zeros_like(dmin))
 
-        if max_min > 0:
-            dmin = max_min / 63.0  # 6-bit mins
-            inv_dmin = 1.0 / dmin
-        else:
-            dmin = 0.0
-            inv_dmin = 0.0
+    # Quantize scales/mins to 6-bit
+    q_scales = (scales * inv_d.unsqueeze(2)).round().clamp(0, 63).to(torch.uint8)
+    q_mins = ((-mins) * inv_dmin.unsqueeze(2)).round().clamp(0, 63).to(torch.uint8)
 
-        # Quantize sub-block scales/mins to 6-bit
-        q_scales = np.zeros(8, dtype=np.uint8)
-        q_mins = np.zeros(8, dtype=np.uint8)
+    # Quantize values to 4-bit
+    eff_scales = (d.unsqueeze(2) * q_scales.float()).unsqueeze(3)
+    eff_mins = (dmin.unsqueeze(2) * q_mins.float()).unsqueeze(3)
+    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
+    qs = ((sub_blocks + eff_mins) * inv_eff_scales).round().clamp(0, 15).to(torch.uint8)
 
-        for i in range(8):
-            if d > 0:
-                q_scales[i] = min(63, int(np.round(scales[i] * inv_d)))
-            if dmin > 0:
-                q_mins[i] = min(63, int(np.round(-mins[i] * inv_dmin)))
+    # Move to CPU for packing
+    d_cpu = d.half().cpu().numpy()
+    dmin_cpu = dmin.half().cpu().numpy()
+    q_scales_cpu = q_scales.cpu().numpy()
+    q_mins_cpu = q_mins.cpu().numpy()
+    qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
 
-        # Store d and dmin as float16
-        d_f16 = np.float16(d)
-        dmin_f16 = np.float16(dmin)
-        output[block_idx, 0:2] = np.frombuffer(d_f16.tobytes(), dtype=np.uint8)
-        output[block_idx, 2:4] = np.frombuffer(dmin_f16.tobytes(), dtype=np.uint8)
+    # Pack into output [n_rows, bytes_per_row]
+    output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
 
-        # Pack scales (6-bit) into 12 bytes
-        # Layout: scales[0-3] low 4 bits, scales[4-7] low 4 bits,
-        #         mins[0-3] low 4 bits, mins[4-7] low 4 bits,
-        #         scales[0-3] high 2 bits + mins[0-3] high 2 bits,
-        #         scales[4-7] high 2 bits + mins[4-7] high 2 bits
-        scales_bytes = np.zeros(12, dtype=np.uint8)
+    for blk in range(n_blocks_per_row):
+        offset = blk * Q4_K_BLOCK_SIZE
 
+        # d and dmin (bytes 0-4)
+        output[:, offset:offset+2] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
+        output[:, offset+2:offset+4] = dmin_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
+
+        # Pack scales (6-bit) into 12 bytes (bytes 4-16)
         for i in range(4):
-            scales_bytes[i] = (q_scales[i] & 0xF) | ((q_scales[i + 4] & 0xF) << 4)
+            output[:, offset+4+i] = (q_scales_cpu[:, blk, i] & 0xF) | ((q_scales_cpu[:, blk, i+4] & 0xF) << 4)
         for i in range(4):
-            scales_bytes[4 + i] = (q_mins[i] & 0xF) | ((q_mins[i + 4] & 0xF) << 4)
+            output[:, offset+8+i] = (q_mins_cpu[:, blk, i] & 0xF) | ((q_mins_cpu[:, blk, i+4] & 0xF) << 4)
         for i in range(4):
-            scales_bytes[8 + i] = ((q_scales[i] >> 4) & 0x3) | (((q_scales[i + 4] >> 4) & 0x3) << 2) | \
-                                  (((q_mins[i] >> 4) & 0x3) << 4) | (((q_mins[i + 4] >> 4) & 0x3) << 6)
+            output[:, offset+12+i] = ((q_scales_cpu[:, blk, i] >> 4) & 0x3) | \
+                                     (((q_scales_cpu[:, blk, i+4] >> 4) & 0x3) << 2) | \
+                                     (((q_mins_cpu[:, blk, i] >> 4) & 0x3) << 4) | \
+                                     (((q_mins_cpu[:, blk, i+4] >> 4) & 0x3) << 6)
 
-        output[block_idx, 4:16] = scales_bytes
+        # Pack quantized values (4-bit) into 128 bytes (bytes 16-144)
+        for i in range(128):
+            output[:, offset+16+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
 
-        # Quantize values to 4-bit
-        qs = np.zeros(128, dtype=np.uint8)
-
-        for i in range(8):
-            sb = sub_blocks[i]
-            sc = d * q_scales[i]
-            mn = dmin * q_mins[i]
-
-            for j in range(32):
-                val = sb[j]
-                if sc > 0:
-                    q = int(np.round((val + mn) / sc))
-                    q = max(0, min(15, q))
-                else:
-                    q = 0
-
-                # Pack two 4-bit values per byte
-                byte_idx = (i * 32 + j) // 2
-                if j % 2 == 0:
-                    qs[byte_idx] = q
-                else:
-                    qs[byte_idx] |= (q << 4)
-
-        output[block_idx, 16:144] = qs
-
-    return output.ravel()
+    if len(original_shape) == 1:
+        return output.ravel()
+    return output
 
 
-def quantize_q6_k(data: np.ndarray) -> np.ndarray:
-    """Quantize float32 data to Q6_K format.
+def quantize_q6_k_rows(data: np.ndarray) -> np.ndarray:
+    """Quantize 2D float32 data to Q6_K format, row by row.
+
+    Input: [n_rows, n_cols] float32 array where n_cols must be multiple of 256
+    Output: [n_rows, n_cols//256 * 210] uint8 array
 
     Q6_K block structure (210 bytes per 256 elements):
     - ql: uint8[128] - lower 4 bits of 6-bit quants
@@ -326,110 +149,113 @@ def quantize_q6_k(data: np.ndarray) -> np.ndarray:
     - d: float16 (2 bytes) - super-block scale
     """
     assert data.dtype == np.float32
+    original_shape = data.shape
 
-    # Reshape to super-blocks of 256 elements
-    n_elements = data.size
-    n_blocks = (n_elements + QK_K - 1) // QK_K
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
 
-    # Pad to multiple of QK_K
-    padded_size = n_blocks * QK_K
-    if padded_size > n_elements:
-        data = np.pad(data.ravel(), (0, padded_size - n_elements), mode='constant')
-    else:
-        data = data.ravel()
+    n_rows, n_cols = data.shape
+    assert n_cols % QK_K == 0, f"Columns ({n_cols}) must be multiple of {QK_K}"
 
-    data = data.reshape(n_blocks, QK_K)
+    n_blocks_per_row = n_cols // QK_K
+    bytes_per_row = n_blocks_per_row * Q6_K_BLOCK_SIZE
 
-    # Output: 210 bytes per block (128 + 64 + 16 + 2)
-    output = np.zeros((n_blocks, 210), dtype=np.uint8)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = torch.from_numpy(data).to(device)
 
-    for block_idx in range(n_blocks):
-        block = data[block_idx]
+    # Reshape to [n_rows, n_blocks_per_row, 16, 16]
+    sub_blocks = tensor.view(n_rows, n_blocks_per_row, 16, 16)
 
-        # Divide into 16 sub-blocks of 16 elements
-        sub_blocks = block.reshape(16, 16)
+    # Find max abs per sub-block (symmetric quantization)
+    max_abs = sub_blocks.abs().max(dim=3).values  # [n_rows, n_blocks, 16]
+    scales = max_abs / 31.0
 
-        # Find scales for each sub-block (symmetric quantization)
-        scales = np.zeros(16, dtype=np.float32)
+    # Super-block scale
+    max_scale = scales.abs().max(dim=2).values  # [n_rows, n_blocks]
+    d = max_scale / 127.0
 
-        for i in range(16):
-            sb = sub_blocks[i]
-            max_abs = np.abs(sb).max()
-            if max_abs > 0:
-                scales[i] = max_abs / 31.0  # 6-bit symmetric = -32 to 31
+    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
 
-        # Find super-block scale
-        max_scale = np.abs(scales).max()
+    # Quantize scales to 8-bit signed
+    q_scales = (scales * inv_d.unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
 
-        if max_scale > 0:
-            d = max_scale / 127.0  # 8-bit scales
-            inv_d = 1.0 / d
-        else:
-            d = 0.0
-            inv_d = 0.0
+    # Quantize values
+    eff_scales = (d.unsqueeze(2) * q_scales.float()).unsqueeze(3)
+    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
+    qs = (sub_blocks * inv_eff_scales).round().clamp(-32, 31).to(torch.int8) + 32
+    qs = qs.to(torch.uint8)
 
-        # Quantize sub-block scales to 8-bit signed
-        q_scales = np.zeros(16, dtype=np.int8)
-        for i in range(16):
-            if d > 0:
-                q_scales[i] = max(-128, min(127, int(np.round(scales[i] * inv_d))))
+    # Move to CPU
+    d_cpu = d.half().cpu().numpy()
+    q_scales_cpu = q_scales.cpu().numpy()
+    qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
 
-        # Quantize values to 6-bit symmetric (-32 to 31)
-        ql = np.zeros(128, dtype=np.uint8)  # lower 4 bits
-        qh = np.zeros(64, dtype=np.uint8)   # upper 2 bits
+    # Pack into output
+    output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
 
-        for i in range(16):
-            sb = sub_blocks[i]
-            sc = d * q_scales[i]
+    for blk in range(n_blocks_per_row):
+        offset = blk * Q6_K_BLOCK_SIZE
 
-            for j in range(16):
-                val = sb[j]
-                if sc > 0:
-                    q = int(np.round(val / sc))
-                    q = max(-32, min(31, q)) + 32  # shift to 0-63
-                else:
-                    q = 32  # zero
+        # ql: lower 4 bits (128 bytes)
+        for i in range(128):
+            output[:, offset+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
 
-                # Element index in block
-                elem_idx = i * 16 + j
+        # qh: upper 2 bits (64 bytes)
+        for i in range(256):
+            qh_byte = i // 4
+            qh_shift = (i % 4) * 2
+            output[:, offset+128+qh_byte] |= ((qs_cpu[:, blk, i] >> 4) & 0x3) << qh_shift
 
-                # Store lower 4 bits
-                byte_idx = elem_idx // 2
-                if elem_idx % 2 == 0:
-                    ql[byte_idx] = q & 0xF
-                else:
-                    ql[byte_idx] |= (q & 0xF) << 4
+        # scales (16 bytes)
+        output[:, offset+192:offset+208] = q_scales_cpu[:, blk].view(np.uint8).reshape(n_rows, 16)
 
-                # Store upper 2 bits
-                qh_byte_idx = elem_idx // 4
-                qh_bit_offset = (elem_idx % 4) * 2
-                qh[qh_byte_idx] |= ((q >> 4) & 0x3) << qh_bit_offset
+        # d as float16 (2 bytes)
+        output[:, offset+208:offset+210] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
 
-        # Pack output
-        output[block_idx, 0:128] = ql
-        output[block_idx, 128:192] = qh
-        output[block_idx, 192:208] = q_scales.view(np.uint8)
-        d_f16 = np.float16(d)
-        output[block_idx, 208:210] = np.frombuffer(d_f16.tobytes(), dtype=np.uint8)
+    if len(original_shape) == 1:
+        return output.ravel()
+    return output
 
-    return output.ravel()
+
+def pad_to_quantize(data: np.ndarray) -> tuple[np.ndarray, tuple]:
+    """Pad tensor so last dimension is multiple of QK_K (256).
+
+    Returns (padded_data, original_shape).
+    """
+    original_shape = data.shape
+
+    if data.ndim == 1:
+        n_cols = data.shape[0]
+        pad_cols = (QK_K - (n_cols % QK_K)) % QK_K
+        if pad_cols > 0:
+            data = np.pad(data, (0, pad_cols), mode='constant')
+        return data, original_shape
+
+    # 2D or higher: pad last dimension
+    n_cols = data.shape[-1]
+    pad_cols = (QK_K - (n_cols % QK_K)) % QK_K
+    if pad_cols > 0:
+        pad_width = [(0, 0)] * (data.ndim - 1) + [(0, pad_cols)]
+        data = np.pad(data, pad_width, mode='constant')
+
+    return data, original_shape
 
 
 def quantize_tensor(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
     """Quantize a tensor using the specified quantization type.
 
-    Uses CUDA-accelerated implementation for K-quants when available.
+    Uses CUDA-accelerated implementation for K-quants.
+    Handles padding to block boundaries automatically.
     """
+    # Pad to block boundary
+    padded_data, original_shape = pad_to_quantize(data)
+
     if qtype == GGMLQuantizationType.Q4_K:
-        if torch.cuda.is_available():
-            return quantize_q4_k_cuda(data)
-        return quantize_q4_k(data)
+        return quantize_q4_k_rows(padded_data)
     elif qtype == GGMLQuantizationType.Q6_K:
-        if torch.cuda.is_available():
-            return quantize_q6_k_cuda(data)
-        return quantize_q6_k(data)
+        return quantize_q6_k_rows(padded_data)
     else:
-        # Fall back to gguf library for basic quants
+        # Fall back to gguf library for basic quants (Q4_0, Q8_0, etc.)
         return gguf.quants.quantize(data, qtype)
 
 # ---------------------------------------------------------------------------

@@ -36,10 +36,10 @@ Q6_K_BLOCK_SIZE = 210  # bytes per Q6_K block
 
 
 def quantize_q4_k_rows(data: np.ndarray) -> np.ndarray:
-    """Quantize 2D float32 data to Q4_K format, row by row.
+    """Quantize float32 data to Q4_K format, row by row.
 
-    Input: [n_rows, n_cols] float32 array where n_cols must be multiple of 256
-    Output: [n_rows, n_cols//256 * 144] uint8 array
+    Input: [..., n_cols] float32 array where n_cols must be multiple of 256
+    Output: [..., n_cols//256 * 144] uint8 array
 
     Q4_K block structure (144 bytes per 256 elements):
     - d: float16 (2 bytes) - super-block scale
@@ -53,6 +53,9 @@ def quantize_q4_k_rows(data: np.ndarray) -> np.ndarray:
     # Handle 1D case
     if data.ndim == 1:
         data = data.reshape(1, -1)
+    elif data.ndim > 2:
+        # Flatten all but last dimension
+        data = data.reshape(-1, data.shape[-1])
 
     n_rows, n_cols = data.shape
     assert n_cols % QK_K == 0, f"Columns ({n_cols}) must be multiple of {QK_K}"
@@ -137,10 +140,10 @@ def quantize_q4_k_rows(data: np.ndarray) -> np.ndarray:
 
 
 def quantize_q6_k_rows(data: np.ndarray) -> np.ndarray:
-    """Quantize 2D float32 data to Q6_K format, row by row.
+    """Quantize float32 data to Q6_K format, row by row.
 
-    Input: [n_rows, n_cols] float32 array where n_cols must be multiple of 256
-    Output: [n_rows, n_cols//256 * 210] uint8 array
+    Input: [..., n_cols] float32 array where n_cols must be multiple of 256
+    Output: [..., n_cols//256 * 210] uint8 array
 
     Q6_K block structure (210 bytes per 256 elements):
     - ql: uint8[128] - lower 4 bits of 6-bit quants
@@ -153,6 +156,9 @@ def quantize_q6_k_rows(data: np.ndarray) -> np.ndarray:
 
     if data.ndim == 1:
         data = data.reshape(1, -1)
+    elif data.ndim > 2:
+        # Flatten all but last dimension
+        data = data.reshape(-1, data.shape[-1])
 
     n_rows, n_cols = data.shape
     assert n_cols % QK_K == 0, f"Columns ({n_cols}) must be multiple of {QK_K}"

@@ -312,7 +312,14 @@ def write_tokenizer(writer: GGUFWriter, model_dir: Path):
     # Merges
     merges = model_data.get("merges", [])
     if merges:
-        writer.add_token_merges([m.encode("utf-8") for m in merges])
+        # Merges can be strings ("a b") or lists (["a", "b"])
+        encoded = []
+        for m in merges:
+            if isinstance(m, list):
+                encoded.append(" ".join(m).encode("utf-8"))
+            else:
+                encoded.append(m.encode("utf-8"))
+        writer.add_token_merges(encoded)
 
     # Special token IDs
     eos_token = tokenizer_config.get("eos_token")

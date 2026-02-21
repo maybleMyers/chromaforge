@@ -10,7 +10,8 @@ import argparse
 from pathlib import Path
 
 import gguf
-from gguf import GGUFReader, GGUFWriter
+from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
+from gguf.gguf_writer import TensorInfo
 import numpy as np
 
 
@@ -70,14 +71,17 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
                 val = parts[0]
                 t = types[0]
 
+                # Handle numpy arrays - extract scalar
+                if isinstance(val, np.ndarray):
+                    if val.size == 1:
+                        val = val.flat[0]
+                    elif t == gguf.GGUFValueType.STRING:
+                        val = bytes(val).decode('utf-8').rstrip('\x00')
+
                 if t == gguf.GGUFValueType.STRING:
-                    if isinstance(val, np.ndarray):
-                        s = bytes(val).decode('utf-8').rstrip('\x00')
-                    elif isinstance(val, bytes):
-                        s = val.decode('utf-8').rstrip('\x00')
-                    else:
-                        s = str(val)
-                    writer.add_string(name, s)
+                    if isinstance(val, bytes):
+                        val = val.decode('utf-8').rstrip('\x00')
+                    writer.add_string(name, str(val))
                 elif t == gguf.GGUFValueType.UINT32:
                     writer.add_uint32(name, int(val))
                 elif t == gguf.GGUFValueType.INT32:
@@ -121,36 +125,38 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
         except Exception as e:
             print(f"  [WARN] Skipping metadata {name}: {e}")
 
-    # Build tensor info directly, bypassing shape inference
-    print("Adding tensor info...")
+    # Process tensors - add directly to writer.tensors[0] dict using TensorInfo
+    print("Processing tensors...")
     total = len(reader.tensors)
+    tensor_dict = writer.tensors[0]  # All tensors go in this dict
 
     for i, tensor in enumerate(reader.tensors):
         name = tensor.name
-        shape = list(tensor.shape)
+        shape = tuple(tensor.shape)
         dtype = tensor.tensor_type
-        data = np.array(tensor.data)  # Copy to ensure contiguous
-        n_bytes = len(data.tobytes())
+        data = tensor.data
+        n_bytes = tensor.n_bytes
 
         # Fix 5D -> 4D by merging dims 1 and 2
         if name in tensors_to_fix and len(shape) == 5:
-            old_shape = shape.copy()
+            old_shape = shape
             # [d0, d1, d2, d3, d4] -> [d0, d1*d2, d3, d4]
-            shape = [shape[0], shape[1] * shape[2], shape[3], shape[4]]
-            print(f"  [{i+1}/{total}] FIXING {name}: {old_shape} -> {shape}")
+            shape = (shape[0], shape[1] * shape[2], shape[3], shape[4])
+            print(f"  [{i+1}/{total}] FIXING {name}: {list(old_shape)} -> {list(shape)}")
 
-        # Directly append to internal structures, bypassing add_tensor_info
-        # ti_data entries: (encoded_name, n_dims, shape_array, dtype_value, offset)
-        encoded_name = name.encode('utf-8')
-        shape_arr = np.array(shape, dtype=np.uint64)
-        dtype_val = dtype.value if hasattr(dtype, 'value') else int(dtype)
+        # Create TensorInfo directly, bypassing shape inference
+        # The data stays as raw bytes, we just fix the shape metadata
+        tensor_dict[name] = TensorInfo(
+            shape=shape,
+            dtype=dtype,
+            nbytes=n_bytes,
+            tensor=np.array(data),  # Ensure it's a proper numpy array
+        )
 
-        # The offset is computed during write, so we use 0 as placeholder
-        writer.ti_data.append((encoded_name, len(shape), shape_arr, dtype_val, 0))
-        writer.tensors.append(data)
-
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 100 == 0:
             print(f"  Progress: {i+1}/{total} tensors...")
+
+    print(f"  Total: {len(tensor_dict)} tensors")
 
     print("Writing file...")
     writer.write_header_to_file()

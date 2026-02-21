@@ -113,8 +113,8 @@ def quantize_q4_k_rows(data: np.ndarray) -> np.ndarray:
         offset = blk * Q4_K_BLOCK_SIZE
 
         # d and dmin (bytes 0-4)
-        output[:, offset:offset+2] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
-        output[:, offset+2:offset+4] = dmin_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
+        output[:, offset:offset+2] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+        output[:, offset+2:offset+4] = np.ascontiguousarray(dmin_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
 
         # Pack scales (6-bit) into 12 bytes (bytes 4-16)
         for i in range(4):
@@ -207,10 +207,10 @@ def quantize_q6_k_rows(data: np.ndarray) -> np.ndarray:
             output[:, offset+128+qh_byte] |= ((qs_cpu[:, blk, i] >> 4) & 0x3) << qh_shift
 
         # scales (16 bytes)
-        output[:, offset+192:offset+208] = q_scales_cpu[:, blk].view(np.uint8).reshape(n_rows, 16)
+        output[:, offset+192:offset+208] = np.ascontiguousarray(q_scales_cpu[:, blk]).view(np.uint8).reshape(n_rows, 16)
 
         # d as float16 (2 bytes)
-        output[:, offset+208:offset+210] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
+        output[:, offset+208:offset+210] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
 
     if len(original_shape) == 1:
         return output.ravel()

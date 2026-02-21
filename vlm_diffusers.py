@@ -2922,11 +2922,7 @@ def create_ui():
     initial_models = vlm_backend.get_model_names() if vlm_backend else ["Initialize backend first"]
     num_gpus = vlm_backend.num_gpus if vlm_backend else 0
 
-    # Gradio 6.x: theme and css moved from Blocks() to launch()
-    with gr.Blocks(title="Chromaforge VLM (Diffusers)") as demo:
-        # Store theme/css for launch()
-        demo._vlm_theme = vlm_theme
-        demo._vlm_css = vlm_css
+    with gr.Blocks(title="Chromaforge VLM (Diffusers)", theme=vlm_theme, css=vlm_css) as demo:
         gr.Markdown("# Chromaforge VLM Chat (Diffusers/Transformers Backend)")
 
         with gr.Tabs():
@@ -3444,13 +3440,10 @@ def main():
 
     # Create and launch the UI
     demo = create_ui()
-    # Gradio 6.x: theme and css passed to launch() instead of Blocks()
     demo.launch(
         server_name=host,
         server_port=args.port,
         share=args.share,
-        theme=getattr(demo, '_vlm_theme', None),
-        css=getattr(demo, '_vlm_css', None),
     )
 
 

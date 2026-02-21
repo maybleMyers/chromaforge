@@ -782,13 +782,15 @@ def convert(model_dir: Path, output_path: Path):
 
         if qtype == GGMLQuantizationType.F32:
             data = bf16_tensor_to_f32_numpy(tensor)
+            writer.add_tensor(gguf_name, data, raw_shape=shape)
         elif qtype == GGMLQuantizationType.F16:
             data = bf16_tensor_to_f16_numpy(tensor)
+            writer.add_tensor(gguf_name, data, raw_shape=shape)
         else:
             data = bf16_tensor_to_f32_numpy(tensor)
             data = quantize_tensor(data, qtype)
-
-        writer.add_tensor(gguf_name, data, raw_shape=shape, raw_dtype=qtype)
+            # Don't pass raw_shape with raw_dtype - library derives element shape from byte shape
+            writer.add_tensor(gguf_name, data, raw_dtype=qtype)
         tensor_count += 1
         print(f"  [{tensor_count}] {gguf_name} {shape} → {qtype.name}")
 
@@ -837,13 +839,14 @@ def convert(model_dir: Path, output_path: Path):
 
             if qtype == GGMLQuantizationType.F32:
                 data = bf16_tensor_to_f32_numpy(tensor)
+                writer.add_tensor(gguf_name, data, raw_shape=shape)
             elif qtype == GGMLQuantizationType.F16:
                 data = bf16_tensor_to_f16_numpy(tensor)
+                writer.add_tensor(gguf_name, data, raw_shape=shape)
             else:
                 data = bf16_tensor_to_f32_numpy(tensor)
                 data = quantize_tensor(data, qtype)
-
-            writer.add_tensor(gguf_name, data, raw_shape=shape, raw_dtype=qtype)
+                writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             tensor_count += 1
 
         # Process expert tensors (merge all experts per projection type)
@@ -875,10 +878,10 @@ def convert(model_dir: Path, output_path: Path):
 
             if qtype == GGMLQuantizationType.F32:
                 data = merged
+                writer.add_tensor(gguf_name, data, raw_shape=merged_shape)
             else:
                 data = quantize_tensor(merged, qtype)
-
-            writer.add_tensor(gguf_name, data, raw_shape=merged_shape, raw_dtype=qtype)
+                writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             tensor_count += 1
 
             # Free memory

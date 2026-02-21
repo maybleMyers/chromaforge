@@ -351,13 +351,21 @@ try:
     from transformers import (
         AutoProcessor,
         AutoModel,
-        AutoModelForVision2Seq,
         AutoModelForCausalLM,
         AutoTokenizer,
         BitsAndBytesConfig,
-        Qwen2_5_VLForConditionalGeneration,
-        Qwen2VLForConditionalGeneration,
     )
+    # AutoModelForVision2Seq renamed to AutoModelForImageTextToText in transformers 5.x
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+    # Qwen2/2.5 classes may not exist in newer transformers
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLForConditionalGeneration
+    except ImportError:
+        Qwen2_5_VLForConditionalGeneration = None
+        Qwen2VLForConditionalGeneration = None
     TRANSFORMERS_AVAILABLE = True
     print(f"Transformers version: {transformers.__version__}")
 

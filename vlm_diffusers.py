@@ -1062,22 +1062,13 @@ class Qwen3VLMBackend:
                     print(f"Loaded as GLM-{glm_version} model")
                     loaded = True
 
-                # For Qwen3-VL models, use AutoModelForVision2Seq which loads model's custom code
-                # This is critical because Qwen3-VL has different architecture than Qwen2.5-VL
-                if not loaded and model_type_from_config == "qwen3_vl":
-                    print("Loading as Qwen3-VL model using AutoModelForVision2Seq...")
+                # For Qwen3-VL and Qwen3.5 MoE models, use AutoModelForVision2Seq
+                # which auto-resolves to the correct class (Qwen3_5MoeForConditionalGeneration, etc.)
+                if not loaded and model_type_from_config in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5_moe", "qwen3_5"]:
+                    print(f"Loading as Qwen3 VL model (type: {model_type_from_config}) using AutoModelForVision2Seq...")
                     self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
-                    print("Loaded as Qwen3-VL model (via AutoModelForVision2Seq)")
+                    print(f"Loaded as Qwen3 VL model (type: {model_type_from_config})")
                     loaded = True
-
-                # For Qwen3-VL MoE models
-                if not loaded and QWEN3_VL_AVAILABLE and model_type_from_config == "qwen3_vl_moe":
-                    try:
-                        self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(**model_kwargs)
-                        print("Loaded as Qwen3-VL MoE model")
-                        loaded = True
-                    except Exception as e:
-                        print(f"Qwen3-VL MoE load failed: {e}, trying fallback...")
 
                 # For Qwen2.5-VL models
                 if not loaded and model_type_from_config in ["qwen2_5_vl", "qwen2_vl"]:
@@ -2930,7 +2921,9 @@ def create_ui():
     initial_models = vlm_backend.get_model_names() if vlm_backend else ["Initialize backend first"]
     num_gpus = vlm_backend.num_gpus if vlm_backend else 0
 
-    with gr.Blocks(title="Chromaforge VLM (Diffusers)", theme=vlm_theme, css=vlm_css) as demo:
+    with gr.Blocks(title="Chromaforge VLM (Diffusers)") as demo:
+        demo._vlm_theme = vlm_theme
+        demo._vlm_css = vlm_css
         gr.Markdown("# Chromaforge VLM Chat (Diffusers/Transformers Backend)")
 
         with gr.Tabs():
@@ -3452,6 +3445,8 @@ def main():
         server_name=host,
         server_port=args.port,
         share=args.share,
+        theme=getattr(demo, '_vlm_theme', None),
+        css=getattr(demo, '_vlm_css', None),
     )
 
 

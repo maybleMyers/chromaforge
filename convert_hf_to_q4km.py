@@ -247,12 +247,68 @@ def pad_to_quantize(data: np.ndarray) -> tuple[np.ndarray, tuple]:
     return data, original_shape
 
 
+# Maximum rows to process at once (tune based on GPU memory)
+# For 32GB GPU, 64K rows of 4096 elements = 1GB per chunk
+MAX_ROWS_PER_CHUNK = 65536
+
+
+def quantize_tensor_chunked(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    """Quantize a large tensor in chunks to avoid OOM.
+
+    Processes MAX_ROWS_PER_CHUNK rows at a time.
+    """
+    # Pad to block boundary
+    padded_data, original_shape = pad_to_quantize(data)
+
+    # Flatten to 2D for chunked processing
+    if padded_data.ndim == 1:
+        padded_data = padded_data.reshape(1, -1)
+    elif padded_data.ndim > 2:
+        padded_data = padded_data.reshape(-1, padded_data.shape[-1])
+
+    n_rows, n_cols = padded_data.shape
+    n_blocks_per_row = n_cols // QK_K
+
+    if qtype == GGMLQuantizationType.Q4_K:
+        bytes_per_row = n_blocks_per_row * Q4_K_BLOCK_SIZE
+        quant_func = quantize_q4_k_rows
+    elif qtype == GGMLQuantizationType.Q6_K:
+        bytes_per_row = n_blocks_per_row * Q6_K_BLOCK_SIZE
+        quant_func = quantize_q6_k_rows
+    else:
+        raise ValueError(f"Unsupported quantization type for chunked: {qtype}")
+
+    # Process in chunks
+    output_chunks = []
+    for start_row in range(0, n_rows, MAX_ROWS_PER_CHUNK):
+        end_row = min(start_row + MAX_ROWS_PER_CHUNK, n_rows)
+        chunk = padded_data[start_row:end_row]
+
+        # Quantize chunk
+        quantized_chunk = quant_func(chunk)
+        output_chunks.append(quantized_chunk)
+
+        # Clear CUDA cache between chunks
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Concatenate all chunks
+    return np.concatenate(output_chunks, axis=0)
+
+
 def quantize_tensor(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
     """Quantize a tensor using the specified quantization type.
 
     Uses CUDA-accelerated implementation for K-quants.
     Handles padding to block boundaries automatically.
+    Uses chunked processing for large tensors to avoid OOM.
     """
+    # For large tensors (>1GB), use chunked processing
+    tensor_size_bytes = data.nbytes
+    if tensor_size_bytes > 1024 * 1024 * 1024:  # 1GB threshold
+        print(f"    [Using chunked quantization for {tensor_size_bytes / (1024**3):.1f} GB tensor]")
+        return quantize_tensor_chunked(data, qtype)
+
     # Pad to block boundary
     padded_data, original_shape = pad_to_quantize(data)
 
@@ -459,11 +515,15 @@ def choose_quant_type(
 
     # Shared expert gate → F32 (1-D, already caught)
 
-    # First and last block weights → Q6_K
+    # Expert weights always use Q4_K (too large for Q6_K with 512 experts)
+    if "ffn_gate_exps" in gguf_name or "ffn_up_exps" in gguf_name or "ffn_down_exps" in gguf_name:
+        return GGMLQuantizationType.Q4_K
+
+    # First and last block non-expert weights → Q6_K
     if is_edge:
         return GGMLQuantizationType.Q6_K
 
-    # Everything else (attention projections, expert weights, shared expert weights) → Q4_K
+    # Everything else (attention projections, shared expert weights) → Q4_K
     return GGMLQuantizationType.Q4_K
 
 
@@ -672,19 +732,23 @@ def merge_experts(
 ) -> np.ndarray:
     """Merge individual expert tensors into a single stacked tensor [n_experts, ...].
 
-    Uses CUDA for the stacking operation.
+    Stacks on CPU to avoid OOM (512 experts = 8GB), then CUDA is used
+    for quantization in chunks.
     """
     tensors = []
     for i in range(num_experts):
         if i not in expert_tensors:
             raise ValueError(f"Missing expert {i}")
-        tensors.append(expert_tensors[i])
+        t = expert_tensors[i]
+        # Convert bf16 to f32 on CPU
+        if t.dtype == torch.bfloat16:
+            t = t.float()
+        elif t.dtype == torch.float16:
+            t = t.float()
+        tensors.append(t.cpu().numpy())
 
-    if torch.cuda.is_available():
-        stacked = torch.stack([t.cuda() for t in tensors]).float().cpu()
-    else:
-        stacked = torch.stack(tensors).float()
-    return stacked.numpy()
+    # Stack on CPU (stacking is cheap, quantization uses CUDA)
+    return np.stack(tensors, axis=0)
 
 
 # ---------------------------------------------------------------------------

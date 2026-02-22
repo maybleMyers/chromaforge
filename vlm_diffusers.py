@@ -369,6 +369,25 @@ try:
     TRANSFORMERS_AVAILABLE = True
     print(f"Transformers version: {transformers.__version__}")
 
+    # Monkey-patch bitsandbytes Params4bit/Int8Params to handle '_is_hf_initialized' kwarg
+    # This fixes compatibility between transformers 5.x and accelerate/bitsandbytes
+    try:
+        import bitsandbytes as bnb
+        # Patch Params4bit for Q4 loading
+        _original_params4bit_new = bnb.nn.Params4bit.__new__
+        def _patched_params4bit_new(cls, data=None, requires_grad=False, *args, **kwargs):
+            kwargs.pop('_is_hf_initialized', None)
+            return _original_params4bit_new(cls, data, requires_grad, *args, **kwargs)
+        bnb.nn.Params4bit.__new__ = _patched_params4bit_new
+        # Patch Int8Params for Q8 loading
+        _original_int8params_new = bnb.nn.Int8Params.__new__
+        def _patched_int8params_new(cls, data=None, requires_grad=False, *args, **kwargs):
+            kwargs.pop('_is_hf_initialized', None)
+            return _original_int8params_new(cls, data, requires_grad, *args, **kwargs)
+        bnb.nn.Int8Params.__new__ = _patched_int8params_new
+    except Exception:
+        pass  # bitsandbytes not installed or patch not needed
+
     # Try to import Qwen3 VL MoE class (requires newer transformers)
     try:
         from transformers import Qwen3VLMoeForConditionalGeneration

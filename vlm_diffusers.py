@@ -388,6 +388,22 @@ try:
     except Exception:
         pass  # bitsandbytes not installed or patch not needed
 
+    # Monkey-patch accelerate's set_module_tensor_to_device to handle bitsandbytes meta tensor issue
+    # When disk offloading MoE models, accelerate tries to move Params4bit to "meta" which fails
+    try:
+        import accelerate.utils.modeling as accel_modeling
+        _original_set_module_tensor = accel_modeling.set_module_tensor_to_device
+        def _patched_set_module_tensor(module, tensor_name, device, *args, **kwargs):
+            # Skip moving bitsandbytes quantized params to meta device - causes .item() errors
+            if device == "meta":
+                param = getattr(module, tensor_name, None)
+                if param is not None and type(param).__name__ in ('Params4bit', 'Int8Params'):
+                    return  # Skip - don't try to move quantized params to meta
+            return _original_set_module_tensor(module, tensor_name, device, *args, **kwargs)
+        accel_modeling.set_module_tensor_to_device = _patched_set_module_tensor
+    except Exception:
+        pass  # accelerate not available or patch not needed
+
     # Try to import Qwen3 VL MoE class (requires newer transformers)
     try:
         from transformers import Qwen3VLMoeForConditionalGeneration
@@ -1007,7 +1023,8 @@ class Qwen3VLMBackend:
                 print("[Q4] CPU offload enabled for layers that don't fit in VRAM")
                 model_kwargs["quantization_config"] = quantization_config
                 model_kwargs["device_map"] = device_map
-                # Note: do NOT set offload_folder - it triggers disk offload which has meta tensor bugs
+                # MoE models need offload_folder to re-save weights during disk offload
+                model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 

@@ -25,6 +25,144 @@ from safetensors import safe_open
 
 import gguf
 from gguf import GGUFWriter, GGMLQuantizationType
+import ctypes
+from ctypes import c_void_p, c_size_t, c_int, c_float, POINTER
+
+# ---------------------------------------------------------------------------
+# Load ggml library for native quantization
+# ---------------------------------------------------------------------------
+
+def load_ggml_lib():
+    """Load libggml for native quantization functions."""
+    import os
+    import glob
+
+    # Try common paths - look for both ggml and ggml-base
+    search_patterns = [
+        "llama.cpp/build/ggml/src/libggml*.so*",
+        "llama.cpp/build/src/libggml*.so*",
+        "llama.cpp/build/lib/libggml*.so*",
+        "llama.cpp/build/libggml*.so*",
+        "/usr/local/lib/libggml*.so*",
+        "/usr/lib/libggml*.so*",
+    ]
+
+    all_paths = []
+    for pattern in search_patterns:
+        all_paths.extend(glob.glob(pattern))
+
+    # Prefer libggml-base.so as it contains the quant functions
+    all_paths.sort(key=lambda x: (0 if 'base' in x else 1, x))
+
+    for path in all_paths:
+        try:
+            lib = ctypes.CDLL(path)
+            # Check if it has the quantization function
+            if hasattr(lib, 'ggml_quantize_q4_K'):
+                print(f"  Loaded ggml library: {path}")
+                return lib
+        except (OSError, AttributeError):
+            continue
+
+    return None
+
+GGML_LIB = None
+
+def init_ggml():
+    """Initialize ggml library and set up function signatures."""
+    global GGML_LIB
+
+    GGML_LIB = load_ggml_lib()
+    if GGML_LIB is None:
+        print("  [WARN] Could not load libggml.so, falling back to Python quantization")
+        return False
+
+    try:
+        # size_t ggml_quantize_q4_K(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix)
+        GGML_LIB.ggml_quantize_q4_K.argtypes = [
+            POINTER(c_float),  # src
+            c_void_p,          # dst
+            ctypes.c_int64,    # nrows
+            ctypes.c_int64,    # n_per_row
+            c_void_p,          # imatrix (can be NULL)
+        ]
+        GGML_LIB.ggml_quantize_q4_K.restype = c_size_t
+
+        GGML_LIB.ggml_quantize_q6_K.argtypes = [
+            POINTER(c_float),
+            c_void_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            c_void_p,
+        ]
+        GGML_LIB.ggml_quantize_q6_K.restype = c_size_t
+
+        return True
+    except AttributeError as e:
+        print(f"  [WARN] ggml library missing quantization functions: {e}")
+        GGML_LIB = None
+        return False
+
+def ggml_quantize_q4_k(data: np.ndarray) -> np.ndarray:
+    """Quantize float32 data to Q4_K using ggml library."""
+    assert data.dtype == np.float32
+
+    # Ensure contiguous
+    if not data.flags['C_CONTIGUOUS']:
+        data = np.ascontiguousarray(data)
+
+    # Flatten to 2D: [nrows, n_per_row]
+    original_shape = data.shape
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    elif data.ndim > 2:
+        data = data.reshape(-1, data.shape[-1])
+
+    nrows, n_per_row = data.shape
+
+    # Q4_K: 144 bytes per 256 elements
+    assert n_per_row % QK_K == 0, f"n_per_row ({n_per_row}) must be multiple of {QK_K}"
+    n_blocks = n_per_row // QK_K
+    output_bytes = nrows * n_blocks * Q4_K_BLOCK_SIZE
+
+    output = np.zeros(output_bytes, dtype=np.uint8)
+
+    # Call ggml
+    src_ptr = data.ctypes.data_as(POINTER(c_float))
+    dst_ptr = output.ctypes.data_as(c_void_p)
+
+    GGML_LIB.ggml_quantize_q4_K(src_ptr, dst_ptr, nrows, n_per_row, None)
+
+    return output
+
+def ggml_quantize_q6_k(data: np.ndarray) -> np.ndarray:
+    """Quantize float32 data to Q6_K using ggml library."""
+    assert data.dtype == np.float32
+
+    if not data.flags['C_CONTIGUOUS']:
+        data = np.ascontiguousarray(data)
+
+    original_shape = data.shape
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    elif data.ndim > 2:
+        data = data.reshape(-1, data.shape[-1])
+
+    nrows, n_per_row = data.shape
+
+    # Q6_K: 210 bytes per 256 elements
+    assert n_per_row % QK_K == 0
+    n_blocks = n_per_row // QK_K
+    output_bytes = nrows * n_blocks * Q6_K_BLOCK_SIZE
+
+    output = np.zeros(output_bytes, dtype=np.uint8)
+
+    src_ptr = data.ctypes.data_as(POINTER(c_float))
+    dst_ptr = output.ctypes.data_as(c_void_p)
+
+    GGML_LIB.ggml_quantize_q6_K(src_ptr, dst_ptr, nrows, n_per_row, None)
+
+    return output
 
 # ---------------------------------------------------------------------------
 # Native Q4_K / Q6_K quantization (gguf library doesn't implement K-quants)
@@ -300,30 +438,33 @@ def quantize_tensor_chunked(data: np.ndarray, qtype: GGMLQuantizationType) -> np
 def quantize_tensor(data: np.ndarray | torch.Tensor, qtype: GGMLQuantizationType) -> np.ndarray:
     """Quantize a tensor using the specified quantization type.
 
-    Uses CUDA-accelerated implementation for K-quants.
+    Uses native ggml library when available (fastest).
+    Falls back to CUDA-accelerated Python implementation.
     Handles padding to block boundaries automatically.
-    Uses chunked processing for large tensors to avoid OOM.
-    Accepts either numpy array or torch tensor (GPU tensor preferred for speed).
     """
     # Convert torch tensor to numpy if needed
     if isinstance(data, torch.Tensor):
         data = data.float().cpu().numpy()
 
-    # For large tensors (>1GB), use chunked processing
-    tensor_size_bytes = data.nbytes
-    if tensor_size_bytes > 1024 * 1024 * 1024:  # 1GB threshold
-        print(f"    [Using chunked quantization for {tensor_size_bytes / (1024**3):.1f} GB tensor]")
-        return quantize_tensor_chunked(data, qtype)
+    if not data.flags['C_CONTIGUOUS']:
+        data = np.ascontiguousarray(data)
 
     # Pad to block boundary
     padded_data, original_shape = pad_to_quantize(data)
 
+    # Use native ggml library if available (much faster)
+    if GGML_LIB is not None:
+        if qtype == GGMLQuantizationType.Q4_K:
+            return ggml_quantize_q4_k(padded_data)
+        elif qtype == GGMLQuantizationType.Q6_K:
+            return ggml_quantize_q6_k(padded_data)
+
+    # Fall back to Python implementation
     if qtype == GGMLQuantizationType.Q4_K:
         return quantize_q4_k_rows(padded_data)
     elif qtype == GGMLQuantizationType.Q6_K:
         return quantize_q6_k_rows(padded_data)
     else:
-        # Fall back to gguf library for basic quants (Q4_0, Q8_0, etc.)
         return gguf.quants.quantize(data, qtype)
 
 # ---------------------------------------------------------------------------
@@ -740,82 +881,51 @@ def merge_and_quantize_experts(
     num_experts: int,
     qtype: GGMLQuantizationType,
 ) -> tuple[np.ndarray, tuple]:
-    """Merge and quantize expert tensors in chunks to avoid OOM.
+    """Merge and quantize expert tensors.
 
     Returns (quantized_data, shape) tuple.
-    Processes experts in batches on GPU to stay within VRAM limits.
+    Uses native ggml quantization when available for maximum speed.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # Get shape from first expert
     first_expert = expert_tensors[0]
-    expert_shape = first_expert.shape  # e.g., (1024, 4096) for gate/up, (4096, 1024) for down
+    expert_shape = first_expert.shape
     merged_shape = (num_experts,) + tuple(expert_shape)
 
-    # For K-quants, calculate output size with padding
-    n_cols = expert_shape[-1]
+    # Stack all experts into one tensor (on CPU to avoid GPU OOM)
+    tensors = []
+    for i in range(num_experts):
+        t = expert_tensors[i].float().cpu().numpy()
+        tensors.append(t)
+    merged = np.stack(tensors, axis=0)  # [num_experts, ...]
+    del tensors
+
+    if qtype == GGMLQuantizationType.F32:
+        return merged, merged_shape
+
+    # Flatten and pad for quantization
+    n_cols = merged.shape[-1]
     pad_cols = (QK_K - (n_cols % QK_K)) % QK_K
-    padded_cols = n_cols + pad_cols
 
-    if qtype == GGMLQuantizationType.Q4_K:
-        n_blocks = padded_cols // QK_K
-        bytes_per_row = n_blocks * Q4_K_BLOCK_SIZE
-    elif qtype == GGMLQuantizationType.Q6_K:
-        n_blocks = padded_cols // QK_K
-        bytes_per_row = n_blocks * Q6_K_BLOCK_SIZE
-    else:
-        # F32 path - just merge on CPU
-        tensors = []
-        for i in range(num_experts):
-            t = expert_tensors[i].float().cpu().numpy()
-            tensors.append(t)
-        return np.stack(tensors, axis=0), merged_shape
+    merged_flat = merged.reshape(-1, n_cols)
+    if pad_cols > 0:
+        padding = np.zeros((merged_flat.shape[0], pad_cols), dtype=np.float32)
+        merged_flat = np.concatenate([merged_flat, padding], axis=1)
 
-    # Process experts in chunks that fit in VRAM
-    # Each expert needs: expert_size * 4 (f32) + workspace for quantization
-    # For 32GB VRAM, process 64 experts at a time
-    experts_per_chunk = 64
+    # Ensure contiguous
+    merged_flat = np.ascontiguousarray(merged_flat)
 
-    all_outputs = []
-
-    for chunk_start in range(0, num_experts, experts_per_chunk):
-        chunk_end = min(chunk_start + experts_per_chunk, num_experts)
-
-        # Stack this chunk of experts on GPU
-        chunk_tensors = []
-        for i in range(chunk_start, chunk_end):
-            t = expert_tensors[i].to(device=device, dtype=torch.float32, non_blocking=True)
-            chunk_tensors.append(t)
-
-        torch.cuda.synchronize()
-        chunk_gpu = torch.stack(chunk_tensors, dim=0)  # [chunk_size, ...]
-        del chunk_tensors
-
-        # Flatten for quantization: [chunk_size * rows_per_expert, cols]
-        chunk_flat = chunk_gpu.reshape(-1, n_cols)
-
-        # Pad if needed
-        if pad_cols > 0:
-            padding = torch.zeros((chunk_flat.shape[0], pad_cols), dtype=torch.float32, device=device)
-            chunk_flat = torch.cat([chunk_flat, padding], dim=-1)
-
-        n_rows = chunk_flat.shape[0]
-        n_blocks_per_row = padded_cols // QK_K
-
-        # Quantize this chunk
+    # Quantize using native ggml or fallback
+    if GGML_LIB is not None:
         if qtype == GGMLQuantizationType.Q4_K:
-            chunk_out = _quantize_q4_k_gpu(chunk_flat, n_rows, padded_cols, n_blocks_per_row, bytes_per_row)
+            quantized = ggml_quantize_q4_k(merged_flat)
+        elif qtype == GGMLQuantizationType.Q6_K:
+            quantized = ggml_quantize_q6_k(merged_flat)
         else:
-            chunk_out = _quantize_q6_k_gpu(chunk_flat, n_rows, padded_cols, n_blocks_per_row, bytes_per_row)
+            quantized = quantize_tensor(merged_flat, qtype)
+    else:
+        quantized = quantize_tensor(merged_flat, qtype)
 
-        all_outputs.append(chunk_out)
-
-        # Free GPU memory
-        del chunk_gpu, chunk_flat
-        torch.cuda.empty_cache()
-
-    # Concatenate all chunks
-    return np.concatenate(all_outputs, axis=0), merged_shape
+    return quantized, merged_shape
 
 
 def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np.ndarray:
@@ -892,7 +1002,7 @@ def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np
 
 def _quantize_q4_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
                         n_blocks_per_row: int, bytes_per_row: int) -> np.ndarray:
-    """Q4_K quantization entirely on GPU."""
+    """Q4_K quantization entirely on GPU with vectorized packing."""
     # Reshape to [n_rows, n_blocks_per_row, QK_K]
     tensor = tensor.view(n_rows, n_blocks_per_row, QK_K)
 
@@ -929,40 +1039,46 @@ def _quantize_q4_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
     inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
     qs = ((sub_blocks + eff_mins) * inv_eff_scales).round().clamp(0, 15).to(torch.uint8)
 
-    # Move to CPU for final packing (packing is complex, faster on CPU)
-    d_cpu = d.half().cpu().numpy()
+    # Move to CPU for packing
+    d_cpu = d.half().cpu().numpy()  # [n_rows, n_blocks]
     dmin_cpu = dmin.half().cpu().numpy()
-    q_scales_cpu = q_scales.cpu().numpy()
+    q_scales_cpu = q_scales.cpu().numpy()  # [n_rows, n_blocks, 8]
     q_mins_cpu = q_mins.cpu().numpy()
     qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
 
-    # Pack into output
+    # Vectorized packing - no Python loops!
     output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
 
+    # Pack all blocks at once using stride tricks
     for blk in range(n_blocks_per_row):
-        offset = blk * Q4_K_BLOCK_SIZE
-        output[:, offset:offset+2] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
-        output[:, offset+2:offset+4] = np.ascontiguousarray(dmin_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+        off = blk * Q4_K_BLOCK_SIZE
 
-        for i in range(4):
-            output[:, offset+4+i] = (q_scales_cpu[:, blk, i] & 0xF) | ((q_scales_cpu[:, blk, i+4] & 0xF) << 4)
-        for i in range(4):
-            output[:, offset+8+i] = (q_mins_cpu[:, blk, i] & 0xF) | ((q_mins_cpu[:, blk, i+4] & 0xF) << 4)
-        for i in range(4):
-            output[:, offset+12+i] = ((q_scales_cpu[:, blk, i] >> 4) & 0x3) | \
-                                     (((q_scales_cpu[:, blk, i+4] >> 4) & 0x3) << 2) | \
-                                     (((q_mins_cpu[:, blk, i] >> 4) & 0x3) << 4) | \
-                                     (((q_mins_cpu[:, blk, i+4] >> 4) & 0x3) << 6)
+        # d and dmin (2 bytes each)
+        output[:, off:off+2] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
+        output[:, off+2:off+4] = dmin_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
 
-        for i in range(128):
-            output[:, offset+16+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
+        # Scales packing (vectorized across all 4 indices)
+        sc = q_scales_cpu[:, blk]  # [n_rows, 8]
+        mn = q_mins_cpu[:, blk]
+        output[:, off+4:off+8] = (sc[:, :4] & 0xF) | ((sc[:, 4:] & 0xF) << 4)
+        output[:, off+8:off+12] = (mn[:, :4] & 0xF) | ((mn[:, 4:] & 0xF) << 4)
+        output[:, off+12:off+16] = (
+            ((sc[:, :4] >> 4) & 0x3) |
+            (((sc[:, 4:] >> 4) & 0x3) << 2) |
+            (((mn[:, :4] >> 4) & 0x3) << 4) |
+            (((mn[:, 4:] >> 4) & 0x3) << 6)
+        )
+
+        # Quantized values packing (vectorized)
+        q = qs_cpu[:, blk]  # [n_rows, 256]
+        output[:, off+16:off+144] = (q[:, 0::2] & 0xF) | ((q[:, 1::2] & 0xF) << 4)
 
     return output
 
 
 def _quantize_q6_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
                         n_blocks_per_row: int, bytes_per_row: int) -> np.ndarray:
-    """Q6_K quantization entirely on GPU."""
+    """Q6_K quantization entirely on GPU with vectorized packing."""
     # Reshape to [n_rows, n_blocks_per_row, 16, 16]
     sub_blocks = tensor.view(n_rows, n_blocks_per_row, 16, 16)
 
@@ -986,26 +1102,35 @@ def _quantize_q6_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
     qs = qs.to(torch.uint8)
 
     # Move to CPU for packing
-    d_cpu = d.half().cpu().numpy()
-    q_scales_cpu = q_scales.cpu().numpy()
+    d_cpu = d.half().cpu().numpy()  # [n_rows, n_blocks]
+    q_scales_cpu = q_scales.cpu().numpy()  # [n_rows, n_blocks, 16]
     qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
 
-    # Pack into output
+    # Vectorized packing
     output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
 
     for blk in range(n_blocks_per_row):
-        offset = blk * Q6_K_BLOCK_SIZE
+        off = blk * Q6_K_BLOCK_SIZE
+        q = qs_cpu[:, blk]  # [n_rows, 256]
 
-        for i in range(128):
-            output[:, offset+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
+        # ql: lower 4 bits packed (128 bytes) - vectorized
+        output[:, off:off+128] = (q[:, 0::2] & 0xF) | ((q[:, 1::2] & 0xF) << 4)
 
-        for i in range(256):
-            qh_byte = i // 4
-            qh_shift = (i % 4) * 2
-            output[:, offset+128+qh_byte] |= ((qs_cpu[:, blk, i] >> 4) & 0x3) << qh_shift
+        # qh: upper 2 bits packed (64 bytes) - vectorized
+        qh = (q >> 4) & 0x3  # [n_rows, 256]
+        # Pack 4 values into each byte
+        output[:, off+128:off+192] = (
+            qh[:, 0::4] |
+            (qh[:, 1::4] << 2) |
+            (qh[:, 2::4] << 4) |
+            (qh[:, 3::4] << 6)
+        )
 
-        output[:, offset+192:offset+208] = np.ascontiguousarray(q_scales_cpu[:, blk]).view(np.uint8).reshape(n_rows, 16)
-        output[:, offset+208:offset+210] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+        # scales (16 bytes)
+        output[:, off+192:off+208] = q_scales_cpu[:, blk].view(np.uint8).reshape(n_rows, 16)
+
+        # d as float16 (2 bytes)
+        output[:, off+208:off+210] = d_cpu[:, blk].view(np.uint8).reshape(n_rows, 2)
 
     return output
 
@@ -1036,11 +1161,18 @@ def convert(model_dir: Path, output_path: Path):
     print(f"Model dir: {model_dir}")
     print(f"Output:    {output_path}")
 
+    # Initialize native ggml library for fast quantization
+    print("\nInitializing...")
+    use_native = init_ggml()
+    if use_native:
+        print("  Using native ggml quantization (C++ optimized)")
+    else:
+        print("  Using Python quantization (slower)")
+
     # Enable TF32 for faster GPU computation on Ampere+
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Pre-allocate CUDA memory for better performance
         torch.cuda.empty_cache()
 
     # Load config
@@ -1146,8 +1278,9 @@ def convert(model_dir: Path, output_path: Path):
     # Close all handles before processing layers
     safetensor_cache.clear()
 
-    # Process layers one at a time for memory efficiency
+    # Process layers
     print(f"\nProcessing {num_layers} layers...")
+
     for layer_idx in range(num_layers):
         if layer_idx not in layer_tensors:
             print(f"  [WARN] No tensors for layer {layer_idx}")

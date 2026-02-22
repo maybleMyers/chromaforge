@@ -735,37 +735,94 @@ def write_metadata(writer: GGUFWriter, config: dict):
 # Expert tensor merging
 # ---------------------------------------------------------------------------
 
-def merge_experts_gpu(
+def merge_and_quantize_experts(
     expert_tensors: dict[int, torch.Tensor],
     num_experts: int,
-) -> torch.Tensor:
-    """Merge individual expert tensors into a single stacked tensor [n_experts, ...].
+    qtype: GGMLQuantizationType,
+) -> tuple[np.ndarray, tuple]:
+    """Merge and quantize expert tensors in chunks to avoid OOM.
 
-    Returns GPU tensor for further processing. Stays on GPU.
+    Returns (quantized_data, shape) tuple.
+    Processes experts in batches on GPU to stay within VRAM limits.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tensors = []
-    for i in range(num_experts):
-        if i not in expert_tensors:
-            raise ValueError(f"Missing expert {i}")
-        t = expert_tensors[i]
-        # Move to GPU and convert to f32
-        t = t.to(device=device, dtype=torch.float32, non_blocking=True)
-        tensors.append(t)
+    # Get shape from first expert
+    first_expert = expert_tensors[0]
+    expert_shape = first_expert.shape  # e.g., (1024, 4096) for gate/up, (4096, 1024) for down
+    merged_shape = (num_experts,) + tuple(expert_shape)
 
-    # Stack on GPU (much faster than CPU for 512 tensors)
-    # Sync to ensure all transfers complete before stacking
-    if device.type == 'cuda':
+    # For K-quants, calculate output size with padding
+    n_cols = expert_shape[-1]
+    pad_cols = (QK_K - (n_cols % QK_K)) % QK_K
+    padded_cols = n_cols + pad_cols
+
+    if qtype == GGMLQuantizationType.Q4_K:
+        n_blocks = padded_cols // QK_K
+        bytes_per_row = n_blocks * Q4_K_BLOCK_SIZE
+    elif qtype == GGMLQuantizationType.Q6_K:
+        n_blocks = padded_cols // QK_K
+        bytes_per_row = n_blocks * Q6_K_BLOCK_SIZE
+    else:
+        # F32 path - just merge on CPU
+        tensors = []
+        for i in range(num_experts):
+            t = expert_tensors[i].float().cpu().numpy()
+            tensors.append(t)
+        return np.stack(tensors, axis=0), merged_shape
+
+    # Process experts in chunks that fit in VRAM
+    # Each expert needs: expert_size * 4 (f32) + workspace for quantization
+    # For 32GB VRAM, process 64 experts at a time
+    experts_per_chunk = 64
+
+    all_outputs = []
+
+    for chunk_start in range(0, num_experts, experts_per_chunk):
+        chunk_end = min(chunk_start + experts_per_chunk, num_experts)
+
+        # Stack this chunk of experts on GPU
+        chunk_tensors = []
+        for i in range(chunk_start, chunk_end):
+            t = expert_tensors[i].to(device=device, dtype=torch.float32, non_blocking=True)
+            chunk_tensors.append(t)
+
         torch.cuda.synchronize()
+        chunk_gpu = torch.stack(chunk_tensors, dim=0)  # [chunk_size, ...]
+        del chunk_tensors
 
-    return torch.stack(tensors, dim=0)
+        # Flatten for quantization: [chunk_size * rows_per_expert, cols]
+        chunk_flat = chunk_gpu.reshape(-1, n_cols)
+
+        # Pad if needed
+        if pad_cols > 0:
+            padding = torch.zeros((chunk_flat.shape[0], pad_cols), dtype=torch.float32, device=device)
+            chunk_flat = torch.cat([chunk_flat, padding], dim=-1)
+
+        n_rows = chunk_flat.shape[0]
+        n_blocks_per_row = padded_cols // QK_K
+
+        # Quantize this chunk
+        if qtype == GGMLQuantizationType.Q4_K:
+            chunk_out = _quantize_q4_k_gpu(chunk_flat, n_rows, padded_cols, n_blocks_per_row, bytes_per_row)
+        else:
+            chunk_out = _quantize_q6_k_gpu(chunk_flat, n_rows, padded_cols, n_blocks_per_row, bytes_per_row)
+
+        all_outputs.append(chunk_out)
+
+        # Free GPU memory
+        del chunk_gpu, chunk_flat
+        torch.cuda.empty_cache()
+
+    # Concatenate all chunks
+    return np.concatenate(all_outputs, axis=0), merged_shape
 
 
 def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np.ndarray:
     """Quantize a GPU tensor directly. Tensor should be float32 on GPU.
 
-    Handles padding and quantization entirely on GPU, returns numpy array.
+    Handles padding and quantization on GPU in chunks to avoid OOM.
+    Returns numpy array.
     """
     assert tensor.device.type == 'cuda', "Tensor must be on GPU"
     assert tensor.dtype == torch.float32, "Tensor must be float32"
@@ -784,7 +841,6 @@ def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np
             tensor = torch.cat([tensor, padding], dim=-1)
 
     # Flatten to 2D for quantization: [batch, cols]
-    original_shape = tensor.shape
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
     elif tensor.ndim > 2:
@@ -795,15 +851,43 @@ def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np
 
     if qtype == GGMLQuantizationType.Q4_K:
         bytes_per_row = n_blocks_per_row * Q4_K_BLOCK_SIZE
-        output = _quantize_q4_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
     elif qtype == GGMLQuantizationType.Q6_K:
         bytes_per_row = n_blocks_per_row * Q6_K_BLOCK_SIZE
-        output = _quantize_q6_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
     else:
         # Fall back to CPU for other types
-        output = gguf.quants.quantize(tensor.cpu().numpy(), qtype)
+        return gguf.quants.quantize(tensor.cpu().numpy(), qtype)
 
-    return output
+    # Process in chunks to avoid OOM
+    # Each row needs ~4x memory during quantization (intermediates)
+    # With 32GB VRAM, process ~64 experts (rows) at a time for 1024-dim tensors
+    max_rows_per_chunk = 64
+
+    if n_rows <= max_rows_per_chunk:
+        # Small enough to process at once
+        if qtype == GGMLQuantizationType.Q4_K:
+            return _quantize_q4_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
+        else:
+            return _quantize_q6_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
+
+    # Process in chunks
+    output_chunks = []
+    for start_row in range(0, n_rows, max_rows_per_chunk):
+        end_row = min(start_row + max_rows_per_chunk, n_rows)
+        chunk = tensor[start_row:end_row]
+        chunk_rows = end_row - start_row
+
+        if qtype == GGMLQuantizationType.Q4_K:
+            chunk_out = _quantize_q4_k_gpu(chunk, chunk_rows, n_cols, n_blocks_per_row, bytes_per_row)
+        else:
+            chunk_out = _quantize_q6_k_gpu(chunk, chunk_rows, n_cols, n_blocks_per_row, bytes_per_row)
+
+        output_chunks.append(chunk_out)
+
+        # Free intermediate GPU memory
+        del chunk
+        torch.cuda.empty_cache()
+
+    return np.concatenate(output_chunks, axis=0)
 
 
 def _quantize_q4_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
@@ -1138,34 +1222,29 @@ def convert(model_dir: Path, output_path: Path):
             gguf_name = proj_to_gguf[proj_type]
             expert_dict = expert_groups[proj_type]
 
-            # Load all expert tensors for this projection
+            # Load all expert tensors for this projection (stays on source device initially)
             expert_tensors_dict = {}
             for expert_idx, hf_name in expert_dict.items():
                 st_file = weight_map[hf_name]
                 handle = get_safetensor_handle(st_file)
                 expert_tensors_dict[expert_idx] = handle.get_tensor(hf_name)
 
-            # Merge on GPU: stack into [n_experts, out_dim, in_dim]
-            merged_gpu = merge_experts_gpu(expert_tensors_dict, num_experts)
-            merged_shape = tuple(merged_gpu.shape)
-
+            # Determine shape for quant type selection
+            first_shape = expert_tensors_dict[0].shape
+            merged_shape = (num_experts,) + tuple(first_shape)
             qtype = choose_quant_type(gguf_name, merged_shape, num_layers)
 
+            # Merge and quantize in chunks to avoid OOM
+            data, merged_shape = merge_and_quantize_experts(expert_tensors_dict, num_experts, qtype)
+
             if qtype == GGMLQuantizationType.F32:
-                data = merged_gpu.cpu().numpy()
                 writer.add_tensor(gguf_name, data, raw_shape=merged_shape)
-            elif qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q6_K):
-                # Quantize directly on GPU
-                data = quantize_tensor_gpu(merged_gpu, qtype)
-                writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             else:
-                data = merged_gpu.cpu().numpy()
-                data = quantize_tensor(data, qtype)
                 writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             tensor_count += 1
 
-            # Free GPU memory immediately
-            del expert_tensors_dict, merged_gpu
+            # Free memory
+            del expert_tensors_dict, data
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

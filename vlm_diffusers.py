@@ -1000,11 +1000,14 @@ class Qwen3VLMBackend:
                     bnb_4bit_compute_dtype=torch.bfloat16,  # bf16 compute is supported for 4-bit!
                     bnb_4bit_use_double_quant=True,  # Nested quantization for extra memory savings
                     llm_int8_skip_modules=['visual'],  # Skip visual encoder (uses bnb_4bit_skip_modules internally)
+                    llm_int8_enable_fp32_cpu_offload=True,  # Allow CPU offload (NOT disk offload)
                 )
                 print("[Q4] Using 4-bit NF4 quantization (skipping visual encoder)")
                 print("[Q4] Compute dtype: bf16 (native support)")
+                print("[Q4] CPU offload enabled for layers that don't fit in VRAM")
                 model_kwargs["quantization_config"] = quantization_config
                 model_kwargs["device_map"] = device_map
+                # Note: do NOT set offload_folder - it triggers disk offload which has meta tensor bugs
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 

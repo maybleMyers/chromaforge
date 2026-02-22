@@ -1100,6 +1100,8 @@ class Qwen3VLMBackend:
 
                 model_kwargs["quantization_config"] = quantization_config
                 model_kwargs["device_map"] = device_map
+                # MoE models need offload_folder to re-save weights during disk offload
+                model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 

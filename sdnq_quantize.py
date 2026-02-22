@@ -54,7 +54,12 @@ def quantize_model(
         trust_remote_code: Trust remote code for custom models
     """
     # Import here to avoid slow startup for --help
-    from transformers import AutoProcessor, AutoModelForVision2Seq, AutoConfig
+    from transformers import AutoProcessor, AutoConfig
+    # AutoModelForVision2Seq renamed to AutoModelForImageTextToText in transformers 5.x
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
     from sdnq import SDNQConfig
     from sdnq.loader import save_sdnq_model
     from sdnq.common import use_torch_compile as sdnq_triton_available

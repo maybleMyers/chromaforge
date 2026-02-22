@@ -451,6 +451,33 @@ except ImportError:
     lmdeploy_load_image = None
     print("Note: lmdeploy not installed. Install with: pip install lmdeploy")
 
+# Try to import vLLM for high-performance inference with PagedAttention
+try:
+    import sys
+    # Temporarily remove local packages_3rdparty from path to avoid gguf conflict
+    _original_path = sys.path.copy()
+    sys.path = [p for p in sys.path if 'packages_3rdparty' not in p]
+    # Also remove any cached gguf module to ensure fresh import
+    _gguf_modules = [k for k in sys.modules.keys() if k.startswith('gguf')]
+    for k in _gguf_modules:
+        del sys.modules[k]
+    from vllm import LLM as VllmLLM, SamplingParams as VllmSamplingParams
+    sys.path = _original_path  # Restore path
+    VLLM_AVAILABLE = True
+    print("vLLM: available (high-performance inference with PagedAttention)")
+except ImportError as e:
+    sys.path = _original_path if '_original_path' in dir() else sys.path
+    VLLM_AVAILABLE = False
+    VllmLLM = None
+    VllmSamplingParams = None
+    print(f"Note: vLLM import error: {e}")
+except Exception as e:
+    sys.path = _original_path if '_original_path' in dir() else sys.path
+    VLLM_AVAILABLE = False
+    VllmLLM = None
+    VllmSamplingParams = None
+    print(f"Warning: vLLM import failed: {e}")
+
 
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
@@ -609,7 +636,10 @@ class Qwen3VLMBackend:
 
         # lmdeploy backend support
         self.lmdeploy_pipe = None
-        self.current_backend: Optional[str] = None  # "transformers" or "lmdeploy"
+        self.current_backend: Optional[str] = None  # "transformers", "lmdeploy", or "vllm"
+
+        # vLLM backend support
+        self.vllm_llm = None
 
         # Check GPU availability
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -679,6 +709,13 @@ class Qwen3VLMBackend:
             if not LMDEPLOY_AVAILABLE:
                 return "Error: lmdeploy not installed. Install with: pip install lmdeploy"
             return self._load_model_lmdeploy(model_name, dtype, num_gpus, context_len, progress)
+
+        if backend == "vllm":
+            if not VLLM_AVAILABLE:
+                return "Error: vLLM not installed. Install with: pip install vllm"
+            return self._load_model_vllm(
+                model_name, dtype, num_gpus, max_memory_per_gpu, context_len, progress
+            )
 
         if not TRANSFORMERS_AVAILABLE:
             return "Error: transformers not installed"
@@ -1434,14 +1471,119 @@ class Qwen3VLMBackend:
             self.current_backend = None
             return f"Error loading model with lmdeploy: {str(e)}"
 
+    def _load_model_vllm(
+        self,
+        model_name: str,
+        dtype: str,
+        num_gpus: int,
+        max_memory_per_gpu: int,
+        context_len: int,
+        progress,
+    ) -> str:
+        """Load model using vLLM backend for high-performance inference."""
+        # Find the model
+        models = self.get_available_models()
+        model_info = next((m for m in models if m["name"] == model_name), None)
+
+        if model_info is None:
+            return f"Error: Model '{model_name}' not found"
+
+        model_path = model_info["path"]
+        model_type = model_info["type"]
+
+        # Unload current model if any
+        self.unload_model()
+
+        try:
+            progress(0.1, desc="Configuring vLLM engine...")
+
+            # Map dtype string to vLLM dtype
+            dtype_map = {
+                "bfloat16": "bfloat16",
+                "float16": "float16",
+                "float32": "float32",
+                "auto": "auto",
+            }
+            vllm_dtype = dtype_map.get(dtype, "auto")
+
+            # Calculate tensor parallel size (TP)
+            tp = min(num_gpus, self.num_gpus) if num_gpus > 0 else 1
+
+            progress(0.2, desc=f"Loading model with vLLM (tp={tp})...")
+
+            # Prepare vLLM engine arguments
+            engine_kwargs = {
+                "model": model_path,
+                "dtype": vllm_dtype,
+                "tensor_parallel_size": tp,
+                "max_model_len": context_len,
+                "trust_remote_code": True,
+            }
+
+            # Enable vision support for VL models
+            if model_type in ["qwen-vl", "glm-vl", "step3-vl", "internvl"]:
+                engine_kwargs["limit_mm_per_prompt"] = {"image": 16, "video": 1}
+
+            # GPU memory utilization limit
+            if max_memory_per_gpu and max_memory_per_gpu > 0:
+                gpus = get_gpu_info()
+                if gpus:
+                    total_mem = gpus[0]["total_memory_gb"]
+                    utilization = min(max_memory_per_gpu / total_mem, 0.95)
+                    engine_kwargs["gpu_memory_utilization"] = utilization
+
+            # Enable flash attention if available and requested
+            if self.use_flash_attention:
+                engine_kwargs["enable_prefix_caching"] = True
+
+            progress(0.4, desc="Initializing vLLM LLM...")
+
+            # Initialize vLLM
+            self.vllm_llm = VllmLLM(**engine_kwargs)
+
+            progress(0.8, desc="Loading processor...")
+
+            # Load processor for chat template formatting
+            if TRANSFORMERS_AVAILABLE:
+                self.processor = AutoProcessor.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                )
+
+            # Set state
+            self.current_model_path = model_path
+            self.current_model_type = model_type
+            self.current_backend = "vllm"
+
+            # Clear other backend references
+            self.model = None
+            self.lmdeploy_pipe = None
+
+            progress(1.0, desc="Model loaded!")
+            print(f"Successfully loaded {model_name} with vLLM (tp={tp})")
+
+            return f"Loaded: {model_name} ({model_type}) via vLLM (tp={tp})"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.vllm_llm = None
+            self.current_backend = None
+            return f"Error loading model with vLLM: {str(e)}"
+
     def unload_model(self) -> str:
         """Unload the current model and free GPU memory."""
-        if self.model is None and self.lmdeploy_pipe is None:
+        if self.model is None and self.lmdeploy_pipe is None and self.vllm_llm is None:
             return "No model loaded"
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "model"
 
         try:
+            # Handle vLLM
+            if self.vllm_llm is not None:
+                del self.vllm_llm
+                self.vllm_llm = None
+
             # Handle lmdeploy pipeline
             if self.lmdeploy_pipe is not None:
                 try:
@@ -1485,10 +1627,14 @@ class Qwen3VLMBackend:
 
     def get_status(self) -> str:
         """Get current status."""
-        if self.model is None and self.lmdeploy_pipe is None:
+        if self.model is None and self.lmdeploy_pipe is None and self.vllm_llm is None:
             return "No model loaded"
 
         model_name = Path(self.current_model_path).stem if self.current_model_path else "Unknown"
+
+        # Handle vLLM backend
+        if self.current_backend == "vllm" and self.vllm_llm is not None:
+            return f"Loaded: {model_name} ({self.current_model_type}) via vLLM"
 
         # Handle lmdeploy backend
         if self.current_backend == "lmdeploy" and self.lmdeploy_pipe is not None:
@@ -1534,13 +1680,20 @@ class Qwen3VLMBackend:
         """
         empty_stats = {"tokens": 0, "time": 0.0, "tokens_per_sec": 0.0}
 
-        if self.model is None and self.lmdeploy_pipe is None:
+        if self.model is None and self.lmdeploy_pipe is None and self.vllm_llm is None:
             return "Error: No model loaded. Please load a model first.", empty_stats
 
         try:
             # Handle lmdeploy backend
             if self.current_backend == "lmdeploy" and self.lmdeploy_pipe is not None:
                 return self._generate_lmdeploy(
+                    messages, images, video_path,
+                    max_new_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
+                )
+
+            # Handle vLLM backend
+            if self.current_backend == "vllm" and self.vllm_llm is not None:
+                return self._generate_vllm(
                     messages, images, video_path,
                     max_new_tokens, temperature, top_p, top_k, repetition_penalty, video_max_frames
                 )
@@ -2085,6 +2238,167 @@ class Qwen3VLMBackend:
 
         return output_text, stats
 
+    def _generate_vllm(
+        self,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Image.Image]],
+        video_path: Optional[str],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repetition_penalty: float,
+        video_max_frames: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate response using vLLM backend."""
+        start_time = time.perf_counter()
+
+        # Collect all images
+        all_images = []
+        if images:
+            all_images.extend(images)
+
+        # Handle video frames
+        if video_path:
+            try:
+                frames = extract_video_frames(video_path, max_frames=video_max_frames)
+                all_images.extend(frames)
+                print(f"[vLLM] Extracted {len(frames)} frames from video")
+            except Exception as e:
+                print(f"[vLLM] Error extracting video frames: {e}")
+
+        # Extract images from message content
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "image" and "image" in item:
+                            img = item["image"]
+                            if isinstance(img, Image.Image):
+                                all_images.append(img)
+
+        # Build conversation for processor
+        conversation = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                # Text-only message
+                conversation.append({
+                    "role": role,
+                    "content": content
+                })
+            elif isinstance(content, list):
+                # Multi-modal message - build content list
+                content_items = []
+                for item in content:
+                    if isinstance(item, str):
+                        content_items.append({"type": "text", "text": item})
+                    elif isinstance(item, dict):
+                        if item.get("type") == "text":
+                            content_items.append({"type": "text", "text": item.get("text", "")})
+                        elif item.get("type") == "image":
+                            # For vLLM, we use placeholder - images passed via multi_modal_data
+                            content_items.append({"type": "image"})
+                conversation.append({
+                    "role": role,
+                    "content": content_items if content_items else [{"type": "text", "text": ""}]
+                })
+
+        # Add image placeholders if we have images but no explicit image content
+        if all_images and conversation:
+            last_user_msg = None
+            for i, msg in enumerate(conversation):
+                if msg["role"] == "user":
+                    last_user_msg = i
+
+            if last_user_msg is not None:
+                msg = conversation[last_user_msg]
+                if isinstance(msg["content"], str):
+                    # Convert to list format with images
+                    content_list = [{"type": "image"} for _ in all_images]
+                    content_list.append({"type": "text", "text": msg["content"]})
+                    conversation[last_user_msg]["content"] = content_list
+                elif isinstance(msg["content"], list):
+                    # Check if images already present
+                    has_images = any(
+                        isinstance(c, dict) and c.get("type") == "image"
+                        for c in msg["content"]
+                    )
+                    if not has_images:
+                        # Prepend image placeholders
+                        image_items = [{"type": "image"} for _ in all_images]
+                        conversation[last_user_msg]["content"] = image_items + msg["content"]
+
+        # Apply chat template to get prompt
+        try:
+            prompt = self.processor.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except Exception as e:
+            print(f"[vLLM] Error applying chat template: {e}")
+            # Fallback: simple prompt construction
+            prompt = ""
+            for msg in conversation:
+                role = msg["role"]
+                content = msg["content"]
+                if isinstance(content, list):
+                    text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                    content = " ".join(text_parts)
+                prompt += f"{role}: {content}\n"
+            prompt += "assistant:"
+
+        # Prepare sampling parameters
+        sampling_params = VllmSamplingParams(
+            temperature=temperature if temperature > 0 else 0.01,
+            top_p=top_p,
+            top_k=top_k if top_k > 0 else -1,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_new_tokens,
+        )
+
+        # Build input for vLLM
+        inputs = {"prompt": prompt}
+        if all_images:
+            inputs["multi_modal_data"] = {"image": all_images}
+
+        print(f"[vLLM] Generating with {len(all_images)} images...")
+
+        # Generate
+        outputs = self.vllm_llm.generate(inputs, sampling_params=sampling_params)
+
+        # Extract response text
+        if outputs and outputs[0].outputs:
+            output_text = outputs[0].outputs[0].text
+        else:
+            output_text = "Error: No output generated"
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        # Get token counts from vLLM output
+        if outputs and outputs[0].outputs:
+            num_tokens = len(outputs[0].outputs[0].token_ids)
+        else:
+            num_tokens = len(output_text.split()) * 1.3
+
+        tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
+
+        stats = {
+            "tokens": int(num_tokens),
+            "time": elapsed_time,
+            "tokens_per_sec": tokens_per_sec,
+            "backend": "vllm",
+            "num_images": len(all_images),
+        }
+        print(f"[vLLM] Generated {int(num_tokens)} tokens in {elapsed_time:.2f}s ({tokens_per_sec:.2f} tok/s)")
+
+        return output_text, stats
+
     def _generate_internvl(
         self,
         messages: List[Dict[str, Any]],
@@ -2375,7 +2689,7 @@ class Qwen3VLMBackend:
         if config is None:
             config = PaCoreConfig()
 
-        if self.model is None and self.lmdeploy_pipe is None:
+        if self.model is None and self.lmdeploy_pipe is None and self.vllm_llm is None:
             return {
                 "final_response": "Error: No model loaded. Please load a model first.",
                 "round_responses": [],
@@ -2922,19 +3236,17 @@ def create_ui():
     initial_models = vlm_backend.get_model_names() if vlm_backend else ["Initialize backend first"]
     num_gpus = vlm_backend.num_gpus if vlm_backend else 0
 
-    with gr.Blocks(title="Chromaforge VLM (Diffusers)") as demo:
-        demo._vlm_theme = vlm_theme
-        demo._vlm_css = vlm_css
+    with gr.Blocks(title="Chromaforge VLM (Diffusers)", theme=vlm_theme, css=vlm_css) as demo:
         gr.Markdown("# Chromaforge VLM Chat (Diffusers/Transformers Backend)")
 
         with gr.Tabs():
             # Chat Tab
             with gr.TabItem("Chat"):
                 # Chat interface at top - full width
-                # Gradio 6.x: type="messages" is now default, parameter removed
                 chatbot = gr.Chatbot(
                     label="Conversation",
                     height=500,
+                    type="messages",
                 )
 
                 # Media inputs row - 4 images + video (like vlm.py)
@@ -3151,12 +3463,28 @@ def create_ui():
 
                 with gr.Column(scale=1):
                     # Backend selection - lmdeploy for AWQ/GPTQ models
-                    backend_choices = ["lmdeploy", "transformers"] if LMDEPLOY_AVAILABLE else ["transformers"]
+                    # Build backend choices based on availability
+                    backend_choices = ["transformers"]
+                    if LMDEPLOY_AVAILABLE:
+                        backend_choices.append("lmdeploy")
+                    if VLLM_AVAILABLE:
+                        backend_choices.append("vllm")
+
+                    # Determine default backend (prefer vllm > lmdeploy > transformers)
+                    default_backend = "transformers"
+                    if VLLM_AVAILABLE:
+                        default_backend = "vllm"
+                    elif LMDEPLOY_AVAILABLE:
+                        default_backend = "lmdeploy"
+
+                    backend_info = "vLLM: PagedAttention, lmdeploy: AWQ/GPTQ" if VLLM_AVAILABLE else (
+                        "lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install vllm or lmdeploy for optimized inference"
+                    )
                     backend_dropdown = gr.Dropdown(
                         label="Backend",
                         choices=backend_choices,
-                        value="lmdeploy" if LMDEPLOY_AVAILABLE else "transformers",
-                        info="lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install lmdeploy for AWQ support",
+                        value=default_backend,
+                        info=backend_info,
                     )
                     flash_attn_checkbox = gr.Checkbox(
                         label="Flash Attention 2",
@@ -3446,8 +3774,6 @@ def main():
         server_name=host,
         server_port=args.port,
         share=args.share,
-        theme=getattr(demo, '_vlm_theme', None),
-        css=getattr(demo, '_vlm_css', None),
     )
 
 

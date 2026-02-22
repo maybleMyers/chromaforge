@@ -853,7 +853,11 @@ def write_metadata(writer: GGUFWriter, config: dict):
     writer.add_rope_freq_base(rope_params.get("rope_theta", 10000000))
     rope_sections = rope_params.get("mrope_section")
     if rope_sections:
-        writer.add_rope_dimension_sections(rope_sections)
+        # llama.cpp expects exactly 4 elements [time, height, width, extra]
+        rope_sections = list(rope_sections)
+        while len(rope_sections) < 4:
+            rope_sections.append(0)
+        writer.add_rope_dimension_sections(rope_sections[:4])
     partial_rotary = rope_params.get("partial_rotary_factor", 0.25)
     head_dim = text_cfg.get("head_dim", 256)
     writer.add_rope_dimension_count(int(head_dim * partial_rotary))

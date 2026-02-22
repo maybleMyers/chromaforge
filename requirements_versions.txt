@@ -41,5 +41,5 @@ tqdm==4.66.1
 peft
 pydantic==2.7.4
 albumentations==1.4.21
-huggingface-hub
+huggingface-hub==0.36.0
 joblib

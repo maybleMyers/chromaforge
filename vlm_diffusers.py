@@ -513,6 +513,50 @@ except Exception as e:
     VllmSamplingParams = None
     print(f"Warning: vLLM import failed: {e}")
 
+# Try to import SDNQ for quantization
+try:
+    from sdnq import SDNQConfig
+    from sdnq.common import use_torch_compile as sdnq_triton_available
+    SDNQ_AVAILABLE = True
+    print("SDNQ: available")
+except ImportError:
+    SDNQ_AVAILABLE = False
+    sdnq_triton_available = False
+    print("Note: sdnq not installed. SDNQ quantization unavailable.")
+
+# SDNQ dtype mapping
+SDNQ_DTYPE_MAP = {
+    "sdnq_int8": "int8",
+    "sdnq_fp8": "float8_e4m3fn",
+    "sdnq_int4": "int4",
+}
+
+# Modules to skip for VLM SDNQ quantization
+VLM_SDNQ_SKIP_MODULES = [
+    'visual',  # Vision encoder - critical
+    'embed_tokens', 'wte',  # Token embeddings
+    'lm_head',  # Output head
+    'norm', 'layernorm', 'ln_f',  # LayerNorms
+    'input_layernorm', 'post_attention_layernorm',
+]
+
+
+def create_sdnq_config_vlm(
+    weights_dtype: str = "int8",
+    use_quantized_matmul: bool = True,
+    quantization_device: str = None,
+    return_device: str = None,
+) -> "SDNQConfig":
+    """Create SDNQConfig for VLM models with appropriate skip modules."""
+    return SDNQConfig(
+        weights_dtype=weights_dtype,
+        group_size=0,
+        use_quantized_matmul=use_quantized_matmul and sdnq_triton_available,
+        quantization_device=quantization_device,
+        return_device=return_device,
+        modules_to_not_convert=VLM_SDNQ_SKIP_MODULES,
+    )
+
 
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
@@ -778,9 +822,11 @@ class Qwen3VLMBackend:
             # - q8_fp16: INT8 with fp16 non-quantized layers (FAST - native bitsandbytes)
             # - q4_nf4: 4-bit NF4 with bf16 compute (smallest memory, good quality)
             # - fp8_scaled: Manual FP8 conversion (native on RTX 40/50 series)
+            # - sdnq_*: SDNQ quantization (alternative to bitsandbytes)
             use_fp8 = dtype == "fp8_scaled"
             use_q8_partial = dtype in ["q8_partial", "q8_fp16"]
             use_q4_nf4 = dtype == "q4_nf4"
+            use_sdnq = dtype in SDNQ_DTYPE_MAP
 
             dtype_map = {
                 "bfloat16": torch.bfloat16,
@@ -790,8 +836,15 @@ class Qwen3VLMBackend:
                 "q8_partial": torch.bfloat16,  # Non-quantized in bf16 (slow - casting overhead)
                 "q8_fp16": torch.float16,  # Non-quantized in fp16 (fast - native bnb support)
                 "q4_nf4": torch.bfloat16,  # 4-bit NF4 supports bf16 compute dtype
+                "sdnq_int8": torch.bfloat16,  # SDNQ INT8 with bf16 for non-quantized
+                "sdnq_fp8": torch.bfloat16,   # SDNQ FP8 with bf16 for non-quantized
+                "sdnq_int4": torch.bfloat16,  # SDNQ INT4 with bf16 for non-quantized
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+
+            # Check SDNQ availability
+            if use_sdnq and not SDNQ_AVAILABLE:
+                return "Error: sdnq not installed. Run: pip install sdnq"
 
             # Create device map for multi-GPU or CPU offloading
             actual_gpus = min(num_gpus, self.num_gpus) if self.num_gpus > 0 else 0
@@ -1025,6 +1078,28 @@ class Qwen3VLMBackend:
                 model_kwargs["device_map"] = device_map
                 # MoE models need offload_folder to re-save weights during disk offload
                 model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
+                if max_memory is not None:
+                    model_kwargs["max_memory"] = max_memory
+
+            # For SDNQ: Alternative quantization that avoids bitsandbytes compatibility issues
+            elif use_sdnq:
+                sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
+                print(f"[SDNQ] Using {sdnq_weights_dtype} quantization")
+
+                if cpu_offload:
+                    quantization_config = create_sdnq_config_vlm(
+                        weights_dtype=sdnq_weights_dtype,
+                        quantization_device="cuda:0" if self.num_gpus > 0 else None,
+                        return_device="cpu",
+                    )
+                    print("[SDNQ] CPU offload enabled: quantizing on GPU, returning to CPU")
+                else:
+                    quantization_config = create_sdnq_config_vlm(
+                        weights_dtype=sdnq_weights_dtype,
+                    )
+
+                model_kwargs["quantization_config"] = quantization_config
+                model_kwargs["device_map"] = device_map
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
 
@@ -3493,9 +3568,12 @@ def create_ui():
                             "q4_nf4",       # 4-bit NF4 + bf16 compute (~20GB)
                             "fp8_scaled",   # FP8 manual (RTX 40/50 native, ~31GB)
                             "q8_partial",   # INT8 + bf16 vision (slow - casting)
+                            "sdnq_int8",    # SDNQ INT8 (alternative to bitsandbytes)
+                            "sdnq_fp8",     # SDNQ FP8 (requires compute capability 8.9+)
+                            "sdnq_int4",    # SDNQ INT4 (smallest memory)
                         ],
                         value="bfloat16",
-                        info="bfloat16: full precision | q8_fp16: INT8 (~30GB)",
+                        info="bfloat16: full | q8_fp16: INT8 | sdnq_*: SDNQ quantization",
                     )
 
                 with gr.Column(scale=1):

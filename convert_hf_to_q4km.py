@@ -248,8 +248,9 @@ def pad_to_quantize(data: np.ndarray) -> tuple[np.ndarray, tuple]:
 
 
 # Maximum rows to process at once (tune based on GPU memory)
-# For 32GB GPU, 64K rows of 4096 elements = 1GB per chunk
-MAX_ROWS_PER_CHUNK = 65536
+# For 32GB GPU with 512 experts, use larger chunks for better GPU utilization
+# 128K rows of 4096 elements = 2GB per chunk, fits well in 32GB VRAM
+MAX_ROWS_PER_CHUNK = 131072
 
 
 def quantize_tensor_chunked(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
@@ -296,13 +297,18 @@ def quantize_tensor_chunked(data: np.ndarray, qtype: GGMLQuantizationType) -> np
     return np.concatenate(output_chunks, axis=0)
 
 
-def quantize_tensor(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+def quantize_tensor(data: np.ndarray | torch.Tensor, qtype: GGMLQuantizationType) -> np.ndarray:
     """Quantize a tensor using the specified quantization type.
 
     Uses CUDA-accelerated implementation for K-quants.
     Handles padding to block boundaries automatically.
     Uses chunked processing for large tensors to avoid OOM.
+    Accepts either numpy array or torch tensor (GPU tensor preferred for speed).
     """
+    # Convert torch tensor to numpy if needed
+    if isinstance(data, torch.Tensor):
+        data = data.float().cpu().numpy()
+
     # For large tensors (>1GB), use chunked processing
     tensor_size_bytes = data.nbytes
     if tensor_size_bytes > 1024 * 1024 * 1024:  # 1GB threshold
@@ -490,12 +496,10 @@ def choose_quant_type(
     if gguf_name == "output_norm.weight":
         return GGMLQuantizationType.F32
 
-    # SSM A_log → F32 (small, critical for recurrence)
-    if "ssm_a_log" in gguf_name:
-        return GGMLQuantizationType.F32
-
-    # SSM dt_bias → F32
-    if "ssm_dt.bias" in gguf_name:
+    # ALL SSM/linear attention tensors → F32
+    # These have small dimensions (64, 128, etc.) that don't fit K-quant 256-element blocks
+    # Includes: ssm_in, ssm_a, ssm_b, ssm_z, ssm_conv1d, ssm_dt, ssm_a_log, ssm_norm, ssm_out
+    if "ssm_" in gguf_name:
         return GGMLQuantizationType.F32
 
     # Extract block number for first/last layer heuristic
@@ -519,6 +523,10 @@ def choose_quant_type(
     if "ffn_gate_exps" in gguf_name or "ffn_up_exps" in gguf_name or "ffn_down_exps" in gguf_name:
         return GGMLQuantizationType.Q4_K
 
+    # Tensors with dimensions not divisible by 256 → F32 (can't use K-quants)
+    if len(shape) >= 2 and shape[-1] % QK_K != 0:
+        return GGMLQuantizationType.F32
+
     # First and last block non-expert weights → Q6_K
     if is_edge:
         return GGMLQuantizationType.Q6_K
@@ -533,16 +541,9 @@ def choose_quant_type(
 
 def bf16_tensor_to_f32_numpy(tensor: torch.Tensor) -> np.ndarray:
     """Convert a bf16 torch tensor to f32 numpy via CUDA if available."""
-    if tensor.dtype == torch.bfloat16:
-        if torch.cuda.is_available():
-            tensor = tensor.cuda().float().cpu()
-        else:
-            tensor = tensor.float()
-    elif tensor.dtype == torch.float16:
-        if torch.cuda.is_available():
-            tensor = tensor.cuda().float().cpu()
-        else:
-            tensor = tensor.float()
+    if torch.cuda.is_available():
+        # Direct GPU conversion - much faster than CPU
+        tensor = tensor.to(device='cuda', non_blocking=True).float().cpu()
     else:
         tensor = tensor.float()
     return tensor.numpy()
@@ -551,10 +552,18 @@ def bf16_tensor_to_f32_numpy(tensor: torch.Tensor) -> np.ndarray:
 def bf16_tensor_to_f16_numpy(tensor: torch.Tensor) -> np.ndarray:
     """Convert a tensor to f16 numpy via CUDA."""
     if torch.cuda.is_available():
-        tensor = tensor.cuda().half().cpu()
+        tensor = tensor.to(device='cuda', non_blocking=True).half().cpu()
     else:
         tensor = tensor.half()
     return tensor.numpy()
+
+
+def bf16_tensor_to_f32_gpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert a bf16 torch tensor to f32 on GPU (stays on GPU)."""
+    if torch.cuda.is_available():
+        return tensor.to(device='cuda', non_blocking=True).float()
+    else:
+        return tensor.float()
 
 
 # ---------------------------------------------------------------------------
@@ -726,29 +735,195 @@ def write_metadata(writer: GGUFWriter, config: dict):
 # Expert tensor merging
 # ---------------------------------------------------------------------------
 
-def merge_experts(
+def merge_experts_gpu(
     expert_tensors: dict[int, torch.Tensor],
     num_experts: int,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Merge individual expert tensors into a single stacked tensor [n_experts, ...].
 
-    Stacks on CPU to avoid OOM (512 experts = 8GB), then CUDA is used
-    for quantization in chunks.
+    Returns GPU tensor for further processing. Stays on GPU.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     tensors = []
     for i in range(num_experts):
         if i not in expert_tensors:
             raise ValueError(f"Missing expert {i}")
         t = expert_tensors[i]
-        # Convert bf16 to f32 on CPU
-        if t.dtype == torch.bfloat16:
-            t = t.float()
-        elif t.dtype == torch.float16:
-            t = t.float()
-        tensors.append(t.cpu().numpy())
+        # Move to GPU and convert to f32
+        t = t.to(device=device, dtype=torch.float32, non_blocking=True)
+        tensors.append(t)
 
-    # Stack on CPU (stacking is cheap, quantization uses CUDA)
-    return np.stack(tensors, axis=0)
+    # Stack on GPU (much faster than CPU for 512 tensors)
+    # Sync to ensure all transfers complete before stacking
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    return torch.stack(tensors, dim=0)
+
+
+def quantize_tensor_gpu(tensor: torch.Tensor, qtype: GGMLQuantizationType) -> np.ndarray:
+    """Quantize a GPU tensor directly. Tensor should be float32 on GPU.
+
+    Handles padding and quantization entirely on GPU, returns numpy array.
+    """
+    assert tensor.device.type == 'cuda', "Tensor must be on GPU"
+    assert tensor.dtype == torch.float32, "Tensor must be float32"
+
+    shape = tensor.shape
+
+    # For K-quants, need to pad last dimension to multiple of 256
+    if qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q6_K):
+        n_cols = shape[-1]
+        pad_cols = (QK_K - (n_cols % QK_K)) % QK_K
+        if pad_cols > 0:
+            # Pad on GPU
+            pad_shape = list(shape)
+            pad_shape[-1] = pad_cols
+            padding = torch.zeros(pad_shape, dtype=torch.float32, device=tensor.device)
+            tensor = torch.cat([tensor, padding], dim=-1)
+
+    # Flatten to 2D for quantization: [batch, cols]
+    original_shape = tensor.shape
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim > 2:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+
+    n_rows, n_cols = tensor.shape
+    n_blocks_per_row = n_cols // QK_K
+
+    if qtype == GGMLQuantizationType.Q4_K:
+        bytes_per_row = n_blocks_per_row * Q4_K_BLOCK_SIZE
+        output = _quantize_q4_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
+    elif qtype == GGMLQuantizationType.Q6_K:
+        bytes_per_row = n_blocks_per_row * Q6_K_BLOCK_SIZE
+        output = _quantize_q6_k_gpu(tensor, n_rows, n_cols, n_blocks_per_row, bytes_per_row)
+    else:
+        # Fall back to CPU for other types
+        output = gguf.quants.quantize(tensor.cpu().numpy(), qtype)
+
+    return output
+
+
+def _quantize_q4_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
+                        n_blocks_per_row: int, bytes_per_row: int) -> np.ndarray:
+    """Q4_K quantization entirely on GPU."""
+    # Reshape to [n_rows, n_blocks_per_row, QK_K]
+    tensor = tensor.view(n_rows, n_blocks_per_row, QK_K)
+
+    # Reshape to [n_rows, n_blocks_per_row, 8, 32] for sub-blocks
+    sub_blocks = tensor.view(n_rows, n_blocks_per_row, 8, 32)
+
+    # Find min/max per sub-block (vectorized on GPU)
+    sb_mins = sub_blocks.min(dim=3).values
+    sb_maxs = sub_blocks.max(dim=3).values
+
+    # Compute scales per sub-block
+    scales = (sb_maxs - sb_mins) / 15.0
+    scales = torch.where(sb_maxs != sb_mins, scales, torch.zeros_like(scales))
+    mins = sb_mins
+
+    # Super-block scales
+    max_scale = scales.abs().max(dim=2).values
+    max_min = mins.abs().max(dim=2).values
+
+    d = max_scale / 63.0
+    dmin = max_min / 63.0
+
+    # Avoid division by zero
+    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+    inv_dmin = torch.where(dmin > 0, 1.0 / dmin, torch.zeros_like(dmin))
+
+    # Quantize scales/mins to 6-bit
+    q_scales = (scales * inv_d.unsqueeze(2)).round().clamp(0, 63).to(torch.uint8)
+    q_mins = ((-mins) * inv_dmin.unsqueeze(2)).round().clamp(0, 63).to(torch.uint8)
+
+    # Quantize values to 4-bit
+    eff_scales = (d.unsqueeze(2) * q_scales.float()).unsqueeze(3)
+    eff_mins = (dmin.unsqueeze(2) * q_mins.float()).unsqueeze(3)
+    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
+    qs = ((sub_blocks + eff_mins) * inv_eff_scales).round().clamp(0, 15).to(torch.uint8)
+
+    # Move to CPU for final packing (packing is complex, faster on CPU)
+    d_cpu = d.half().cpu().numpy()
+    dmin_cpu = dmin.half().cpu().numpy()
+    q_scales_cpu = q_scales.cpu().numpy()
+    q_mins_cpu = q_mins.cpu().numpy()
+    qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
+
+    # Pack into output
+    output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
+
+    for blk in range(n_blocks_per_row):
+        offset = blk * Q4_K_BLOCK_SIZE
+        output[:, offset:offset+2] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+        output[:, offset+2:offset+4] = np.ascontiguousarray(dmin_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+
+        for i in range(4):
+            output[:, offset+4+i] = (q_scales_cpu[:, blk, i] & 0xF) | ((q_scales_cpu[:, blk, i+4] & 0xF) << 4)
+        for i in range(4):
+            output[:, offset+8+i] = (q_mins_cpu[:, blk, i] & 0xF) | ((q_mins_cpu[:, blk, i+4] & 0xF) << 4)
+        for i in range(4):
+            output[:, offset+12+i] = ((q_scales_cpu[:, blk, i] >> 4) & 0x3) | \
+                                     (((q_scales_cpu[:, blk, i+4] >> 4) & 0x3) << 2) | \
+                                     (((q_mins_cpu[:, blk, i] >> 4) & 0x3) << 4) | \
+                                     (((q_mins_cpu[:, blk, i+4] >> 4) & 0x3) << 6)
+
+        for i in range(128):
+            output[:, offset+16+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
+
+    return output
+
+
+def _quantize_q6_k_gpu(tensor: torch.Tensor, n_rows: int, n_cols: int,
+                        n_blocks_per_row: int, bytes_per_row: int) -> np.ndarray:
+    """Q6_K quantization entirely on GPU."""
+    # Reshape to [n_rows, n_blocks_per_row, 16, 16]
+    sub_blocks = tensor.view(n_rows, n_blocks_per_row, 16, 16)
+
+    # Find max abs per sub-block (symmetric quantization)
+    max_abs = sub_blocks.abs().max(dim=3).values
+    scales = max_abs / 31.0
+
+    # Super-block scale
+    max_scale = scales.abs().max(dim=2).values
+    d = max_scale / 127.0
+
+    inv_d = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+
+    # Quantize scales to 8-bit signed
+    q_scales = (scales * inv_d.unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
+
+    # Quantize values
+    eff_scales = (d.unsqueeze(2) * q_scales.float()).unsqueeze(3)
+    inv_eff_scales = torch.where(eff_scales > 0, 1.0 / eff_scales, torch.zeros_like(eff_scales))
+    qs = (sub_blocks * inv_eff_scales).round().clamp(-32, 31).to(torch.int8) + 32
+    qs = qs.to(torch.uint8)
+
+    # Move to CPU for packing
+    d_cpu = d.half().cpu().numpy()
+    q_scales_cpu = q_scales.cpu().numpy()
+    qs_cpu = qs.cpu().numpy().reshape(n_rows, n_blocks_per_row, 256)
+
+    # Pack into output
+    output = np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
+
+    for blk in range(n_blocks_per_row):
+        offset = blk * Q6_K_BLOCK_SIZE
+
+        for i in range(128):
+            output[:, offset+i] = (qs_cpu[:, blk, i*2] & 0xF) | ((qs_cpu[:, blk, i*2+1] & 0xF) << 4)
+
+        for i in range(256):
+            qh_byte = i // 4
+            qh_shift = (i % 4) * 2
+            output[:, offset+128+qh_byte] |= ((qs_cpu[:, blk, i] >> 4) & 0x3) << qh_shift
+
+        output[:, offset+192:offset+208] = np.ascontiguousarray(q_scales_cpu[:, blk]).view(np.uint8).reshape(n_rows, 16)
+        output[:, offset+208:offset+210] = np.ascontiguousarray(d_cpu[:, blk]).view(np.uint8).reshape(n_rows, 2)
+
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +951,13 @@ def convert(model_dir: Path, output_path: Path):
     """Main conversion: HF bf16 safetensors → GGUF Q4_K_M."""
     print(f"Model dir: {model_dir}")
     print(f"Output:    {output_path}")
+
+    # Enable TF32 for faster GPU computation on Ampere+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Pre-allocate CUDA memory for better performance
+        torch.cuda.empty_cache()
 
     # Load config
     with open(model_dir / "config.json") as f:
@@ -831,10 +1013,13 @@ def convert(model_dir: Path, output_path: Path):
     print(f"\nProcessing {len(non_layer_tensors)} non-layer tensors...")
     safetensor_cache = {}
 
+    # Use CUDA for safetensor loading if available
+    st_device = "cuda" if torch.cuda.is_available() else "cpu"
+
     def get_safetensor_handle(filepath: str):
         if filepath not in safetensor_cache:
             full_path = str(model_dir / filepath)
-            safetensor_cache[filepath] = safe_open(full_path, framework="pt", device="cpu")
+            safetensor_cache[filepath] = safe_open(full_path, framework="pt", device=st_device)
         return safetensor_cache[filepath]
 
     tensor_count = 0
@@ -847,6 +1032,16 @@ def convert(model_dir: Path, output_path: Path):
         handle = get_safetensor_handle(st_file)
         tensor = handle.get_tensor(hf_name)
         shape = tuple(tensor.shape)
+
+        # Handle 5D vision patch embedding tensor (for temporal video support)
+        # [out_ch, h, w, temporal, in_ch] or similar → merge to 4D
+        if len(shape) == 5:
+            old_shape = shape
+            # Merge dims 1 and 2: [d0, d1, d2, d3, d4] -> [d0, d1*d2, d3, d4]
+            shape = (shape[0], shape[1] * shape[2], shape[3], shape[4])
+            print(f"  [5D→4D] {gguf_name}: {old_shape} → {shape}")
+            # Reshape the tensor data
+            tensor = tensor.reshape(shape)
 
         qtype = choose_quant_type(gguf_name, shape, num_layers)
 
@@ -905,21 +1100,31 @@ def convert(model_dir: Path, output_path: Path):
             tensor = handle.get_tensor(hf_name)
             shape = tuple(tensor.shape)
 
+            # Handle 5D tensors in layer processing too (shouldn't happen but just in case)
+            if len(shape) == 5:
+                old_shape = shape
+                shape = (shape[0], shape[1] * shape[2], shape[3], shape[4])
+                tensor = tensor.reshape(shape)
+                print(f"    [5D→4D] {gguf_name}: {old_shape} → {shape}")
+
             qtype = choose_quant_type(gguf_name, shape, num_layers)
 
             if qtype == GGMLQuantizationType.F32:
+                # Stay on GPU for conversion, move to CPU only at the end
                 data = bf16_tensor_to_f32_numpy(tensor)
                 writer.add_tensor(gguf_name, data, raw_shape=shape)
             elif qtype == GGMLQuantizationType.F16:
                 data = bf16_tensor_to_f16_numpy(tensor)
                 writer.add_tensor(gguf_name, data, raw_shape=shape)
             else:
+                # For quantization, convert on GPU then quantize
                 data = bf16_tensor_to_f32_numpy(tensor)
                 data = quantize_tensor(data, qtype)
                 writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             tensor_count += 1
 
         # Process expert tensors (merge all experts per projection type)
+        # This is the bulk of the model - optimize for GPU
         proj_to_gguf = {
             "gate_proj": f"blk.{layer_idx}.ffn_gate_exps.weight",
             "up_proj": f"blk.{layer_idx}.ffn_up_exps.weight",
@@ -940,22 +1145,27 @@ def convert(model_dir: Path, output_path: Path):
                 handle = get_safetensor_handle(st_file)
                 expert_tensors_dict[expert_idx] = handle.get_tensor(hf_name)
 
-            # Merge: stack into [n_experts, out_dim, in_dim]
-            merged = merge_experts(expert_tensors_dict, num_experts)
-            merged_shape = merged.shape
+            # Merge on GPU: stack into [n_experts, out_dim, in_dim]
+            merged_gpu = merge_experts_gpu(expert_tensors_dict, num_experts)
+            merged_shape = tuple(merged_gpu.shape)
 
             qtype = choose_quant_type(gguf_name, merged_shape, num_layers)
 
             if qtype == GGMLQuantizationType.F32:
-                data = merged
+                data = merged_gpu.cpu().numpy()
                 writer.add_tensor(gguf_name, data, raw_shape=merged_shape)
+            elif qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q6_K):
+                # Quantize directly on GPU
+                data = quantize_tensor_gpu(merged_gpu, qtype)
+                writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             else:
-                data = quantize_tensor(merged, qtype)
+                data = merged_gpu.cpu().numpy()
+                data = quantize_tensor(data, qtype)
                 writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             tensor_count += 1
 
-            # Free memory
-            del expert_tensors_dict, merged
+            # Free GPU memory immediately
+            del expert_tensors_dict, merged_gpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

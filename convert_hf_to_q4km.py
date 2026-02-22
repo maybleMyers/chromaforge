@@ -70,11 +70,25 @@ def load_ggml_lib():
         try:
             lib = ctypes.CDLL(path)
             # Check if it has the quantization function
-            if hasattr(lib, 'ggml_quantize_q4_K'):
+            try:
+                _ = lib.ggml_quantize_q4_K
                 print(f"  Loaded ggml library: {path}")
                 return lib
-        except (OSError, AttributeError):
+            except AttributeError:
+                # Try alternate name
+                try:
+                    _ = lib.quantize_q4_K
+                    print(f"  Loaded ggml library: {path}")
+                    return lib
+                except AttributeError:
+                    pass
+        except OSError as e:
+            print(f"  [DEBUG] Failed to load {path}: {e}")
             continue
+
+    if all_paths:
+        print(f"  [DEBUG] Tried {len(all_paths)} libraries, none had quantization functions")
+        print(f"  [DEBUG] First few paths: {all_paths[:3]}")
 
     return None
 

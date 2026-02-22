@@ -47,6 +47,9 @@ def load_ggml_lib():
     env_path = os.environ.get('GGML_LIB_PATH')
     if env_path:
         search_patterns.append(os.path.join(env_path, "libggml*.so*"))
+        print(f"  GGML_LIB_PATH={env_path}")
+    else:
+        print("  GGML_LIB_PATH not set")
 
     # Try common relative paths
     search_patterns.extend([
@@ -61,10 +64,17 @@ def load_ggml_lib():
 
     all_paths = []
     for pattern in search_patterns:
-        all_paths.extend(glob.glob(pattern))
+        matches = glob.glob(pattern)
+        all_paths.extend(matches)
 
     # Prefer libggml-base.so as it contains the quant functions
     all_paths.sort(key=lambda x: (0 if 'base' in x else 1, x))
+
+    if not all_paths:
+        print("  No libggml*.so files found in search paths")
+        return None
+
+    print(f"  Found {len(all_paths)} candidate libraries")
 
     for path in all_paths:
         try:
@@ -75,9 +85,9 @@ def load_ggml_lib():
                 print(f"  Loaded ggml library: {path}")
                 return lib
             except AttributeError:
-                pass
+                print(f"  {path}: loaded but missing quantize_q4_K")
         except OSError as e:
-            continue
+            print(f"  {path}: failed to load: {e}")
 
     return None
 

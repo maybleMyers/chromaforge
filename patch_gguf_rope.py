@@ -23,6 +23,102 @@ from gguf.gguf_writer import TensorInfo
 import numpy as np
 
 
+def extract_field_value(field):
+    """Extract a Python value from a GGUFReader ReaderField.
+
+    Returns (value, is_array, value_type) where:
+    - value: the extracted Python value (scalar, string, or list)
+    - is_array: True if the field is an array type
+    - value_type: the GGUFValueType of the scalar or array element type
+    """
+    types = field.types
+    parts = field.parts
+    data_idxs = field.data
+
+    if not types:
+        return None, False, None
+
+    if types[0] == gguf.GGUFValueType.ARRAY:
+        # Array field
+        # types[1] is the element type
+        # data_idxs contains indexes into parts for each element's data
+        elem_type = types[1] if len(types) > 1 else None
+
+        if elem_type == gguf.GGUFValueType.STRING:
+            values = []
+            for idx in data_idxs:
+                raw = parts[idx]
+                if isinstance(raw, np.ndarray):
+                    values.append(bytes(raw).decode('utf-8', errors='replace').rstrip('\x00'))
+                elif isinstance(raw, bytes):
+                    values.append(raw.decode('utf-8', errors='replace').rstrip('\x00'))
+                else:
+                    values.append(str(raw))
+            return values, True, elem_type
+        elif elem_type in (gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT32,
+                           gguf.GGUFValueType.INT64, gguf.GGUFValueType.UINT64,
+                           gguf.GGUFValueType.INT8, gguf.GGUFValueType.UINT8,
+                           gguf.GGUFValueType.INT16, gguf.GGUFValueType.UINT16):
+            values = [int(parts[idx][0]) for idx in data_idxs]
+            return values, True, elem_type
+        elif elem_type in (gguf.GGUFValueType.FLOAT32, gguf.GGUFValueType.FLOAT64):
+            values = [float(parts[idx][0]) for idx in data_idxs]
+            return values, True, elem_type
+        elif elem_type == gguf.GGUFValueType.BOOL:
+            values = [bool(parts[idx][0]) for idx in data_idxs]
+            return values, True, elem_type
+        else:
+            return None, True, elem_type
+
+    elif types[0] == gguf.GGUFValueType.STRING:
+        # String scalar: parts[0] = length, parts[1] = string bytes
+        raw = parts[data_idxs[0]] if data_idxs else parts[-1]
+        if isinstance(raw, np.ndarray):
+            return bytes(raw).decode('utf-8', errors='replace').rstrip('\x00'), False, types[0]
+        elif isinstance(raw, bytes):
+            return raw.decode('utf-8', errors='replace').rstrip('\x00'), False, types[0]
+        return str(raw), False, types[0]
+
+    else:
+        # Scalar type
+        val = parts[data_idxs[0]] if data_idxs else parts[0]
+        if isinstance(val, np.ndarray) and val.size == 1:
+            val = val.flat[0]
+        return val, False, types[0]
+
+
+def write_field_to_writer(writer, name, value, is_array, value_type):
+    """Write a field value to a GGUFWriter."""
+    if is_array:
+        writer.add_array(name, value)
+    elif value_type == gguf.GGUFValueType.STRING:
+        writer.add_string(name, str(value))
+    elif value_type == gguf.GGUFValueType.UINT32:
+        writer.add_uint32(name, int(value))
+    elif value_type == gguf.GGUFValueType.INT32:
+        writer.add_int32(name, int(value))
+    elif value_type == gguf.GGUFValueType.FLOAT32:
+        writer.add_float32(name, float(value))
+    elif value_type == gguf.GGUFValueType.BOOL:
+        writer.add_bool(name, bool(value))
+    elif value_type == gguf.GGUFValueType.UINT64:
+        writer.add_uint64(name, int(value))
+    elif value_type == gguf.GGUFValueType.INT64:
+        writer.add_int64(name, int(value))
+    elif value_type == gguf.GGUFValueType.FLOAT64:
+        writer.add_float64(name, float(value))
+    elif value_type == gguf.GGUFValueType.UINT8:
+        writer.add_uint8(name, int(value))
+    elif value_type == gguf.GGUFValueType.INT8:
+        writer.add_int8(name, int(value))
+    elif value_type == gguf.GGUFValueType.UINT16:
+        writer.add_uint16(name, int(value))
+    elif value_type == gguf.GGUFValueType.INT16:
+        writer.add_int16(name, int(value))
+    else:
+        print(f"  [WARN] Unknown type {value_type} for {name}, skipping")
+
+
 def patch_gguf(input_path: Path, output_path: Path | None = None):
     """Read GGUF, fix rope.dimension_sections, write new GGUF."""
 
@@ -38,8 +134,8 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
     for field in reader.fields.values():
         if 'rope.dimension_sections' in field.name:
             rope_field_name = field.name
-            arr_data = field.parts[-1]
-            rope_sections_old = [int(x) for x in arr_data]
+            value, is_array, vtype = extract_field_value(field)
+            rope_sections_old = value
             break
 
     if rope_field_name is None:
@@ -48,7 +144,7 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
 
     print(f"  Found: {rope_field_name} = {rope_sections_old}")
 
-    if len(rope_sections_old) >= 4:
+    if isinstance(rope_sections_old, list) and len(rope_sections_old) >= 4:
         print(f"  Already has {len(rope_sections_old)} elements, nothing to fix.")
         return
 
@@ -63,13 +159,8 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
     arch = None
     for field in reader.fields.values():
         if field.name == 'general.architecture':
-            data = field.parts[-1]
-            if isinstance(data, np.ndarray):
-                arch = bytes(data).decode('utf-8').rstrip('\x00')
-            elif isinstance(data, bytes):
-                arch = data.decode('utf-8').rstrip('\x00')
-            else:
-                arch = str(data)
+            value, _, _ = extract_field_value(field)
+            arch = str(value)
             break
 
     if arch is None or len(arch) < 2:
@@ -82,79 +173,36 @@ def patch_gguf(input_path: Path, output_path: Path | None = None):
 
     # Copy all metadata, overriding rope.dimension_sections
     print("Copying metadata...")
+    skipped = 0
+    copied = 0
     for field in reader.fields.values():
-        if field.name.startswith('general.') or field.name == 'GGUF.version':
-            continue  # Skip auto-added fields
-
         name = field.name
-        parts = field.parts
-        types = field.types
+
+        # Skip auto-added fields (writer adds these automatically)
+        if name.startswith('GGUF.') or name == 'general.architecture':
+            continue
+
+        # Override rope.dimension_sections
+        if name == rope_field_name:
+            writer.add_array(name, rope_sections_new)
+            print(f"  Patched: {name} = {rope_sections_new}")
+            copied += 1
+            continue
 
         try:
-            if len(parts) == 1 and len(types) == 1:
-                val = parts[0]
-                t = types[0]
-
-                if isinstance(val, np.ndarray):
-                    if val.size == 1:
-                        val = val.flat[0]
-                    elif t == gguf.GGUFValueType.STRING:
-                        val = bytes(val).decode('utf-8').rstrip('\x00')
-
-                if t == gguf.GGUFValueType.STRING:
-                    if isinstance(val, bytes):
-                        val = val.decode('utf-8').rstrip('\x00')
-                    writer.add_string(name, str(val))
-                elif t == gguf.GGUFValueType.UINT32:
-                    writer.add_uint32(name, int(val))
-                elif t == gguf.GGUFValueType.INT32:
-                    writer.add_int32(name, int(val))
-                elif t == gguf.GGUFValueType.FLOAT32:
-                    writer.add_float32(name, float(val))
-                elif t == gguf.GGUFValueType.BOOL:
-                    writer.add_bool(name, bool(val))
-                elif t == gguf.GGUFValueType.UINT64:
-                    writer.add_uint64(name, int(val))
-                elif t == gguf.GGUFValueType.INT64:
-                    writer.add_int64(name, int(val))
-                elif t == gguf.GGUFValueType.FLOAT64:
-                    writer.add_float64(name, float(val))
-                elif t == gguf.GGUFValueType.UINT8:
-                    writer.add_uint8(name, int(val))
-                elif t == gguf.GGUFValueType.INT8:
-                    writer.add_int8(name, int(val))
-                elif t == gguf.GGUFValueType.UINT16:
-                    writer.add_uint16(name, int(val))
-                elif t == gguf.GGUFValueType.INT16:
-                    writer.add_int16(name, int(val))
-            elif len(types) >= 2 and types[0] == gguf.GGUFValueType.ARRAY:
-                arr_type = types[1]
-                arr_data = parts[-1]
-
-                # Override rope.dimension_sections
-                if name == rope_field_name:
-                    writer.add_array(name, rope_sections_new)
-                    print(f"  Patched: {name} = {rope_sections_new}")
-                    continue
-
-                if arr_type == gguf.GGUFValueType.STRING:
-                    str_list = []
-                    for s in arr_data:
-                        if isinstance(s, np.ndarray):
-                            str_list.append(bytes(s).decode('utf-8').rstrip('\x00'))
-                        elif isinstance(s, bytes):
-                            str_list.append(s.decode('utf-8').rstrip('\x00'))
-                        else:
-                            str_list.append(str(s))
-                    writer.add_array(name, str_list)
-                elif arr_type in (gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT32):
-                    writer.add_array(name, [int(x) for x in arr_data])
-                elif arr_type == gguf.GGUFValueType.FLOAT32:
-                    writer.add_array(name, [float(x) for x in arr_data])
+            value, is_array, value_type = extract_field_value(field)
+            if value is None:
+                skipped += 1
+                continue
+            write_field_to_writer(writer, name, value, is_array, value_type)
+            copied += 1
         except Exception as e:
-            print(f"  [WARN] Skipping metadata {name}: {e}")
+            print(f"  [WARN] Skipping {name}: {e}")
+            skipped += 1
 
-    # Copy all tensors (stream data, don't load into RAM)
+    print(f"  Copied {copied} metadata fields ({skipped} skipped)")
+
+    # Copy all tensors
     print(f"Copying {len(reader.tensors)} tensors...")
     tensor_dict = writer.tensors[0]
 

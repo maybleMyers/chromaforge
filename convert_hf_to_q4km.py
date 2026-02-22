@@ -69,26 +69,15 @@ def load_ggml_lib():
     for path in all_paths:
         try:
             lib = ctypes.CDLL(path)
-            # Check if it has the quantization function
+            # Check if it has the quantization function (without ggml_ prefix)
             try:
-                _ = lib.ggml_quantize_q4_K
+                _ = lib.quantize_q4_K
                 print(f"  Loaded ggml library: {path}")
                 return lib
             except AttributeError:
-                # Try alternate name
-                try:
-                    _ = lib.quantize_q4_K
-                    print(f"  Loaded ggml library: {path}")
-                    return lib
-                except AttributeError:
-                    pass
+                pass
         except OSError as e:
-            print(f"  [DEBUG] Failed to load {path}: {e}")
             continue
-
-    if all_paths:
-        print(f"  [DEBUG] Tried {len(all_paths)} libraries, none had quantization functions")
-        print(f"  [DEBUG] First few paths: {all_paths[:3]}")
 
     return None
 
@@ -100,28 +89,28 @@ def init_ggml():
 
     GGML_LIB = load_ggml_lib()
     if GGML_LIB is None:
-        print("  [WARN] Could not load libggml.so, falling back to Python quantization")
+        print("  [WARN] Could not load libggml, falling back to Python quantization")
         return False
 
     try:
-        # size_t ggml_quantize_q4_K(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix)
-        GGML_LIB.ggml_quantize_q4_K.argtypes = [
+        # size_t quantize_q4_K(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix)
+        GGML_LIB.quantize_q4_K.argtypes = [
             POINTER(c_float),  # src
             c_void_p,          # dst
             ctypes.c_int64,    # nrows
             ctypes.c_int64,    # n_per_row
             c_void_p,          # imatrix (can be NULL)
         ]
-        GGML_LIB.ggml_quantize_q4_K.restype = c_size_t
+        GGML_LIB.quantize_q4_K.restype = c_size_t
 
-        GGML_LIB.ggml_quantize_q6_K.argtypes = [
+        GGML_LIB.quantize_q6_K.argtypes = [
             POINTER(c_float),
             c_void_p,
             ctypes.c_int64,
             ctypes.c_int64,
             c_void_p,
         ]
-        GGML_LIB.ggml_quantize_q6_K.restype = c_size_t
+        GGML_LIB.quantize_q6_K.restype = c_size_t
 
         return True
     except AttributeError as e:
@@ -157,7 +146,7 @@ def ggml_quantize_q4_k(data: np.ndarray) -> np.ndarray:
     src_ptr = data.ctypes.data_as(POINTER(c_float))
     dst_ptr = output.ctypes.data_as(c_void_p)
 
-    GGML_LIB.ggml_quantize_q4_K(src_ptr, dst_ptr, nrows, n_per_row, None)
+    GGML_LIB.quantize_q4_K(src_ptr, dst_ptr, nrows, n_per_row, None)
 
     return output
 
@@ -186,7 +175,7 @@ def ggml_quantize_q6_k(data: np.ndarray) -> np.ndarray:
     src_ptr = data.ctypes.data_as(POINTER(c_float))
     dst_ptr = output.ctypes.data_as(c_void_p)
 
-    GGML_LIB.ggml_quantize_q6_K(src_ptr, dst_ptr, nrows, n_per_row, None)
+    GGML_LIB.quantize_q6_K(src_ptr, dst_ptr, nrows, n_per_row, None)
 
     return output
 

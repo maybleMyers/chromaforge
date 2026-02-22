@@ -33,19 +33,31 @@ from ctypes import c_void_p, c_size_t, c_int, c_float, POINTER
 # ---------------------------------------------------------------------------
 
 def load_ggml_lib():
-    """Load libggml for native quantization functions."""
+    """Load libggml for native quantization functions.
+
+    Set GGML_LIB_PATH environment variable to specify the library path.
+    Example: export GGML_LIB_PATH=/path/to/llama.cpp/build/bin
+    """
     import os
     import glob
 
-    # Try common paths - look for both ggml and ggml-base
-    search_patterns = [
+    search_patterns = []
+
+    # Check environment variable first
+    env_path = os.environ.get('GGML_LIB_PATH')
+    if env_path:
+        search_patterns.append(os.path.join(env_path, "libggml*.so*"))
+
+    # Try common relative paths
+    search_patterns.extend([
+        "llama.cpp/build/bin/libggml*.so*",
         "llama.cpp/build/ggml/src/libggml*.so*",
         "llama.cpp/build/src/libggml*.so*",
         "llama.cpp/build/lib/libggml*.so*",
         "llama.cpp/build/libggml*.so*",
         "/usr/local/lib/libggml*.so*",
         "/usr/lib/libggml*.so*",
-    ]
+    ])
 
     all_paths = []
     for pattern in search_patterns:

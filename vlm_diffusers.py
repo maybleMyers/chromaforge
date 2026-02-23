@@ -639,6 +639,71 @@ def create_vlm_moe_device_map(num_layers: int = 60, num_experts: int = 512):
     return device_map, gpu_memory_gb
 
 
+class UnfusedQwen3_5MoeExperts(torch.nn.Module):
+    """
+    Drop-in replacement for Qwen3_5MoeExperts that uses per-expert nn.Linear layers
+    instead of fused 3D nn.Parameter tensors. This allows SDNQ to quantize each expert
+    individually (SDNQ only handles 2D nn.Linear weights, not 3D Parameters).
+
+    Weight names: "{i}.gate_proj.weight", "{i}.up_proj.weight", "{i}.down_proj.weight"
+    which match the checkpoint's per-expert naming directly (no fusion needed).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        from transformers.activations import ACT2FN
+        self.act_fn = ACT2FN[config.hidden_act]
+        for i in range(self.num_experts):
+            expert = torch.nn.Module()
+            expert.gate_proj = torch.nn.Linear(self.hidden_dim, self.intermediate_dim, bias=False)
+            expert.up_proj = torch.nn.Linear(self.hidden_dim, self.intermediate_dim, bias=False)
+            expert.down_proj = torch.nn.Linear(self.intermediate_dim, self.hidden_dim, bias=False)
+            self.add_module(str(i), expert)
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            expert = getattr(self, str(expert_idx.item()))
+            current_state = hidden_states[token_idx]
+            gate = expert.gate_proj(current_state)
+            up = expert.up_proj(current_state)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = expert.down_proj(current_hidden_states)
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        return final_hidden_states
+
+
+def patch_qwen35_moe_experts():
+    """Replace fused 3D expert nn.Parameter with per-expert nn.Linear for SDNQ compatibility."""
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeSparseMoeBlock, Qwen3_5MoeTopKRouter, Qwen3_5MoeMLP,
+    )
+    original_init = Qwen3_5MoeSparseMoeBlock.__init__
+
+    def patched_init(self, config):
+        torch.nn.Module.__init__(self)
+        self.gate = Qwen3_5MoeTopKRouter(config)
+        self.experts = UnfusedQwen3_5MoeExperts(config)
+        self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+    Qwen3_5MoeSparseMoeBlock.__init__ = patched_init
+    print("[SDNQ] Patched Qwen3_5MoeExperts: using per-expert nn.Linear (SDNQ-compatible)")
+    return original_init
+
+
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
     gpus = []
@@ -1215,7 +1280,15 @@ class Qwen3VLMBackend:
                     sdnq_weights_dtype = SDNQ_DTYPE_MAP[dtype]
                     print(f"[SDNQ] Using {sdnq_weights_dtype} quantization")
 
-                    if cpu_offload:
+                    if sdnq_is_moe and cpu_offload:
+                        # MoE: let the device_map control placement (attention→GPU, experts→CPU)
+                        quantization_config = create_sdnq_config_vlm(
+                            weights_dtype=sdnq_weights_dtype,
+                            quantization_device="cuda:0" if self.num_gpus > 0 else None,
+                            return_device=None,
+                        )
+                        print("[SDNQ] MoE CPU offload: quantizing on GPU, device_map controls placement")
+                    elif cpu_offload:
                         quantization_config = create_sdnq_config_vlm(
                             weights_dtype=sdnq_weights_dtype,
                             quantization_device="cuda:0" if self.num_gpus > 0 else None,
@@ -1366,6 +1439,10 @@ class Qwen3VLMBackend:
                     print(f"Loading as Qwen3 VL model (type: {model_type_from_config}) using AutoModelForVision2Seq...")
 
                     if use_sdnq and sdnq_is_moe:
+                        # Monkey-patch Qwen3_5MoeSparseMoeBlock to use per-expert nn.Linear
+                        # instead of fused 3D nn.Parameter (which SDNQ can't quantize)
+                        original_moe_init = patch_qwen35_moe_experts()
+
                         # Patch normal_() to handle int8/uint8 quantized weights
                         # SDNQ quantizes to int/uint types, but transformers tries to reinitialize with normal_()
                         original_normal_ = torch.Tensor.normal_
@@ -1381,6 +1458,9 @@ class Qwen3VLMBackend:
                             self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
                         finally:
                             torch.Tensor.normal_ = original_normal_
+                            # Restore original MoeSparseMoeBlock.__init__ so future non-SDNQ loads are unaffected
+                            from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+                            Qwen3_5MoeSparseMoeBlock.__init__ = original_moe_init
 
                         print(f"Loaded as Qwen3 VL MoE model (type: {model_type_from_config})")
                     else:

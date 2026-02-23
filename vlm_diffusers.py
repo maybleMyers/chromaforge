@@ -1230,11 +1230,17 @@ class Qwen3VLMBackend:
                 model_kwargs["quantization_config"] = quantization_config
 
                 if sdnq_is_moe and cpu_offload:
-                    # MoE + SDNQ + CPU offload: load everything to CPU first,
-                    # then dispatch with explicit device map (avoids accelerate bin-packing hang)
-                    model_kwargs["device_map"] = "cpu"
+                    # MoE + SDNQ + CPU offload: pass explicit device map to from_pretrained
+                    # so accelerate places weights shard-by-shard during loading.
+                    # This avoids both: (1) peak RAM spike from loading to CPU then dispatching,
+                    # and (2) the bin-packing hang from device_map="auto" with 30k+ expert modules.
+                    explicit_device_map, gpu_gb = create_vlm_moe_device_map(
+                        num_layers=sdnq_moe_num_layers,
+                        num_experts=sdnq_moe_num_experts,
+                    )
+                    model_kwargs["device_map"] = explicit_device_map
                     model_kwargs.pop("max_memory", None)
-                    print("[SDNQ] MoE: loading to CPU first, will dispatch with explicit device map after")
+                    print(f"[SDNQ] MoE: using explicit device map (~{gpu_gb:.1f}GB GPU, experts on CPU)")
                 else:
                     model_kwargs["device_map"] = device_map
                     # MoE models need offload_folder to re-save weights during disk offload
@@ -1359,9 +1365,9 @@ class Qwen3VLMBackend:
                 if not loaded and model_type_from_config in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5_moe", "qwen3_5"]:
                     print(f"Loading as Qwen3 VL model (type: {model_type_from_config}) using AutoModelForVision2Seq...")
 
-                    if use_sdnq and sdnq_is_moe and cpu_offload:
+                    if use_sdnq and sdnq_is_moe:
                         # Patch normal_() to handle int8/uint8 quantized weights
-                        # SDNQ quantizes to int8, but transformers tries to reinitialize with normal_()
+                        # SDNQ quantizes to int/uint types, but transformers tries to reinitialize with normal_()
                         original_normal_ = torch.Tensor.normal_
 
                         def safe_normal_(self, mean=0, std=1, *, generator=None):
@@ -1377,21 +1383,6 @@ class Qwen3VLMBackend:
                             torch.Tensor.normal_ = original_normal_
 
                         print(f"Loaded as Qwen3 VL MoE model (type: {model_type_from_config})")
-
-                        # Free GPU memory used during quantization before dispatching
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                        # Dispatch: attention to GPU, MoE experts stay on CPU
-                        from accelerate import dispatch_model
-                        explicit_device_map, gpu_gb = create_vlm_moe_device_map(
-                            num_layers=sdnq_moe_num_layers,
-                            num_experts=sdnq_moe_num_experts,
-                        )
-                        print(f"[SDNQ] Dispatching MoE: ~{gpu_gb:.1f}GB to GPU, experts on CPU")
-                        self.model = dispatch_model(self.model, device_map=explicit_device_map)
-                        print(f"[SDNQ] MoE dispatch complete")
                     else:
                         self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
                         print(f"Loaded as Qwen3 VL model (type: {model_type_from_config})")

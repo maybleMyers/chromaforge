@@ -538,6 +538,7 @@ VLM_SDNQ_SKIP_MODULES = [
     'lm_head',  # Output head
     'norm', 'layernorm', 'ln_f',  # LayerNorms
     'input_layernorm', 'post_attention_layernorm',
+    'shared_expert_gate',  # MoE routing gates must stay in high precision
 ]
 
 
@@ -556,6 +557,86 @@ def create_sdnq_config_vlm(
         return_device=return_device,
         modules_to_not_convert=VLM_SDNQ_SKIP_MODULES,
     )
+
+
+def estimate_vlm_moe_gpu_memory(num_layers: int = 60, hidden_size: int = 4096,
+                                 num_heads: int = 32, num_kv_heads: int = 2,
+                                 head_dim: int = 256, bytes_per_param: float = 2.0):
+    """
+    Estimate GPU memory needed for attention layers + non-MoE components of a VLM MoE model.
+
+    Based on Qwen3.5-397B-A17B architecture. Returns memory in GB.
+    """
+    # Per-layer attention: Q, K, V, O projections
+    q_params = hidden_size * (num_heads * head_dim)
+    k_params = hidden_size * (num_kv_heads * head_dim)
+    v_params = hidden_size * (num_kv_heads * head_dim)
+    o_params = (num_heads * head_dim) * hidden_size
+    attn_params_per_layer = q_params + k_params + v_params + o_params
+
+    # LayerNorms per layer (2 per layer)
+    ln_params_per_layer = 2 * hidden_size * 2  # input_ln + post_attn_ln, weight + bias
+
+    # Per-layer total (non-expert, non-MLP)
+    per_layer = attn_params_per_layer + ln_params_per_layer
+    transformer_params = per_layer * num_layers
+
+    # Embeddings
+    vocab_size = 248320
+    embed_params = vocab_size * hidden_size
+
+    # Vision encoder (~400M params for SigLIP-style)
+    vision_params = 400_000_000
+
+    # Final LN + lm_head
+    final_params = hidden_size + vocab_size * hidden_size
+
+    total_params = transformer_params + embed_params + vision_params + final_params
+    total_bytes = total_params * bytes_per_param
+    total_gb = total_bytes / (1024**3)
+
+    return total_gb
+
+
+def create_vlm_moe_device_map(num_layers: int = 60, num_experts: int = 512):
+    """
+    Create a device_map that keeps attention layers on GPU while offloading MoE experts to CPU.
+
+    Based on Qwen3.5-397B-A17B VLM model structure:
+    - model.language_model.layers.X.self_attn / linear_attn: attention -> GPU
+    - model.language_model.layers.X.mlp: MoE block (experts + gate + shared) -> CPU
+    - Global embeddings/heads/vision -> GPU
+    """
+    device_map = {}
+
+    # 1. Global modules to GPU
+    gpu_modules = [
+        'model.visual',
+        'model.language_model.embed_tokens',
+        'model.language_model.norm',
+        'lm_head',
+    ]
+    for module in gpu_modules:
+        device_map[module] = 0
+
+    # 2. Per-layer mapping
+    for i in range(num_layers):
+        # Attention components -> GPU (latency sensitive, relatively small)
+        device_map[f'model.language_model.layers.{i}.self_attn'] = 0
+        device_map[f'model.language_model.layers.{i}.linear_attn'] = 0
+        device_map[f'model.language_model.layers.{i}.input_layernorm'] = 0
+        device_map[f'model.language_model.layers.{i}.post_attention_layernorm'] = 0
+
+        # Whole MLP block (experts + gate + shared expert) -> CPU
+        device_map[f'model.language_model.layers.{i}.mlp'] = 'cpu'
+
+    # Estimate GPU memory for non-MoE components
+    gpu_memory_gb = estimate_vlm_moe_gpu_memory(num_layers=num_layers)
+
+    experts_on_cpu = num_layers * num_experts
+    print(f"[device_map] VLM MoE attention-priority: ~{gpu_memory_gb:.1f}GB on GPU, {experts_on_cpu} MoE experts on CPU (entire MLP block offloaded)")
+
+    return device_map, gpu_memory_gb
 
 
 def get_gpu_info() -> List[Dict[str, Any]]:
@@ -1061,6 +1142,11 @@ class Qwen3VLMBackend:
                 "attn_implementation": attn_impl,
             }
 
+            # Track MoE detection for SDNQ dispatch (set in SDNQ block below)
+            sdnq_is_moe = False
+            sdnq_moe_num_layers = 0
+            sdnq_moe_num_experts = 0
+
             # For Q8 partial: use BitsAndBytesConfig to quantize language model to INT8
             # but skip vision encoder layers which are sensitive to quantization
             quantization_config = None
@@ -1105,6 +1191,21 @@ class Qwen3VLMBackend:
 
             # For SDNQ: Alternative quantization that avoids bitsandbytes compatibility issues
             elif use_sdnq:
+                # Detect MoE model from config for special handling
+                sdnq_is_moe = False
+                sdnq_moe_num_layers = 0
+                sdnq_moe_num_experts = 0
+                sdnq_config_path = os.path.join(model_path, "config.json")
+                if os.path.exists(sdnq_config_path):
+                    with open(sdnq_config_path, "r") as f:
+                        sdnq_config_data = json.load(f)
+                    text_cfg = sdnq_config_data.get("text_config", {})
+                    sdnq_moe_num_experts = text_cfg.get("num_experts", 0)
+                    sdnq_moe_num_layers = text_cfg.get("num_hidden_layers", 0)
+                    if sdnq_moe_num_experts > 0:
+                        sdnq_is_moe = True
+                        print(f"[SDNQ] Detected MoE model: {sdnq_moe_num_layers} layers, {sdnq_moe_num_experts} experts")
+
                 if prequantized_sdnq_config is not None:
                     # Use pre-quantized model's config
                     quantization_config = prequantized_sdnq_config
@@ -1127,11 +1228,19 @@ class Qwen3VLMBackend:
                         )
 
                 model_kwargs["quantization_config"] = quantization_config
-                model_kwargs["device_map"] = device_map
-                # MoE models need offload_folder to re-save weights during disk offload
-                model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
-                if max_memory is not None:
-                    model_kwargs["max_memory"] = max_memory
+
+                if sdnq_is_moe and cpu_offload:
+                    # MoE + SDNQ + CPU offload: load everything to CPU first,
+                    # then dispatch with explicit device map (avoids accelerate bin-packing hang)
+                    model_kwargs["device_map"] = "cpu"
+                    model_kwargs.pop("max_memory", None)
+                    print("[SDNQ] MoE: loading to CPU first, will dispatch with explicit device map after")
+                else:
+                    model_kwargs["device_map"] = device_map
+                    # MoE models need offload_folder to re-save weights during disk offload
+                    model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
+                    if max_memory is not None:
+                        model_kwargs["max_memory"] = max_memory
 
             # For FP8: Use new musubi-tuner style loading
             # 1. Create model with meta tensors
@@ -1249,8 +1358,44 @@ class Qwen3VLMBackend:
                 # which auto-resolves to the correct class (Qwen3_5MoeForConditionalGeneration, etc.)
                 if not loaded and model_type_from_config in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5_moe", "qwen3_5"]:
                     print(f"Loading as Qwen3 VL model (type: {model_type_from_config}) using AutoModelForVision2Seq...")
-                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
-                    print(f"Loaded as Qwen3 VL model (type: {model_type_from_config})")
+
+                    if use_sdnq and sdnq_is_moe and cpu_offload:
+                        # Patch normal_() to handle int8/uint8 quantized weights
+                        # SDNQ quantizes to int8, but transformers tries to reinitialize with normal_()
+                        original_normal_ = torch.Tensor.normal_
+
+                        def safe_normal_(self, mean=0, std=1, *, generator=None):
+                            """Skip normal_ for integer dtypes (quantized weights)."""
+                            if self.dtype in (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64):
+                                return self
+                            return original_normal_(self, mean, std, generator=generator)
+
+                        torch.Tensor.normal_ = safe_normal_
+                        try:
+                            self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                        finally:
+                            torch.Tensor.normal_ = original_normal_
+
+                        print(f"Loaded as Qwen3 VL MoE model (type: {model_type_from_config})")
+
+                        # Free GPU memory used during quantization before dispatching
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        # Dispatch: attention to GPU, MoE experts stay on CPU
+                        from accelerate import dispatch_model
+                        explicit_device_map, gpu_gb = create_vlm_moe_device_map(
+                            num_layers=sdnq_moe_num_layers,
+                            num_experts=sdnq_moe_num_experts,
+                        )
+                        print(f"[SDNQ] Dispatching MoE: ~{gpu_gb:.1f}GB to GPU, experts on CPU")
+                        self.model = dispatch_model(self.model, device_map=explicit_device_map)
+                        print(f"[SDNQ] MoE dispatch complete")
+                    else:
+                        self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                        print(f"Loaded as Qwen3 VL model (type: {model_type_from_config})")
+
                     loaded = True
 
                 # For Qwen2.5-VL models

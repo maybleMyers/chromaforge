@@ -861,6 +861,7 @@ class LlamaCppVLM:
         messages: List[Dict[str, Any]],
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        top_p: float = 0.95,
         video_max_frames: int = 81,
         every_other_frame: bool = False,
         stream: bool = False,
@@ -935,6 +936,30 @@ class LlamaCppVLM:
                                         "text": f"[Video error: {e}]"
                                     })
 
+                        elif item_type == "audio" and "audio" in item:
+                            audio_path = item["audio"]
+                            if isinstance(audio_path, str) and os.path.exists(audio_path):
+                                try:
+                                    with open(audio_path, "rb") as f:
+                                        b64_audio = base64.b64encode(f.read()).decode("utf-8")
+                                    ext = audio_path.split('.')[-1].lower()
+                                    if ext not in ['wav', 'mp3']:
+                                        ext = 'wav'
+                                    content_parts.append({
+                                        "type": "input_audio",
+                                        "input_audio": {
+                                            "data": b64_audio,
+                                            "format": ext
+                                        }
+                                    })
+                                    has_images = True
+                                except Exception as e:
+                                    print(f"[llama-server] Audio processing error: {e}")
+                                    content_parts.append({
+                                        "type": "text",
+                                        "text": f"[Audio error: {e}]"
+                                    })
+
                     elif isinstance(item, str):
                         if item:
                             content_parts.append({"type": "text", "text": item})
@@ -977,6 +1002,7 @@ class LlamaCppVLM:
             "messages": api_messages,
             "max_tokens": max_new_tokens,
             "temperature": temperature if temperature > 0 else 0.001,
+            "top_p": top_p,
             "stream": stream,
         }
 
@@ -1156,6 +1182,7 @@ class LlamaCppVLM:
         images: Optional[List[Image.Image]] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        top_p: float = 0.95,
         video_max_frames: int = 8,
         every_other_frame: bool = False,
         stream: bool = False,
@@ -1189,6 +1216,7 @@ class LlamaCppVLM:
                 messages=messages,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 video_max_frames=video_max_frames,
                 every_other_frame=every_other_frame,
                 stream=stream,
@@ -1262,6 +1290,7 @@ class LlamaCppVLM:
                             text_parts = []
                             has_images = False
                             has_video = False
+                            has_audio = False
                             for item in content:
                                 if isinstance(item, dict):
                                     if item.get("type") == "text":
@@ -1270,6 +1299,8 @@ class LlamaCppVLM:
                                         has_images = True
                                     elif item.get("type") == "video":
                                         has_video = True
+                                    elif item.get("type") == "audio":
+                                        has_audio = True
                                 elif isinstance(item, str):
                                     text_parts.append(item)
 
@@ -1281,6 +1312,8 @@ class LlamaCppVLM:
                                 final_text = f"[Note: Images were provided but this model is text-only] {final_text}"
                             if has_video:
                                 final_text = f"[Note: Video was provided but this model is text-only] {final_text}"
+                            if has_audio:
+                                final_text = f"[Note: Audio was provided but this model is text-only] {final_text}"
 
                             llama_messages.append({"role": "user", "content": final_text if final_text else "Hello"})
                         else:
@@ -1320,6 +1353,27 @@ class LlamaCppVLM:
                                                 parts.append({
                                                     "type": "text",
                                                     "text": f"[Video error: {e}]"
+                                                })
+                                    elif item.get("type") == "audio" and "audio" in item:
+                                        audio_path = item["audio"]
+                                        if isinstance(audio_path, str) and os.path.exists(audio_path):
+                                            try:
+                                                with open(audio_path, "rb") as f:
+                                                    b64_audio = base64.b64encode(f.read()).decode("utf-8")
+                                                ext = audio_path.split('.')[-1].lower()
+                                                if ext not in ['wav', 'mp3']:
+                                                    ext = 'wav'
+                                                parts.append({
+                                                    "type": "input_audio",
+                                                    "input_audio": {
+                                                        "data": b64_audio,
+                                                        "format": ext
+                                                    }
+                                                })
+                                            except Exception as e:
+                                                parts.append({
+                                                    "type": "text",
+                                                    "text": f"[Audio error: {e}]"
                                                 })
 
                             if parts:
@@ -1367,6 +1421,7 @@ class LlamaCppVLM:
                 "messages": llama_messages,
                 "max_tokens": max_new_tokens,
                 "temperature": temperature if temperature > 0 else 0.001,
+                "top_p": top_p,
             }
 
             # Note: reasoning_effort for GPT-OSS is only supported via llama-server backend
@@ -1536,6 +1591,7 @@ DEFAULT_SETTINGS = {
     "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
     "max_tokens": 8096,
     "temperature": 0.7,
+    "top_p": 0.95,
     "video_max_frames": 8,
     "every_other_frame": False,
     "show_thinking": True,
@@ -1566,6 +1622,7 @@ def save_settings(
     system_prompt: str,
     max_tokens: int,
     temperature: float,
+    top_p: float,
     video_max_frames: int,
     every_other_frame: bool,
     show_thinking: bool,
@@ -1595,6 +1652,7 @@ def save_settings(
         "system_prompt": system_prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "top_p": top_p,
         "video_max_frames": video_max_frames,
         "every_other_frame": every_other_frame,
         "show_thinking": show_thinking,
@@ -1750,8 +1808,10 @@ def chat_handler(
     image3,
     image4,
     video,
+    audio,
     max_tokens: int,
     temperature: float,
+    top_p: float,
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     show_thinking: bool = False,
@@ -1807,6 +1867,9 @@ def chat_handler(
     if video is not None:
         model_content.append({"type": "video", "video": video})
 
+    if audio is not None:
+        model_content.append({"type": "audio", "audio": audio})
+
     if message.strip():
         model_content.append({"type": "text", "text": message})
     elif not model_content:
@@ -1843,6 +1906,12 @@ def chat_handler(
         # Use dict with "path" key for file content in chatbot
         new_history.append({"role": "user", "content": {"path": video}})
 
+    elif audio is not None:
+        display_text = message if message else "Describe this audio"
+        new_history.append({"role": "user", "content": display_text})
+        # Use dict with "path" key for file content in chatbot
+        new_history.append({"role": "user", "content": {"path": audio}})
+
     else:
         new_history.append({"role": "user", "content": message})
 
@@ -1860,6 +1929,7 @@ def chat_handler(
         messages=messages,
         max_new_tokens=max_tokens,
         temperature=temperature,
+        top_p=top_p,
         video_max_frames=video_max_frames,
         every_other_frame=every_other_frame,
         stream=True,
@@ -2084,6 +2154,10 @@ def create_ui():
                     video_input = gr.Video(
                         label="Upload Video (optional)",
                         height=150,
+                    )
+                    audio_input = gr.Audio(
+                        label="Upload Audio (optional)",
+                        type="filepath",
                     )
 
                 # Message input row
@@ -2314,6 +2388,13 @@ def create_ui():
                     step=0.1,
                     label="Temperature",
                 )
+                top_p = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=saved_settings.get("top_p", DEFAULT_SETTINGS["top_p"]),
+                    step=0.05,
+                    label="Top P",
+                )
                 video_max_frames = gr.Slider(
                     minimum=1,
                     maximum=201,
@@ -2387,26 +2468,26 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, max_tok, temp, vid_frames, every_other, thinking, reasoning):
-            if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None:
-                yield history, "", None, None, None, None, None, "", ""
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, vid_frames, every_other, thinking, reasoning):
+            if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None and aud is None:
+                yield history, "", None, None, None, None, None, None, "", ""
                 return
 
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
-                msg, history, sys_prompt, img1, img2, img3, img4, vid,
-                max_tok, temp, vid_frames, every_other, thinking, reasoning
+                msg, history, sys_prompt, img1, img2, img3, img4, vid, aud,
+                max_tok, temp, top_p_val, vid_frames, every_other, thinking, reasoning
             ):
-                yield new_history, "", None, None, None, None, None, stats, ctx_info
+                yield new_history, "", None, None, None, None, None, None, stats, ctx_info
 
         send_btn.click(
             fn=send_message,
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
         )
 
         msg_input.submit(
@@ -2414,9 +2495,9 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, max_tokens, temperature, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, stats_display, context_display],
+            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
         )
 
         clear_btn.click(
@@ -2447,7 +2528,7 @@ def create_ui():
                 use_mmap, use_mlock, override_tensor, extra_args,
                 server_port, llama_server_path,
                 # Generation Settings
-                system_prompt, max_tokens, temperature, video_max_frames,
+                system_prompt, max_tokens, temperature, top_p, video_max_frames,
                 every_other_frame, show_thinking, reasoning_level,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt

@@ -1035,6 +1035,7 @@ class LlamaCppVLM:
                 token_count = 0
                 prompt_tokens = 0
                 ctx_info = ""  # Initialize context info for streaming
+                in_reasoning = False  # Tracks whether we've opened a <think> tag we haven't closed yet
                 print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
@@ -1071,21 +1072,22 @@ class LlamaCppVLM:
 
                                     # Handle reasoning_content (GLM-4.7 thinking mode)
                                     if reasoning_content:
-                                        # Wrap in <think> tags for compatibility with existing display logic
-                                        if not accumulated or not accumulated.rstrip().endswith(">"):
-                                            # First reasoning token - open the think tag
-                                            if not accumulated:
-                                                accumulated = "<think>"
-                                            elif "</think>" not in accumulated:
-                                                accumulated += "<think>"
+                                        # Wrap in <think> tags for compatibility with existing display logic.
+                                        # Only open the tag once, on the first reasoning token - track this
+                                        # with an explicit flag rather than inferring it from the string,
+                                        # since arbitrary token text won't reliably end in ">".
+                                        if not in_reasoning:
+                                            accumulated += "<think>"
+                                            in_reasoning = True
                                         accumulated += reasoning_content
                                         token_count += 1
 
                                     # Handle regular content
                                     if content:
                                         # Close think tag if we were in reasoning mode
-                                        if accumulated and "<think>" in accumulated and "</think>" not in accumulated:
+                                        if in_reasoning:
                                             accumulated += "</think>"
+                                            in_reasoning = False
                                         accumulated += content
                                         token_count += 1
 
@@ -1122,8 +1124,9 @@ class LlamaCppVLM:
                 print(f"[llama-server] Done: {token_count} tokens in {generation_time:.2f}s ({final_speed:.1f} tok/s) | ctx: {total_ctx_used}/{ctx_total}")
 
                 # Ensure think tag is closed if model only produced reasoning content
-                if accumulated and "<think>" in accumulated and "</think>" not in accumulated:
+                if in_reasoning:
                     accumulated += "</think>"
+                    in_reasoning = False
 
                 if accumulated:
                     # Create final display_text with thinking stripped

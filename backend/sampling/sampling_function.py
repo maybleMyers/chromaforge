@@ -483,6 +483,27 @@ def sampling_prepare(unet, x, p=None):
             )
             print(f"Z-Image: Auto mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
 
+    is_krea2 = getattr(getattr(real_model, 'config', None), 'is_krea2', False)
+
+    if is_krea2 and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'apply_mu_transform'):
+        manual_shift = getattr(opts, 'krea2_shift_override', 1.15)
+
+        if manual_shift > 0:
+            real_model.predictor.apply_mu_transform(shift_override=manual_shift)
+            print(f"Krea2: Using constant mu={manual_shift:.4f} for {H}x{W} latents")
+        else:
+            # Resolution-derived mu for the Raw (undistilled) model: linear in image
+            # sequence length between 256px (seq 256) and 1280px (seq 6400) endpoints.
+            image_seq_len = (H // 2) * (W // 2)
+            real_model.predictor.apply_mu_transform(
+                seq_len=image_seq_len,
+                base_seq_len=256,
+                max_seq_len=6400,
+                base_shift=0.5,
+                max_shift=1.15,
+            )
+            print(f"Krea2: Auto mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
+
     # Set up APG (Adaptive Projected Guidance) if enabled
     # Read from p first, fall back to opts
     apg_enabled = getattr(p, 'apg_enabled', None) if p else None

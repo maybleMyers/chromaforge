@@ -1103,6 +1103,25 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
         print("DEBUG: Loaded Chroma2 components:", list(huggingface_components.keys()))
         return Chroma2Klein(estimated_config=estimated_config, huggingface_components=huggingface_components)
 
+    if preset == 'krea2':
+        print("DEBUG: Loading Krea2 model from preset")
+        from backend.diffusion_engine.krea2 import Krea2
+
+        state_dicts = {'transformer': load_torch_file(sd)}
+
+        if additional_state_dicts:
+            for module_path in additional_state_dicts:
+                module_sd = load_torch_file(module_path)
+                if 'decoder.conv_in.weight' in module_sd:
+                    state_dicts['vae'] = module_sd
+                elif 'language_model.embed_tokens.weight' in module_sd or 'model.language_model.embed_tokens.weight' in module_sd:
+                    state_dicts['text_encoder'] = module_sd
+                else:
+                    print(f'Krea2: Could not identify additional module {module_path}, ignoring')
+
+        print("DEBUG: Loaded Krea2 components:", list(state_dicts.keys()))
+        return Krea2(state_dicts=state_dicts)
+
     try:
         state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
     except:

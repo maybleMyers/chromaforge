@@ -957,6 +957,131 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         if state.job_count == -1:
             state.job_count = p.n_iter
 
+        deferred_batches = []
+        infotext = None
+
+        def finalize_batch(n, samples_ddim):
+            nonlocal infotext
+
+            if getattr(samples_ddim, 'already_decoded', False):
+                x_samples_ddim = samples_ddim
+            else:
+                devices.test_for_nans(samples_ddim, "unet")
+
+                if opts.sd_vae_decode_method != 'Full':
+                    p.extra_generation_params['VAE Decoder'] = opts.sd_vae_decode_method
+                try:
+                    x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
+                except memory_management.OOM_EXCEPTION as e:
+                    memory_management.emergency_memory_cleanup()
+                    raise RuntimeError(
+                        "Out of memory during VAE decode. Memory has been cleared. "
+                        "Please try again with a smaller resolution or use tiled VAE decoding."
+                    ) from e
+
+            x_samples_ddim = torch.stack(x_samples_ddim).float()
+            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+            del samples_ddim
+
+            devices.torch_gc()
+
+            if p.scripts is not None:
+                p.scripts.postprocess_batch(p, x_samples_ddim, batch_number=n)
+
+                p.prompts = p.all_prompts[n * p.batch_size:(n + 1) * p.batch_size]
+                p.negative_prompts = p.all_negative_prompts[n * p.batch_size:(n + 1) * p.batch_size]
+
+                batch_params = scripts.PostprocessBatchListArgs(list(x_samples_ddim))
+                p.scripts.postprocess_batch_list(p, batch_params, batch_number=n)
+                x_samples_ddim = batch_params.images
+
+            def infotext(index=0, use_main_prompt=False):
+                return create_infotext(p, p.prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=p.negative_prompts)
+
+            save_samples = p.save_samples()
+
+            for i, x_sample in enumerate(x_samples_ddim):
+                p.batch_index = i
+
+                x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
+                x_sample = x_sample.astype(np.uint8)
+
+                if p.restore_faces:
+                    if save_samples and opts.save_images_before_face_restoration:
+                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-face-restoration")
+
+                    devices.torch_gc()
+
+                    x_sample = modules.face_restoration.restore_faces(x_sample)
+                    devices.torch_gc()
+
+                image = Image.fromarray(x_sample)
+
+                if p.scripts is not None:
+                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
+                    p.scripts.postprocess_image(p, pp)
+                    image = pp.image
+
+                mask_for_overlay = getattr(p, "mask_for_overlay", None)
+
+                if not shared.opts.overlay_inpaint:
+                    overlay_image = None
+                elif getattr(p, "overlay_images", None) is not None and i < len(p.overlay_images):
+                    overlay_image = p.overlay_images[i]
+                else:
+                    overlay_image = None
+
+                if p.scripts is not None:
+                    ppmo = scripts.PostProcessMaskOverlayArgs(i, mask_for_overlay, overlay_image)
+                    p.scripts.postprocess_maskoverlay(p, ppmo)
+                    mask_for_overlay, overlay_image = ppmo.mask_for_overlay, ppmo.overlay_image
+
+                if p.color_corrections is not None and i < len(p.color_corrections):
+                    if save_samples and opts.save_images_before_color_correction:
+                        image_without_cc, _ = apply_overlay(image, p.paste_to, overlay_image)
+                        images.save_image(image_without_cc, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-color-correction")
+                    image = apply_color_correction(p.color_corrections[i], image)
+
+                # If the intention is to show the output from the model
+                # that is being composited over the original image,
+                # we need to keep the original image around
+                # and use it in the composite step.
+                image, original_denoised_image = apply_overlay(image, p.paste_to, overlay_image)
+
+                p.pixels_after_sampling.append(image)
+
+                if p.scripts is not None:
+                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
+                    p.scripts.postprocess_image_after_composite(p, pp)
+                    image = pp.image
+
+                if save_samples:
+                    images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p)
+
+                text = infotext(i)
+                infotexts.append(text)
+                if opts.enable_pnginfo:
+                    image.info["parameters"] = text
+                output_images.append(image)
+
+                if mask_for_overlay is not None:
+                    if opts.return_mask or opts.save_mask:
+                        image_mask = mask_for_overlay.convert('RGB')
+                        if save_samples and opts.save_mask:
+                            images.save_image(image_mask, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-mask")
+                        if opts.return_mask:
+                            output_images.append(image_mask)
+
+                    if opts.return_mask_composite or opts.save_mask_composite:
+                        image_mask_composite = Image.composite(original_denoised_image.convert('RGBA').convert('RGBa'), Image.new('RGBa', image.size), images.resize_image(2, mask_for_overlay, image.width, image.height).convert('L')).convert('RGBA')
+                        if save_samples and opts.save_mask_composite:
+                            images.save_image(image_mask_composite, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-mask-composite")
+                        if opts.return_mask_composite:
+                            output_images.append(image_mask_composite)
+
+            del x_samples_ddim
+
         for n in range(p.n_iter):
             p.iteration = n
 
@@ -1146,24 +1271,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.post_sample(p, ps)
                 samples_ddim = ps.samples
 
-            if getattr(samples_ddim, 'already_decoded', False):
-                x_samples_ddim = samples_ddim
+            defer_decode = (
+                opts.defer_batch_vae_decode
+                and p.n_iter > 1
+                and shared.sd_model.forge_objects.vae is not None
+                and not getattr(samples_ddim, 'already_decoded', False)
+            )
+
+            if defer_decode:
+                deferred_batches.append((n, samples_ddim.to(devices.cpu)))
             else:
-                devices.test_for_nans(samples_ddim, "unet")
-
-                if opts.sd_vae_decode_method != 'Full':
-                    p.extra_generation_params['VAE Decoder'] = opts.sd_vae_decode_method
-                try:
-                    x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
-                except memory_management.OOM_EXCEPTION as e:
-                    memory_management.emergency_memory_cleanup()
-                    raise RuntimeError(
-                        "Out of memory during VAE decode. Memory has been cleared. "
-                        "Please try again with a smaller resolution or use tiled VAE decoding."
-                    ) from e
-
-            x_samples_ddim = torch.stack(x_samples_ddim).float()
-            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                finalize_batch(n, samples_ddim)
 
             del samples_ddim
 
@@ -1171,102 +1289,19 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             state.nextjob()
 
-            if p.scripts is not None:
-                p.scripts.postprocess_batch(p, x_samples_ddim, batch_number=n)
-
+        if deferred_batches:
+            print(f"[Deferred Decode] Decoding {len(deferred_batches)} deferred batches at end of generation ...")
+            for n, samples_ddim in deferred_batches:
+                p.iteration = n
                 p.prompts = p.all_prompts[n * p.batch_size:(n + 1) * p.batch_size]
                 p.negative_prompts = p.all_negative_prompts[n * p.batch_size:(n + 1) * p.batch_size]
+                p.seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
+                p.subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
+                shared.state.job = f"Decoding batch {n + 1} out of {p.n_iter}"
 
-                batch_params = scripts.PostprocessBatchListArgs(list(x_samples_ddim))
-                p.scripts.postprocess_batch_list(p, batch_params, batch_number=n)
-                x_samples_ddim = batch_params.images
+                finalize_batch(n, samples_ddim)
 
-            def infotext(index=0, use_main_prompt=False):
-                return create_infotext(p, p.prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=p.negative_prompts)
-
-            save_samples = p.save_samples()
-
-            for i, x_sample in enumerate(x_samples_ddim):
-                p.batch_index = i
-
-                x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
-                x_sample = x_sample.astype(np.uint8)
-
-                if p.restore_faces:
-                    if save_samples and opts.save_images_before_face_restoration:
-                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-face-restoration")
-
-                    devices.torch_gc()
-
-                    x_sample = modules.face_restoration.restore_faces(x_sample)
-                    devices.torch_gc()
-
-                image = Image.fromarray(x_sample)
-
-                if p.scripts is not None:
-                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
-                    p.scripts.postprocess_image(p, pp)
-                    image = pp.image
-
-                mask_for_overlay = getattr(p, "mask_for_overlay", None)
-
-                if not shared.opts.overlay_inpaint:
-                    overlay_image = None
-                elif getattr(p, "overlay_images", None) is not None and i < len(p.overlay_images):
-                    overlay_image = p.overlay_images[i]
-                else:
-                    overlay_image = None
-
-                if p.scripts is not None:
-                    ppmo = scripts.PostProcessMaskOverlayArgs(i, mask_for_overlay, overlay_image)
-                    p.scripts.postprocess_maskoverlay(p, ppmo)
-                    mask_for_overlay, overlay_image = ppmo.mask_for_overlay, ppmo.overlay_image
-
-                if p.color_corrections is not None and i < len(p.color_corrections):
-                    if save_samples and opts.save_images_before_color_correction:
-                        image_without_cc, _ = apply_overlay(image, p.paste_to, overlay_image)
-                        images.save_image(image_without_cc, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-color-correction")
-                    image = apply_color_correction(p.color_corrections[i], image)
-
-                # If the intention is to show the output from the model
-                # that is being composited over the original image,
-                # we need to keep the original image around
-                # and use it in the composite step.
-                image, original_denoised_image = apply_overlay(image, p.paste_to, overlay_image)
-
-                p.pixels_after_sampling.append(image)
-
-                if p.scripts is not None:
-                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
-                    p.scripts.postprocess_image_after_composite(p, pp)
-                    image = pp.image
-
-                if save_samples:
-                    images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p)
-
-                text = infotext(i)
-                infotexts.append(text)
-                if opts.enable_pnginfo:
-                    image.info["parameters"] = text
-                output_images.append(image)
-
-                if mask_for_overlay is not None:
-                    if opts.return_mask or opts.save_mask:
-                        image_mask = mask_for_overlay.convert('RGB')
-                        if save_samples and opts.save_mask:
-                            images.save_image(image_mask, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-mask")
-                        if opts.return_mask:
-                            output_images.append(image_mask)
-
-                    if opts.return_mask_composite or opts.save_mask_composite:
-                        image_mask_composite = Image.composite(original_denoised_image.convert('RGBA').convert('RGBa'), Image.new('RGBa', image.size), images.resize_image(2, mask_for_overlay, image.width, image.height).convert('L')).convert('RGBA')
-                        if save_samples and opts.save_mask_composite:
-                            images.save_image(image_mask_composite, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-mask-composite")
-                        if opts.return_mask_composite:
-                            output_images.append(image_mask_composite)
-
-            del x_samples_ddim
-
+            deferred_batches.clear()
             devices.torch_gc()
 
         if not infotexts:

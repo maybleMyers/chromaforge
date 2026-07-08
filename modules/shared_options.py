@@ -254,6 +254,7 @@ options_templates.update(options_section(('optimizations', "Optimizations", "sd"
     "persistent_cond_cache": OptionInfo(True, "Persistent cond cache").info("do not recalculate conds from prompts if prompts have not changed since previous calculation"),
     "batch_cond_uncond": OptionInfo(True, "Batch cond/uncond").info("do both conditional and unconditional denoising in one batch; uses a bit more VRAM during sampling, but improves speed; previously this was controlled by --always-batch-cond-uncond commandline argument"),
     "fp8_storage": OptionInfo("Disable", "FP8 weight", gr.Radio, {"choices": ["Disable", "Enable for SDXL", "Enable"]}).info("Use FP8 to store Linear/Conv layers' weight. Require pytorch>=2.1.0."),
+    "defer_batch_vae_decode": OptionInfo(False, "Defer VAE decode until end of generation").info("with batch count > 1, keep all latents and decode them together after the last batch finishes sampling; avoids swapping the diffusion model out for the VAE between every image when VRAM is tight; images only appear/save once all sampling is done"),
     "cache_fp16_weight": OptionInfo(False, "Cache FP16 weight for LoRA").info("Cache fp16 weight when enabling FP8, will increase the quality of LoRA. Use more system ram."),
 }))
 

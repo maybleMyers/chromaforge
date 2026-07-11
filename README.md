@@ -86,6 +86,7 @@ Donate to Lodestone (training is bookoo expensive and crowdfunded): https://ko-f
 Discord for help etc. https://discord.gg/wDaEfNGuCX  
 
 ## Changlog
+7/11/26 Add support for Krea2. Update memory management. Add option in settings for deferred vae decode to stop swapping models.
 1/27/26 Z-image SFT supported in the z tab. Use CFG of 4-5 and 30-50 steps. https://huggingface.co/maybleMyers/z-image/blob/main/z_image_merged_bf16_SFT.safetensors  
 1/26/26 Add support for Kaleidoscope chroma model. Supports klein 4b in the chroma2 tab as well.    
 1/23/26  Add support for latest chroma radiance model.

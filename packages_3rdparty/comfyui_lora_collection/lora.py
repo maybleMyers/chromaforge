@@ -296,7 +296,9 @@ def model_lora_keys_unet(model, key_map={}):
             else:
                 key_map["{}".format(k)] = k #generic lora format for not .weight without any weird key names
 
-    diffusers_keys = utils.unet_to_diffusers(model.diffusion_model.config)
+    # Wrapped transformers (e.g. Krea2) have no diffusers UNet config dict
+    unet_config = getattr(model.diffusion_model, "config", None)
+    diffusers_keys = utils.unet_to_diffusers(unet_config) if isinstance(unet_config, dict) else {}
     for k in diffusers_keys:
         if k.endswith(".weight"):
             unet_key = "diffusion_model.{}".format(diffusers_keys[k])
@@ -353,6 +355,10 @@ def model_lora_keys_unet(model, key_map={}):
                 key_map["transformer.{}".format(k[:-len(".weight")])] = to  # simpletrainer and probably regular diffusers flux lora format
                 key_map["lycoris_{}".format(k[:-len(".weight")].replace(".", "_"))] = to  # simpletrainer lycoris
                 key_map["lora_transformer_{}".format(k[:-len(".weight")].replace(".", "_"))] = to  # onetrainer
+
+    if getattr(config, 'is_krea2', False) or repo == 'krea2':  # Krea 2 LoRA
+        from backend.nn.krea2 import krea2_lora_key_map
+        krea2_lora_key_map(sdk, key_map)
 
     # Z-Image LoRA support
     is_zimage = (config is not None and getattr(config, 'is_zimage', False)) or repo == 'z-image'

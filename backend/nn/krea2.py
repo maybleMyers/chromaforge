@@ -533,6 +533,57 @@ def convert_diffusers_krea2_state_dict(sd):
     return out
 
 
+# Inverse of the _convert_krea2_block_key / convert_diffusers_krea2_state_dict
+# renames, for mapping Diffusers-named LoRA keys onto the reference model.
+_KREA2_REFERENCE_TO_DIFFUSERS = [
+    ('first.', 'img_in.'),
+    ('tmlp.0.', 'time_embed.linear_1.'),
+    ('tmlp.2.', 'time_embed.linear_2.'),
+    ('tproj.1.', 'time_mod_proj.'),
+    ('txtmlp.1.', 'txt_in.linear_1.'),
+    ('txtmlp.3.', 'txt_in.linear_2.'),
+    ('txtfusion.', 'text_fusion.'),
+    ('blocks.', 'transformer_blocks.'),
+    ('last.linear.', 'final_layer.linear.'),
+    ('attn.wq.', 'attn.to_q.'),
+    ('attn.wk.', 'attn.to_k.'),
+    ('attn.wv.', 'attn.to_v.'),
+    ('attn.gate.', 'attn.to_gate.'),
+    ('attn.wo.', 'attn.to_out.0.'),
+    ('mlp.gate.', 'ff.gate.'),
+    ('mlp.up.', 'ff.up.'),
+    ('mlp.down.', 'ff.down.'),
+]
+
+
+def krea2_lora_key_map(sdk, key_map):
+    """Build LoRA-file-key -> model-key mappings for Krea 2.
+
+    The transformer sits behind Krea2TransformerWrapper, so model state dict
+    keys are 'diffusion_model.mmdit.blocks...' while LoRA files address the
+    bare reference names ('blocks.N.attn.wq') or the Diffusers renames
+    ('transformer_blocks.N.attn.to_q'); register both spellings under the
+    common LoRA prefix conventions."""
+    for k in sdk:
+        if not (k.startswith('diffusion_model.') and k.endswith('.weight')):
+            continue
+        inner = k[len('diffusion_model.'):-len('.weight')]
+        if inner.startswith('mmdit.'):
+            inner = inner[len('mmdit.'):]
+        # The rename table matches with trailing dots, so convert before
+        # stripping the '.weight' suffix.
+        diffusers = inner + '.weight'
+        for ref, diff in _KREA2_REFERENCE_TO_DIFFUSERS:
+            diffusers = diffusers.replace(ref, diff)
+        diffusers = diffusers[:-len('.weight')]
+        for name in {inner, diffusers}:
+            key_map['diffusion_model.{}'.format(name)] = k
+            key_map['transformer.{}'.format(name)] = k  # diffusers/PEFT
+            key_map['lora_unet_{}'.format(name.replace('.', '_'))] = k  # kohya
+            key_map['lycoris_{}'.format(name.replace('.', '_'))] = k
+    return key_map
+
+
 class Krea2QwenVAE(torch.nn.Module):
     """Wraps the Qwen-Image VAE (AutoencoderKLQwenImage, f8 / 16 latent channels)
     behind the 4D encode/decode interface that Forge's VAE patcher expects, with

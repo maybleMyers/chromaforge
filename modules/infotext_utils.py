@@ -175,7 +175,7 @@ def connect_paste_params_buttons():
         destination_height_component = next(iter([field for field, name in fields if name == "Size-2"] if fields else []), None)
 
         if binding.source_image_component and destination_image_component:
-            need_send_dementions = destination_width_component and binding.tabname != 'inpaint'
+            need_send_dementions = destination_width_component is not None
             if isinstance(binding.source_image_component, gr.Gallery):
                 func = send_image_and_dimensions if need_send_dementions else image_from_url_text
                 jsfunc = "extract_image_from_gallery"
@@ -195,13 +195,42 @@ def connect_paste_params_buttons():
             connect_paste(binding.paste_button, fields, binding.source_text_component, override_settings_component, binding.tabname)
 
         if binding.source_tabname is not None and fields is not None:
-            paste_field_names = ['Prompt', 'Negative prompt', 'Steps', 'Face restoration'] + (["Seed"] if shared.opts.send_seed else []) + binding.paste_field_names
-            binding.paste_button.click(
-                fn=lambda *x: x,
-                inputs=[field for field, name in paste_fields[binding.source_tabname]["fields"] if name in paste_field_names],
-                outputs=[field for field, name in fields if name in paste_field_names],
-                show_progress=False,
-            )
+            paste_field_names = [
+                'Prompt', 'Negative prompt', 'Steps', 'Face restoration',
+                'CFG scale', 'Distilled CFG Scale', 'Batch size',
+                'sampler_name', 'scheduler',
+                'Z-Image Shift', 'Sigma Rescale Start', 'Sigma Rescale End',
+                'APG Eta', 'APG Momentum', 'APG Threshold',
+            ] + (["Seed"] if shared.opts.send_seed else []) + binding.paste_field_names
+
+            def field_name(field):
+                # a field's target may be a callable instead of a label (e.g. sampler);
+                # those are matched through their api name instead
+                return getattr(field, 'label', None) or getattr(field, 'api', None)
+
+            # pair source and destination components by field name, so tabs whose field
+            # lists differ or are ordered differently still copy each value to the right place
+            source_components = {}
+            for field in paste_fields[binding.source_tabname]["fields"]:
+                name = field_name(field)
+                if name in paste_field_names and name not in source_components:
+                    source_components[name] = field[0]
+
+            copy_inputs = []
+            copy_outputs = []
+            for field in fields:
+                name = field_name(field)
+                if name in source_components:
+                    copy_inputs.append(source_components.pop(name))
+                    copy_outputs.append(field[0])
+
+            if copy_outputs:
+                binding.paste_button.click(
+                    fn=lambda *x: x,
+                    inputs=copy_inputs,
+                    outputs=copy_outputs,
+                    show_progress=False,
+                )
 
         binding.paste_button.click(
             fn=None,

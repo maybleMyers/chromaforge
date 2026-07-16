@@ -90,8 +90,13 @@ def unload_all_models_clicked():
     return
 
 
-def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
+def make_checkpoint_selection_components():
+    """Create the quicksettings Checkpoint / VAE-TE dropdowns early and unrendered, so
+    txt2img/img2img submit events can list them as inputs (per-session model capture).
+    They are rendered into the quicksettings row by make_checkpoint_manager_ui()."""
+    global ui_checkpoint, ui_vae, ui_forge_preset
+
+    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'chroma2', 'z', 'krea2', 'all'], elem_id="forge_ui_preset", render=False)
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -99,14 +104,13 @@ def make_checkpoint_manager_ui():
         if len(sd_models.checkpoints_list) > 0:
             shared.opts.set('sd_model_checkpoint', next(iter(sd_models.checkpoints_list.values())).name)
 
-    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'chroma2', 'z', 'krea2', 'all'], elem_id="forge_ui_preset")
-
     ckpt_list, vae_list = refresh_models()
 
     ui_checkpoint = gr.Dropdown(
         value=lambda: shared.opts.sd_model_checkpoint,
         label="Checkpoint",
         elem_classes=['model_selection'],
+        render=False,
         choices=ckpt_list
     )
 
@@ -117,6 +121,17 @@ def make_checkpoint_manager_ui():
         render=False,
         choices=vae_list
     )
+
+
+def make_checkpoint_manager_ui():
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
+
+    if ui_checkpoint is None:
+        make_checkpoint_selection_components()
+
+    ui_forge_preset.render()
+
+    ui_checkpoint.render()
 
     def gr_refresh_models():
         a, b = refresh_models()
@@ -143,6 +158,17 @@ def make_checkpoint_manager_ui():
     )
 
     ui_vae.render()
+
+    def save_modules_default(preset, module_values):
+        names = [os.path.basename(v) for v in (module_values or [])]
+        defaults = dict(shared.opts.data.get('forge_preset_module_defaults', {}))
+        defaults[preset] = names
+        shared.opts.set('forge_preset_module_defaults', defaults)
+        shared.opts.save(shared.config_filename)
+        gr.Info(f'Saved VAE / Text Encoder default for "{preset}": {", ".join(names) if names else "(none)"}')
+
+    save_modules_default_button = ui_common.ToolButton(value='💾', elem_id='forge_save_modules_default', tooltip='Save the current VAE / Text Encoder selection as the default for the current UI preset. It is auto-selected whenever this preset is chosen.')
+    save_modules_default_button.click(save_modules_default, inputs=[ui_forge_preset, ui_vae], show_progress=False, queue=False)
 
     ui_forge_unet_storage_dtype_options = gr.Dropdown(label="Diffusion in Low Bits", value=lambda: shared.opts.forge_unet_storage_dtype, choices=list(forge_unet_storage_dtype_options.keys()))
     bind_to_opts(ui_forge_unet_storage_dtype_options, 'forge_unet_storage_dtype', save=True, callback=refresh_model_loading_parameters)
@@ -172,8 +198,11 @@ def make_checkpoint_manager_ui():
     ui_z_text_encoder_dtype = gr.Dropdown(label="Z-Image Text Encoder Precision", value=lambda: shared.opts.z_text_encoder_dtype, choices=z_precision_options)
     bind_to_opts(ui_z_text_encoder_dtype, 'z_text_encoder_dtype', save=True, callback=refresh_model_loading_parameters)
 
-    ui_checkpoint.change(checkpoint_change, inputs=[ui_checkpoint], show_progress=False)
-    ui_vae.change(modules_change, inputs=[ui_vae], queue=False, show_progress=False)
+    # Persist the selection as the default for new sessions only; the per-tab value is
+    # captured with each submit and staged per job in processing.process_images, so a
+    # change in one tab must not restage the loading parameters other tabs' jobs use.
+    ui_checkpoint.change(lambda v: checkpoint_change(v, save=True, refresh=False), inputs=[ui_checkpoint], show_progress=False)
+    ui_vae.change(lambda v: modules_change(v, save=True, refresh=False), inputs=[ui_vae], queue=False, show_progress=False)
 
     return
 
@@ -280,14 +309,22 @@ def refresh_model_loading_parameters():
 
     dynamic_args['online_lora'] = lora_fp16
 
-    model_data.forge_loading_parameters = dict(
+    new_parameters = dict(
         checkpoint_info=checkpoint_info,
         additional_modules=shared.opts.forge_additional_modules,
+        forge_preset=shared.opts.forge_preset,
         unet_storage_dtype=unet_storage_dtype,
         z_transformer_dtype=getattr(shared.opts, 'z_transformer_dtype', 'Automatic'),
         z_vae_dtype=getattr(shared.opts, 'z_vae_dtype', 'Automatic'),
         z_text_encoder_dtype=getattr(shared.opts, 'z_text_encoder_dtype', 'Automatic'),
     )
+
+    # This now runs for every job (per-tab model staging), so it must not force an
+    # unload when nothing changed. Same string-hash mechanism as forge_model_reload.
+    if str(new_parameters) == str(model_data.forge_loading_parameters):
+        return
+
+    model_data.forge_loading_parameters = new_parameters
 
     print(f'Model selected: {model_data.forge_loading_parameters}')
     print(f'Using online LoRAs in FP16: {lora_fp16}')
@@ -403,13 +440,25 @@ def forge_main_entry():
     return
 
 
-# indices of ui_img2img_width / ui_img2img_height in the output_targets list of forge_main_entry
+# indices of ui_vae / ui_img2img_width / ui_img2img_height in the output_targets list of forge_main_entry
+UI_VAE_INDEX = 0
 I2I_WIDTH_INDEX = 7
 I2I_HEIGHT_INDEX = 9
 
 
 def on_preset_change(preset=None, img2img_image=None, inpaint_image=None):
     updates = preset_updates(preset)
+
+    # Auto-select the saved VAE/TE default for the newly chosen preset (saved via the 💾
+    # button). Only on an actual preset change — on page load (preset=None) the dropdown
+    # keeps showing the current global selection.
+    if preset is not None:
+        default_modules = shared.opts.data.get('forge_preset_module_defaults', {}).get(preset)
+        if default_modules is not None and isinstance(updates[UI_VAE_INDEX], dict):
+            missing = [m for m in default_modules if m not in module_list]
+            if missing:
+                print(f'VAE/TE default for preset "{preset}": skipping missing module(s): {missing}')
+            updates[UI_VAE_INDEX]['value'] = [m for m in default_modules if m in module_list]
 
     # An image is currently loaded in img2img or inpaint: keep the size sliders as they
     # are (they follow the image via 'Send to ...' / send_size) instead of resetting

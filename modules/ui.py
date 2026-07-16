@@ -844,6 +844,11 @@ def create_ui():
     settings = ui_settings.UiSettings()
     settings.register_settings()
 
+    # Create the quicksettings Checkpoint / VAE-TE dropdowns unrendered so the
+    # txt2img/img2img submits below can capture each browser session's own values;
+    # they are rendered into the quicksettings row later (ui_settings.add_quicksettings).
+    main_entry.make_checkpoint_selection_components()
+
     scripts.scripts_current = scripts.scripts_txt2img
     scripts.scripts_txt2img.initialize_scripts(is_img2img=False)
 
@@ -1032,6 +1037,9 @@ def create_ui():
                 hr_cfg,
                 hr_distilled_cfg,
                 override_settings,
+                main_entry.ui_checkpoint,
+                main_entry.ui_vae,
+                main_entry.ui_forge_preset,
             ] + custom_inputs
 
             txt2img_outputs = [
@@ -1487,6 +1495,9 @@ def create_ui():
                 img2img_batch_png_info_dir,
                 img2img_batch_source_type,
                 img2img_batch_upload,
+                main_entry.ui_checkpoint,
+                main_entry.ui_vae,
+                main_entry.ui_forge_preset,
             ] + custom_inputs
 
             img2img_args = dict(

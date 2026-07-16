@@ -147,12 +147,9 @@ def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, 
     return batch_results
 
 
-def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6, ref_edit_lora_strength: float, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
+def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6, ref_edit_lora_strength: float, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, checkpoint_name: str, vae_te_modules: list, forge_preset_name: str, *args):
 
     override_settings = create_override_settings_dict(override_settings_texts)
-
-    # Capture checkpoint at request time for tab isolation
-    checkpoint_override = shared.opts.sd_model_checkpoint
 
     is_batch = mode == 6
 
@@ -241,7 +238,9 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
         apg_eta=apg_eta,
         apg_momentum=apg_momentum,
         apg_threshold=apg_threshold,
-        checkpoint_override=checkpoint_override,  # Per-request checkpoint for tab isolation
+        checkpoint_override=checkpoint_name,  # this browser session's dropdown value, for tab isolation
+        modules_override=vae_te_modules,
+        preset_override=forge_preset_name,
     )
 
     p.scripts = modules.scripts.scripts_img2img

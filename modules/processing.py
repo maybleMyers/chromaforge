@@ -169,6 +169,8 @@ class StableDiffusionProcessing:
     override_settings_restore_afterwards: bool = True
     sampler_index: int = None
     checkpoint_override: str = None  # Per-request checkpoint override for tab isolation
+    modules_override: list = None  # Per-request VAE/TE modules override for tab isolation; None = use global opts, [] = no extra modules
+    preset_override: str = None  # Per-request forge_preset override for tab isolation; the loader needs it to pick the right engine (e.g. krea2)
     refiner_checkpoint: str = None
     refiner_switch_at: float = None
     token_merging_ratio = 0
@@ -864,6 +866,22 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         # apply any options overrides
         set_config(p.override_settings, is_api=True, run_callbacks=False, save_config=False)
 
+        # apply the per-session (browser tab) model capture; explicit override_settings win.
+        # Applied into global opts without restore: jobs are serialized under queue_lock, so
+        # opts simply settle on the last job's model and same-tab jobs cause no churn.
+        if 'sd_model_checkpoint' not in p.override_settings and p.checkpoint_override is not None:
+            if sd_models.get_closet_checkpoint_match(p.checkpoint_override) is not None:
+                main_entry.checkpoint_change(p.checkpoint_override, save=False, refresh=False)
+            else:
+                print(f"Captured checkpoint {p.checkpoint_override!r} not found; using {shared.opts.sd_model_checkpoint!r}", file=sys.stderr)
+        if 'forge_additional_modules' not in p.override_settings and p.modules_override is not None:
+            main_entry.modules_change(p.modules_override, save=False, refresh=False)
+        if 'forge_preset' not in p.override_settings and p.preset_override is not None and p.preset_override != shared.opts.forge_preset:
+            shared.opts.set('forge_preset', p.preset_override)
+
+        # stage this job's loading parameters (no-op if unchanged)
+        main_entry.refresh_model_loading_parameters()
+
         # load/reload model and manage prompt cache as needed
         if getattr(p, 'txt2img_upscale', False):
             # avoid model load from hiresfix quickbutton, as it could be redundant
@@ -1093,11 +1111,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             if not getattr(p, 'txt2img_upscale', False) or p.hr_checkpoint_name is None:
                 # hiresfix quickbutton may not need reload of firstpass model
-                # Apply per-request checkpoint override if set (for tab isolation)
-                if p.checkpoint_override is not None:
-                    from modules_forge import main_entry
-                    main_entry.checkpoint_change(p.checkpoint_override, save=False, refresh=False)
-                    main_entry.refresh_model_loading_parameters()
+                # (the per-tab model capture is already staged in process_images)
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
@@ -1586,8 +1600,15 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                 decoded_samples = None
 
         with sd_models.SkipWritingToConfig():
-            fp_checkpoint = getattr(shared.opts, 'sd_model_checkpoint')
-            fp_additional_modules = getattr(shared.opts, 'forge_additional_modules')
+            # snapshot the firstpass model from this job's own settings, not bare global
+            # opts — another tab's dropdown change mid-job would corrupt the restore below
+            fp_checkpoint = self.override_settings.get('sd_model_checkpoint') or self.checkpoint_override or getattr(shared.opts, 'sd_model_checkpoint')
+            if 'forge_additional_modules' in self.override_settings:
+                fp_additional_modules = self.override_settings['forge_additional_modules']
+            elif self.modules_override is not None:
+                fp_additional_modules = self.modules_override
+            else:
+                fp_additional_modules = getattr(shared.opts, 'forge_additional_modules')
 
             reload = False
             is_cross_architecture = False

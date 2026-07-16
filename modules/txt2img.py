@@ -12,14 +12,11 @@ import gradio as gr
 from modules_forge import main_thread
 
 
-def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt, hr_cfg: float, hr_distilled_cfg: float, override_settings_texts, *args, force_enable_hr=False):
+def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt, hr_cfg: float, hr_distilled_cfg: float, override_settings_texts, checkpoint_name: str, vae_te_modules: list, forge_preset_name: str, *args, force_enable_hr=False):
     override_settings = create_override_settings_dict(override_settings_texts)
 
     if force_enable_hr:
         enable_hr = True
-
-    # Capture checkpoint at request time for tab isolation
-    checkpoint_override = shared.opts.sd_model_checkpoint
 
     p = processing.StableDiffusionProcessingTxt2Img(
         outpath_samples=opts.outdir_samples or opts.outdir_txt2img_samples,
@@ -56,7 +53,9 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
         hr_cfg=hr_cfg,
         hr_distilled_cfg=hr_distilled_cfg,
         override_settings=override_settings,
-        checkpoint_override=checkpoint_override,  # Per-request checkpoint for tab isolation
+        checkpoint_override=checkpoint_name,  # this browser session's dropdown value, for tab isolation
+        modules_override=vae_te_modules,
+        preset_override=forge_preset_name,
     )
 
     p.scripts = modules.scripts.scripts_txt2img

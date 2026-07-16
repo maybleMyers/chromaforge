@@ -303,6 +303,26 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
     return sorted(models, key=lambda x: x["name"])
 
 
+def get_vram_info() -> str:
+    """Query VRAM usage for all GPUs via nvidia-smi. Returns '' if unavailable."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return ""
+        readouts = []
+        for i, line in enumerate(result.stdout.strip().splitlines()):
+            used, total = (int(x.strip()) for x in line.split(","))
+            readouts.append(f"GPU{i}: {used:,}/{total:,} MiB")
+        return " | ".join(readouts)
+    except Exception:
+        return ""
+
+
 class LlamaCppVLM:
     """Manages VLM inference via llama-cpp-python or native llama-server subprocess."""
 
@@ -862,6 +882,8 @@ class LlamaCppVLM:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        repeat_penalty: float = 1.0,
+        seed: int = -1,
         video_max_frames: int = 81,
         every_other_frame: bool = False,
         stream: bool = False,
@@ -1003,8 +1025,12 @@ class LlamaCppVLM:
             "max_tokens": max_new_tokens,
             "temperature": temperature if temperature > 0 else 0.001,
             "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
             "stream": stream,
         }
+
+        if seed is not None and int(seed) >= 0:
+            payload["seed"] = int(seed)
 
         # Request usage info in streaming responses (OpenAI-compatible extension)
         if stream:
@@ -1186,6 +1212,8 @@ class LlamaCppVLM:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        repeat_penalty: float = 1.0,
+        seed: int = -1,
         video_max_frames: int = 8,
         every_other_frame: bool = False,
         stream: bool = False,
@@ -1220,6 +1248,8 @@ class LlamaCppVLM:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
                 video_max_frames=video_max_frames,
                 every_other_frame=every_other_frame,
                 stream=stream,
@@ -1425,7 +1455,11 @@ class LlamaCppVLM:
                 "max_tokens": max_new_tokens,
                 "temperature": temperature if temperature > 0 else 0.001,
                 "top_p": top_p,
+                "repeat_penalty": repeat_penalty,
             }
+
+            if seed is not None and int(seed) >= 0:
+                chat_kwargs["seed"] = int(seed)
 
             # Note: reasoning_effort for GPT-OSS is only supported via llama-server backend
             # The llama-cpp-python library doesn't support chat_template_kwargs
@@ -1569,9 +1603,15 @@ class LlamaCppVLM:
 vlm_manager: Optional[LlamaCppVLM] = None
 # Global stop flag for generation
 stop_generation: bool = False
+# Snapshot of the last chat turn (model content + display history) for Regenerate
+last_turn: Optional[Dict[str, Any]] = None
 
 # Default settings file path
 SETTINGS_FILE = "vlm_settings.json"
+# System prompt presets file path
+PROMPTS_FILE = "vlm_prompts.json"
+# Per-model settings profiles file path
+PROFILES_FILE = "vlm_model_profiles.json"
 
 # Default settings values
 DEFAULT_SETTINGS = {
@@ -1595,6 +1635,8 @@ DEFAULT_SETTINGS = {
     "max_tokens": 8096,
     "temperature": 0.7,
     "top_p": 0.95,
+    "repeat_penalty": 1.0,
+    "seed": -1,
     "video_max_frames": 8,
     "every_other_frame": False,
     "show_thinking": True,
@@ -1626,6 +1668,8 @@ def save_settings(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    repeat_penalty: float,
+    seed: int,
     video_max_frames: int,
     every_other_frame: bool,
     show_thinking: bool,
@@ -1656,6 +1700,8 @@ def save_settings(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
+        "repeat_penalty": repeat_penalty,
+        "seed": seed,
         "video_max_frames": video_max_frames,
         "every_other_frame": every_other_frame,
         "show_thinking": show_thinking,
@@ -1691,6 +1737,133 @@ def load_settings() -> Dict[str, Any]:
     except Exception as e:
         print(f"[vlm.py] Error loading settings: {e}, using defaults")
         return DEFAULT_SETTINGS.copy()
+
+
+def load_prompt_presets() -> Dict[str, str]:
+    """Load system prompt presets ({name: prompt}) from JSON file."""
+    try:
+        if os.path.exists(PROMPTS_FILE):
+            with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
+                presets = json.load(f)
+            if isinstance(presets, dict):
+                return presets
+    except Exception as e:
+        print(f"[vlm.py] Error loading prompt presets: {e}")
+    return {}
+
+
+def write_prompt_presets(presets: Dict[str, str]) -> None:
+    """Write system prompt presets to JSON file."""
+    with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(presets, f, indent=2, ensure_ascii=False)
+
+
+def save_prompt_preset_handler(name: str, prompt_text: str):
+    """Save the current system prompt under a preset name."""
+    name = (name or "").strip()
+    if not name:
+        return gr.update(), gr.update(), "Enter a preset name before saving"
+    try:
+        presets = load_prompt_presets()
+        presets[name] = prompt_text
+        write_prompt_presets(presets)
+        choices = sorted(presets)
+        print(f"[vlm.py] Saved prompt preset '{name}'")
+        return (
+            gr.update(choices=choices, value=name),
+            gr.update(choices=choices),
+            f"Saved preset '{name}'",
+        )
+    except Exception as e:
+        return gr.update(), gr.update(), f"Error saving preset: {e}"
+
+
+def delete_prompt_preset_handler(name: str):
+    """Delete the selected system prompt preset."""
+    if not name:
+        return gr.update(), gr.update(), "No preset selected"
+    try:
+        presets = load_prompt_presets()
+        if name in presets:
+            del presets[name]
+            write_prompt_presets(presets)
+        choices = sorted(presets)
+        return (
+            gr.update(choices=choices, value=None),
+            gr.update(choices=choices, value=None),
+            f"Deleted preset '{name}'",
+        )
+    except Exception as e:
+        return gr.update(), gr.update(), f"Error deleting preset: {e}"
+
+
+def apply_prompt_preset(name: str):
+    """Fill the system prompt textbox from the selected preset."""
+    presets = load_prompt_presets()
+    if name and name in presets:
+        return presets[name], name
+    return gr.update(), gr.update()
+
+
+def apply_batch_prompt_preset(name: str):
+    """Fill the batch system prompt textbox from the selected preset."""
+    presets = load_prompt_presets()
+    if name and name in presets:
+        return presets[name]
+    return gr.update()
+
+
+# Per-model settings saved/restored when the model selection changes
+PROFILE_KEYS = [
+    "n_gpu_layers", "n_ctx", "backend_type", "tensor_split", "main_gpu",
+    "kv_cache_type", "flash_attn", "use_mmap", "use_mlock",
+    "override_tensor", "extra_args", "server_port",
+]
+
+
+def load_model_profiles() -> Dict[str, Dict[str, Any]]:
+    """Load per-model settings profiles from JSON file."""
+    try:
+        if os.path.exists(PROFILES_FILE):
+            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+                profiles = json.load(f)
+            if isinstance(profiles, dict):
+                return profiles
+    except Exception as e:
+        print(f"[vlm.py] Error loading model profiles: {e}")
+    return {}
+
+
+def save_model_profile(model_name: str, profile: Dict[str, Any]) -> None:
+    """Save the settings used to load a model, keyed by model name."""
+    try:
+        profiles = load_model_profiles()
+        profiles[model_name] = profile
+        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump(profiles, f, indent=2, ensure_ascii=False)
+        print(f"[vlm.py] Saved settings profile for '{model_name}'")
+    except Exception as e:
+        print(f"[vlm.py] Error saving model profile: {e}")
+
+
+def apply_model_profile(model_name: str):
+    """Restore saved settings for the selected model, if a profile exists.
+
+    Returns updates for the PROFILE_KEYS components plus the server options
+    row visibility.
+    """
+    profiles = load_model_profiles()
+    profile = profiles.get(model_name)
+    if not profile:
+        return [gr.update()] * (len(PROFILE_KEYS) + 1)
+
+    updates = [
+        gr.update(value=profile[key]) if key in profile else gr.update()
+        for key in PROFILE_KEYS
+    ]
+    updates.append(gr.update(visible=(profile.get("backend_type") == "llama-server")))
+    print(f"[vlm.py] Restored settings profile for '{model_name}'")
+    return updates
 
 
 def initialize_manager(models_dir: str = "models/LLM"):
@@ -1792,14 +1965,94 @@ def unload_model_handler():
     """Handle model unloading."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.unload_model()
+    status = vlm_manager.unload_model()
+    vram = get_vram_info()
+    if vram:
+        status = f"{status} | VRAM: {vram}"
+    return status
 
 
 def status_handler():
     """Handle status request."""
     if vlm_manager is None:
         return "Manager not initialized"
-    return vlm_manager.get_status()
+    status = vlm_manager.get_status()
+    vram = get_vram_info()
+    if vram:
+        status = f"{status} | VRAM: {vram}"
+    return status
+
+
+def extract_text_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract text-only messages from display history for the model."""
+    messages = []
+    if history:
+        for msg in history:
+            if isinstance(msg, dict):
+                role = msg.get("role")
+                content = msg.get("content")
+                if role and content:
+                    # Extract text content for the model
+                    if isinstance(content, str):
+                        messages.append({"role": role, "content": content})
+                    elif isinstance(content, list):
+                        # Extract text from multimodal content
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                        if text_parts:
+                            messages.append({"role": role, "content": " ".join(text_parts)})
+    return messages
+
+
+def stream_chat_response(
+    messages: List[Dict[str, Any]],
+    new_history: List[Dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    repeat_penalty: float,
+    seed: int,
+    video_max_frames: int,
+    every_other_frame: bool,
+    show_thinking: bool,
+    reasoning_level: str,
+):
+    """Stream a generation into the last (assistant) entry of new_history.
+
+    Yields (history, stats, ctx_info) tuples.
+    """
+    global stop_generation
+    stop_generation = False
+
+    stats = ""
+    ctx_info = ""
+    for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
+        messages=messages,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        repeat_penalty=repeat_penalty,
+        seed=seed,
+        video_max_frames=video_max_frames,
+        every_other_frame=every_other_frame,
+        stream=True,
+        reasoning_level=reasoning_level,
+    ):
+        # Check stop flag
+        if stop_generation:
+            new_history[-1]["content"] += "\n\n[Generation stopped]"
+            stop_generation = False
+            yield new_history, stats, ctx_info
+            return
+
+        # Show thinking if enabled, otherwise show cleaned text
+        if show_thinking:
+            new_history[-1]["content"] = raw_text
+        else:
+            new_history[-1]["content"] = display_text
+        yield new_history, stats, ctx_info
 
 
 def chat_handler(
@@ -1815,6 +2068,8 @@ def chat_handler(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    repeat_penalty: float = 1.0,
+    seed: int = -1,
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     show_thinking: bool = False,
@@ -1841,23 +2096,7 @@ def chat_handler(
         messages.append({"role": "system", "content": system_prompt})
 
     # Add chat history (handle None case)
-    if history:
-        for msg in history:
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-                if role and content:
-                    # Extract text content for the model
-                    if isinstance(content, str):
-                        messages.append({"role": role, "content": content})
-                    elif isinstance(content, list):
-                        # Extract text from multimodal content
-                        text_parts = []
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text_parts.append(item.get("text", ""))
-                        if text_parts:
-                            messages.append({"role": role, "content": " ".join(text_parts)})
+    messages.extend(extract_text_history(history))
 
     # Build current message content for model
     model_content = []
@@ -1921,40 +2160,96 @@ def chat_handler(
     # Add empty assistant message that we'll stream into
     new_history.append({"role": "assistant", "content": ""})
 
-    # Reset stop flag before starting generation
-    global stop_generation
-    stop_generation = False
+    # Snapshot this turn so Regenerate can replay it (with current settings)
+    global last_turn
+    base_len = len(history) if history else 0
+    last_turn = {
+        "model_content": model_content,
+        "history_before": list(history) if history else [],
+        "display_entries": new_history[base_len:-1],
+    }
 
     # Stream the response
-    stats = ""
-    ctx_info = ""
-    for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
-        messages=messages,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        video_max_frames=video_max_frames,
-        every_other_frame=every_other_frame,
-        stream=True,
-        reasoning_level=reasoning_level,
+    for streamed_history, stats, ctx_info in stream_chat_response(
+        messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
+        seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
     ):
-        # Check stop flag
-        if stop_generation:
-            new_history[-1]["content"] += "\n\n[Generation stopped]"
-            stop_generation = False
-            yield new_history, "", stats, ctx_info
-            return
+        yield streamed_history, "", stats, ctx_info
 
-        # Show thinking if enabled, otherwise show cleaned text
-        if show_thinking:
-            new_history[-1]["content"] = raw_text
-        else:
-            new_history[-1]["content"] = display_text
-        yield new_history, "", stats, ctx_info
+
+def regenerate_handler(
+    history: List[Dict[str, Any]],
+    system_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    repeat_penalty: float,
+    seed: int,
+    video_max_frames: int = 8,
+    every_other_frame: bool = False,
+    show_thinking: bool = False,
+    reasoning_level: str = "medium",
+):
+    """Re-run the last user turn, discarding the previous assistant reply.
+
+    Uses the snapshot saved by chat_handler (which keeps the original images/
+    video/audio), but applies the current system prompt and sampling settings.
+    """
+    model_ready = (
+        vlm_manager is not None and
+        (vlm_manager.model is not None or vlm_manager.use_server_backend)
+    )
+    if not model_ready or last_turn is None:
+        yield history, "", ""
+        return
+
+    # Rebuild model messages with the current system prompt
+    messages = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(extract_text_history(last_turn["history_before"]))
+    messages.append({"role": "user", "content": last_turn["model_content"]})
+
+    # Rebuild display history without the previous assistant reply
+    new_history = list(last_turn["history_before"]) + list(last_turn["display_entries"])
+    new_history.append({"role": "assistant", "content": ""})
+
+    yield from stream_chat_response(
+        messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
+        seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+    )
+
+
+def edit_last_handler(history: List[Dict[str, Any]]):
+    """Remove the last exchange from the chat and return the user text for editing.
+
+    Attached media from that turn is discarded - re-attach before resending.
+    """
+    global last_turn
+    last_turn = None
+
+    history = list(history) if history else []
+    if not history:
+        return history, ""
+
+    # Drop the trailing assistant reply
+    while history and history[-1].get("role") == "assistant":
+        history.pop()
+
+    # Drop the trailing user entries (text + media thumbnails), keeping the text
+    text = ""
+    while history and history[-1].get("role") == "user":
+        content = history.pop().get("content")
+        if isinstance(content, str) and not text:
+            text = content
+
+    return history, text
 
 
 def clear_chat_handler():
     """Clear chat history."""
+    global last_turn
+    last_turn = None
     return []
 
 
@@ -1971,6 +2266,8 @@ def batch_caption_handler(
     system_prompt: str,
     max_tokens: int,
     temperature: float,
+    repeat_penalty: float = 1.0,
+    seed: int = -1,
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     progress=gr.Progress(),
@@ -2037,6 +2334,8 @@ def batch_caption_handler(
                 messages=messages,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
                 video_max_frames=video_max_frames,
                 every_other_frame=every_other_frame,
                 stream=False,
@@ -2072,6 +2371,7 @@ def create_ui():
     """Create the Gradio interface."""
     # Load saved settings
     saved_settings = load_settings()
+    preset_choices = sorted(load_prompt_presets())
 
     # Theme
     vlm_theme = themes.Default(
@@ -2175,6 +2475,8 @@ def create_ui():
 
                 with gr.Row():
                     clear_btn = gr.Button("Clear Chat", scale=1)
+                    regen_btn = gr.Button("Regenerate", scale=1)
+                    edit_last_btn = gr.Button("Edit Last", scale=1)
                     stop_btn = gr.Button("Stop", variant="stop", scale=1, elem_classes=["red-btn"])
                     stats_display = gr.Textbox(
                         label="Speed",
@@ -2197,6 +2499,13 @@ def create_ui():
                     label="Folder Path",
                     placeholder="Enter the full path to folder containing images/videos...",
                     lines=1,
+                )
+
+                batch_preset_dropdown = gr.Dropdown(
+                    label="Load System Prompt Preset",
+                    choices=preset_choices,
+                    value=None,
+                    info="Presets are managed in Generation Settings below",
                 )
 
                 batch_system_prompt = gr.Textbox(
@@ -2368,6 +2677,21 @@ def create_ui():
 
         with gr.Accordion("Generation Settings", open=False):
             with gr.Row():
+                prompt_preset_dropdown = gr.Dropdown(
+                    label="System Prompt Preset",
+                    choices=preset_choices,
+                    value=None,
+                    scale=2,
+                )
+                preset_name = gr.Textbox(
+                    label="Preset Name",
+                    placeholder="Name to save the current prompt as...",
+                    scale=2,
+                )
+                save_preset_btn = gr.Button("Save Preset", scale=1)
+                delete_preset_btn = gr.Button("Delete Preset", scale=1, elem_classes=["red-btn"])
+
+            with gr.Row():
                 system_prompt = gr.Textbox(
                     label="System Prompt",
                     placeholder="Enter a system prompt to guide the model's behavior...",
@@ -2413,6 +2737,20 @@ def create_ui():
                 )
 
             with gr.Row():
+                repeat_penalty = gr.Slider(
+                    minimum=0.8,
+                    maximum=1.5,
+                    value=saved_settings.get("repeat_penalty", DEFAULT_SETTINGS["repeat_penalty"]),
+                    step=0.01,
+                    label="Repeat Penalty",
+                    info="1.0 = disabled",
+                )
+                seed = gr.Number(
+                    label="Seed",
+                    value=saved_settings.get("seed", DEFAULT_SETTINGS["seed"]),
+                    precision=0,
+                    info="-1 = random, >=0 for reproducible output",
+                )
                 show_thinking = gr.Checkbox(
                     label="Show Thinking",
                     value=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
@@ -2445,16 +2783,38 @@ def create_ui():
         ):
             """Route to appropriate load handler based on backend selection."""
             if backend == "llama-server":
-                return load_model_server_handler(
+                status = load_model_server_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
                     main_gpu, kv_cache_type, use_mmap_val, use_mlock_val, override_tensor, extra_args_val, int(server_port),
                     llama_server_path, progress
                 )
             else:
-                return load_model_handler(
+                status = load_model_handler(
                     model_name, n_gpu_layers, n_ctx, tensor_split, flash_attn,
                     main_gpu, kv_cache_type, use_mmap_val, use_mlock_val, progress
                 )
+
+            if isinstance(status, str) and not status.startswith("Error"):
+                # Remember the settings that successfully loaded this model
+                save_model_profile(model_name, {
+                    "n_gpu_layers": n_gpu_layers,
+                    "n_ctx": n_ctx,
+                    "backend_type": backend,
+                    "tensor_split": tensor_split,
+                    "main_gpu": main_gpu,
+                    "kv_cache_type": kv_cache_type,
+                    "flash_attn": flash_attn,
+                    "use_mmap": use_mmap_val,
+                    "use_mlock": use_mlock_val,
+                    "override_tensor": override_tensor,
+                    "extra_args": extra_args_val,
+                    "server_port": int(server_port),
+                })
+                vram = get_vram_info()
+                if vram:
+                    status = f"{status} | VRAM: {vram}"
+
+            return status
 
         load_model_btn.click(
             fn=load_model_dispatcher,
@@ -2471,7 +2831,7 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, vid_frames, every_other, thinking, reasoning):
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None and aud is None:
                 yield history, "", None, None, None, None, None, None, "", ""
                 return
@@ -2479,7 +2839,7 @@ def create_ui():
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid, aud,
-                max_tok, temp, top_p_val, vid_frames, every_other, thinking, reasoning
+                max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning
             ):
                 yield new_history, "", None, None, None, None, None, None, stats, ctx_info
 
@@ -2488,7 +2848,7 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
         )
@@ -2498,14 +2858,66 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
+        )
+
+        regen_btn.click(
+            fn=regenerate_handler,
+            inputs=[
+                chatbot, system_prompt, max_tokens, temperature, top_p,
+                repeat_penalty, seed, video_max_frames, every_other_frame,
+                show_thinking, reasoning_level
+            ],
+            outputs=[chatbot, stats_display, context_display],
+        )
+
+        edit_last_btn.click(
+            fn=edit_last_handler,
+            inputs=[chatbot],
+            outputs=[chatbot, msg_input],
         )
 
         clear_btn.click(
             fn=clear_chat_handler,
             outputs=[chatbot],
+        )
+
+        # System prompt preset handlers
+        prompt_preset_dropdown.change(
+            fn=apply_prompt_preset,
+            inputs=[prompt_preset_dropdown],
+            outputs=[system_prompt, preset_name],
+        )
+
+        save_preset_btn.click(
+            fn=save_prompt_preset_handler,
+            inputs=[preset_name, system_prompt],
+            outputs=[prompt_preset_dropdown, batch_preset_dropdown, save_status],
+        )
+
+        delete_preset_btn.click(
+            fn=delete_prompt_preset_handler,
+            inputs=[prompt_preset_dropdown],
+            outputs=[prompt_preset_dropdown, batch_preset_dropdown, save_status],
+        )
+
+        batch_preset_dropdown.change(
+            fn=apply_batch_prompt_preset,
+            inputs=[batch_preset_dropdown],
+            outputs=[batch_system_prompt],
+        )
+
+        # Restore per-model settings profile when the model selection changes
+        model_dropdown.change(
+            fn=apply_model_profile,
+            inputs=[model_dropdown],
+            outputs=[
+                n_gpu_layers, n_ctx, backend_type, tensor_split, main_gpu,
+                kv_cache_type, flash_attn, use_mmap, use_mlock,
+                override_tensor, extra_args, server_port, server_options_row
+            ],
         )
 
         stop_btn.click(
@@ -2516,7 +2928,7 @@ def create_ui():
             fn=batch_caption_handler,
             inputs=[
                 batch_folder, batch_prompt, batch_system_prompt,
-                max_tokens, temperature, video_max_frames, every_other_frame
+                max_tokens, temperature, repeat_penalty, seed, video_max_frames, every_other_frame
             ],
             outputs=[batch_output],
         )
@@ -2531,8 +2943,8 @@ def create_ui():
                 use_mmap, use_mlock, override_tensor, extra_args,
                 server_port, llama_server_path,
                 # Generation Settings
-                system_prompt, max_tokens, temperature, top_p, video_max_frames,
-                every_other_frame, show_thinking, reasoning_level,
+                system_prompt, max_tokens, temperature, top_p, repeat_penalty,
+                seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt
             ],

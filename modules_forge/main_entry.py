@@ -317,6 +317,8 @@ def refresh_model_loading_parameters():
         z_transformer_dtype=getattr(shared.opts, 'z_transformer_dtype', 'Automatic'),
         z_vae_dtype=getattr(shared.opts, 'z_vae_dtype', 'Automatic'),
         z_text_encoder_dtype=getattr(shared.opts, 'z_text_encoder_dtype', 'Automatic'),
+        torch_compile=getattr(shared.opts, 'torch_compile', False),
+        torch_compile_mode=getattr(shared.opts, 'torch_compile_mode', 'default'),
     )
 
     # This now runs for every job (per-tab model staging), so it must not force an

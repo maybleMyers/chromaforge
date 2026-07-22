@@ -3,11 +3,13 @@ import torch
 
 from backend.modules.k_model import KModel
 from backend.patcher.base import ModelPatcher
+from backend.torch_compile import apply_torch_compile
 
 
 class UnetPatcher(ModelPatcher):
     @classmethod
     def from_model(cls, model, diffusers_scheduler, config, k_predictor=None):
+        apply_torch_compile(model)
         model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, config=config)
         return UnetPatcher(
             model,

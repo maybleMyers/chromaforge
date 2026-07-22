@@ -49,7 +49,9 @@ def attention(
         k = k.repeat_interleave(repeats, dim=1)
         v = v.repeat_interleave(repeats, dim=1)
     x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-    return rearrange(x, "B H L D -> B L (H D)")
+    # x = rearrange(x, "B H L D -> B L (H D)")  # einops hard-errors under torch.compile with dynamic shapes
+    B, H, L, D = x.shape
+    return x.transpose(1, 2).reshape(B, L, H * D)
 
 
 def _mask(mask: Tensor) -> Tensor:
@@ -225,11 +227,12 @@ class Attention(torch.nn.Module):
     ) -> Tensor:
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
-        q, k, v = (
-            rearrange(q, "B L (H D) -> B H L D", H=self.heads),
-            rearrange(k, "B L (H D) -> B H L D", H=self.kvheads),
-            rearrange(v, "B L (H D) -> B H L D", H=self.kvheads),
-        )
+        # q = rearrange(q, "B L (H D) -> B H L D", H=self.heads), same for k/v --
+        # einops hard-errors under torch.compile with dynamic shapes
+        B, L, _ = q.shape
+        q = q.view(B, L, self.heads, self.headdim).transpose(1, 2)
+        k = k.view(B, L, self.kvheads, self.headdim).transpose(1, 2)
+        v = v.view(B, L, self.kvheads, self.headdim).transpose(1, 2)
 
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:

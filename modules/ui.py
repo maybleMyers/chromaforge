@@ -79,6 +79,7 @@ extra_networks_symbol = '\U0001F3B4'  # 🎴
 switch_values_symbol = '\U000021C5' # ⇅
 restore_progress_symbol = '\U0001F300' # 🌀
 detect_image_size_symbol = '\U0001F4D0'  # 📐
+reset_symbol = '\U000021BA'  # ↺
 
 
 plaintext_to_html = ui_common.plaintext_to_html
@@ -890,7 +891,7 @@ def create_ui():
                     elif category == "cfg":
                         with gr.Row():
                             distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=30.0, step=0.1, label='Distilled CFG Scale', value=3.5, elem_id="txt2img_distilled_cfg_scale")
-                            cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.1, label='CFG Scale', value=7.0, elem_id="txt2img_cfg_scale")
+                            cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='CFG Scale', value=7.0, elem_id="txt2img_cfg_scale")
                             zimage_shift = gr.Slider(minimum=0.0, maximum=30.0, step=0.05, label='Z-Image Shift', value=0.0, elem_id="txt2img_zimage_shift")
                             main_entry.ui_txt2img_zimage_shift = zimage_shift
                             cfg_scale.change(lambda x: gr.update(interactive=(x != 1)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
@@ -1100,7 +1101,7 @@ def create_ui():
                 PasteField(batch_size, "Batch size", api="batch_size"),
                 PasteField(toprow.ui_styles.dropdown, lambda d: d["Styles array"] if isinstance(d.get("Styles array"), list) else gr.update(), api="styles"),
                 PasteField(denoising_strength, "Denoising strength", api="denoising_strength"),
-                PasteField(enable_hr, lambda d: "Denoising strength" in d and ("Hires upscale" in d or "Hires upscaler" in d or "Hires resize-1" in d), api="enable_hr"),
+                PasteField(enable_hr, lambda d: "Denoising strength" in d and bool("Hires upscale" in d or "Hires upscaler" in d or d.get("Hires resize-1", 0)), api="enable_hr"),
                 PasteField(hr_scale, "Hires upscale", api="hr_scale"),
                 PasteField(hr_upscaler, "Hires upscaler", api="hr_upscaler"),
                 PasteField(hr_second_pass_steps, "Hires steps", api="hr_second_pass_steps"),
@@ -1364,12 +1365,15 @@ def create_ui():
                                     batch_size = gr.Slider(minimum=1, maximum=8, step=1, label='Batch size', value=1, elem_id="img2img_batch_size")
 
                     elif category == "denoising":
-                        denoising_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Denoising strength', value=0.75, elem_id="img2img_denoising_strength")
+                        with gr.Row():
+                            denoising_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Denoising strength', value=0.75, elem_id="img2img_denoising_strength")
+                            reset_denoising_btn = ToolButton(value=reset_symbol, elem_id="img2img_reset_denoising_btn", tooltip="Reset denoising strength to 0.75")
+                            reset_denoising_btn.click(fn=lambda: gr.update(value=0.75), inputs=[], outputs=[denoising_strength], show_progress=False)
 
                     elif category == "cfg":
                         with gr.Row():
                             distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=30.0, step=0.1, label='Distilled CFG Scale', value=3.5, elem_id="img2img_distilled_cfg_scale")
-                            cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.1, label='CFG Scale', value=7.0, elem_id="img2img_cfg_scale")
+                            cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='CFG Scale', value=7.0, elem_id="img2img_cfg_scale")
                             zimage_shift = gr.Slider(minimum=0.0, maximum=30.0, step=0.05, label='Z-Image Shift', value=0.0, elem_id="img2img_zimage_shift")
                             main_entry.ui_img2img_zimage_shift = zimage_shift
                             image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label='Image CFG Scale', value=1.5, elem_id="img2img_image_cfg_scale", visible=False)

@@ -11,6 +11,16 @@ from functools import lru_cache
 from backend.operations import using_forge_operations
 from backend import memory_management
 
+_compiled_function_cache = {}
+
+
+def _compiled(fn):
+    # torch.compile once per function; wrapping inside forward would rebuild the
+    # OptimizedModule wrapper on every call.
+    if fn not in _compiled_function_cache:
+        _compiled_function_cache[fn] = torch.compile(fn)
+    return _compiled_function_cache[fn]
+
 class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: list[int]):
         super().__init__()
@@ -93,7 +103,7 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: Tensor):
         if self.use_compiled:
-            return torch.compile(self._forward)(x)
+            return _compiled(type(self)._forward)(self, x)
         else:
             return self._forward(x)
 
@@ -547,13 +557,13 @@ class DoubleStreamBlock(nn.Module):
 
     def modulation_shift_scale_fn(self, x, scale, shift):
         if self.use_compiled:
-            return torch.compile(_modulation_shift_scale_fn)(x, scale, shift)
+            return _compiled(_modulation_shift_scale_fn)(x, scale, shift)
         else:
             return _modulation_shift_scale_fn(x, scale, shift)
 
     def modulation_gate_fn(self, x, gate, gate_params):
         if self.use_compiled:
-            return torch.compile(_modulation_gate_fn)(x, gate, gate_params)
+            return _compiled(_modulation_gate_fn)(x, gate, gate_params)
         else:
             return _modulation_gate_fn(x, gate, gate_params)
 
@@ -678,13 +688,13 @@ class SingleStreamBlock(nn.Module):
 
     def modulation_shift_scale_fn(self, x, scale, shift):
         if self.use_compiled:
-            return torch.compile(_modulation_shift_scale_fn)(x, scale, shift)
+            return _compiled(_modulation_shift_scale_fn)(x, scale, shift)
         else:
             return _modulation_shift_scale_fn(x, scale, shift)
 
     def modulation_gate_fn(self, x, gate, gate_params):
         if self.use_compiled:
-            return torch.compile(_modulation_gate_fn)(x, gate, gate_params)
+            return _compiled(_modulation_gate_fn)(x, gate, gate_params)
         else:
             return _modulation_gate_fn(x, gate, gate_params)
 
@@ -736,7 +746,7 @@ class LastLayer(nn.Module):
 
     def modulation_shift_scale_fn(self, x, scale, shift):
         if self.use_compiled:
-            return torch.compile(_modulation_shift_scale_fn)(x, scale, shift)
+            return _compiled(_modulation_shift_scale_fn)(x, scale, shift)
         else:
             return _modulation_shift_scale_fn(x, scale, shift)
 

@@ -22,14 +22,6 @@ ui_forge_unet_storage_dtype_options: gr.Radio = None
 ui_forge_async_loading: gr.Radio = None
 ui_forge_pin_shared_memory: gr.Radio = None
 ui_forge_inference_memory: gr.Slider = None
-ui_forge_ram_limit: gr.Slider = None
-
-total_ram = int(memory_management.total_ram)
-
-
-def default_ram_limit():
-    # Leave 8 GB for the OS, browser, and load-time overhead by default.
-    return max(1024, total_ram - 8192)
 
 # Z-Image specific precision options
 ui_z_transformer_dtype: gr.Dropdown = None
@@ -132,7 +124,7 @@ def make_checkpoint_selection_components():
 
 
 def make_checkpoint_manager_ui():
-    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_ram_limit, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
+    global ui_checkpoint, ui_vae, ui_clip_skip, ui_forge_unet_storage_dtype_options, ui_forge_async_loading, ui_forge_pin_shared_memory, ui_forge_inference_memory, ui_forge_preset, ui_z_transformer_dtype, ui_z_vae_dtype, ui_z_text_encoder_dtype
 
     if ui_checkpoint is None:
         make_checkpoint_selection_components()
@@ -184,12 +176,10 @@ def make_checkpoint_manager_ui():
     ui_forge_async_loading = gr.Radio(label="Swap Method", value=lambda: shared.opts.forge_async_loading, choices=['Queue', 'Async'])
     ui_forge_pin_shared_memory = gr.Radio(label="Swap Location", value=lambda: shared.opts.forge_pin_shared_memory, choices=['CPU', 'Shared'])
     ui_forge_inference_memory = gr.Slider(label="GPU Weights (MB)", value=lambda: total_vram - shared.opts.forge_inference_memory, minimum=0, maximum=int(memory_management.total_vram), step=1)
-    ui_forge_ram_limit = gr.Slider(label="Maximum RAM (MB)", value=lambda: shared.opts.forge_ram_limit if shared.opts.forge_ram_limit > 0 else default_ram_limit(), minimum=0, maximum=total_ram, step=1)
 
-    mem_comps = [ui_forge_inference_memory, ui_forge_ram_limit, ui_forge_async_loading, ui_forge_pin_shared_memory]
+    mem_comps = [ui_forge_inference_memory, ui_forge_async_loading, ui_forge_pin_shared_memory]
 
     ui_forge_inference_memory.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
-    ui_forge_ram_limit.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
     ui_forge_async_loading.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
     ui_forge_pin_shared_memory.change(ui_refresh_memory_management_settings, inputs=mem_comps, queue=False, show_progress=False)
 
@@ -254,22 +244,20 @@ def refresh_models():
     return ckpt_list, module_list.keys()
 
 
-def ui_refresh_memory_management_settings(model_memory, ram_limit, async_loading, pin_shared_memory):
+def ui_refresh_memory_management_settings(model_memory, async_loading, pin_shared_memory):
     """ Passes precalculated 'model_memory' from "GPU Weights" UI slider (skip redundant calculation) """
     refresh_memory_management_settings(
         async_loading=async_loading,
         pin_shared_memory=pin_shared_memory,
-        model_memory=model_memory,  # Use model_memory directly from UI slider value
-        ram_limit=ram_limit
+        model_memory=model_memory  # Use model_memory directly from UI slider value
     )
 
-def refresh_memory_management_settings(async_loading=None, inference_memory=None, pin_shared_memory=None, model_memory=None, ram_limit=None):
+def refresh_memory_management_settings(async_loading=None, inference_memory=None, pin_shared_memory=None, model_memory=None):
     global user_specified_model_memory
     # Fallback to defaults if values are not passed
     async_loading = async_loading if async_loading is not None else shared.opts.forge_async_loading
     inference_memory = inference_memory if inference_memory is not None else shared.opts.forge_inference_memory
     pin_shared_memory = pin_shared_memory if pin_shared_memory is not None else shared.opts.forge_pin_shared_memory
-    ram_limit = ram_limit if ram_limit is not None else (shared.opts.forge_ram_limit or default_ram_limit())
 
     # If model_memory is provided, calculate inference memory accordingly, otherwise use inference_memory directly
     if model_memory is None:
@@ -282,12 +270,10 @@ def refresh_memory_management_settings(async_loading=None, inference_memory=None
     shared.opts.set('forge_async_loading', async_loading)
     shared.opts.set('forge_inference_memory', inference_memory)
     shared.opts.set('forge_pin_shared_memory', pin_shared_memory)
-    shared.opts.set('forge_ram_limit', int(ram_limit))
 
     stream.stream_activated = async_loading == 'Async'
     memory_management.current_inference_memory = inference_memory * 1024 * 1024  # Convert MB to bytes
     memory_management.PIN_SHARED_MEMORY = pin_shared_memory == 'Shared'
-    memory_management.current_ram_budget = int(ram_limit) * 1024 * 1024  # Convert MB to bytes
 
     log_dict = dict(
         stream=stream.should_use_stream(),
@@ -309,12 +295,6 @@ def refresh_memory_management_settings(async_loading=None, inference_memory=None
     else:
         compute_percentage = (inference_memory / total_vram) * 100.0
         print(f'[GPU Setting] You will use {(100 - compute_percentage):.2f}% GPU memory ({model_memory:.2f} MB) to load weights, and use {compute_percentage:.2f}% GPU memory ({inference_memory:.2f} MB) to do matrix computation.')
-
-    if ram_limit > 0:
-        rss_mb = memory_management.get_process_ram() / (1024 * 1024)
-        print(f'[RAM Setting] Model weights kept in system RAM are limited to {ram_limit:.0f} MB of {total_ram} MB (currently using {rss_mb:.0f} MB).')
-    else:
-        print('[RAM Setting] No RAM limit set.')
 
     processing.need_global_unload = True
     return

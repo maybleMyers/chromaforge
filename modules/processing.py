@@ -834,8 +834,6 @@ need_global_unload = False
 def manage_model_and_prompt_cache(p: StableDiffusionProcessing):
     global need_global_unload
 
-    memory_management.free_ram(reason='pre-generation')
-
     p.sd_model, just_reloaded = forge_model_reload()
 
     # Skip unloading for ChromaDCT models that don't use VAE

@@ -665,55 +665,6 @@ def apply_token_merging(sd_model, token_merging_ratio):
     return
 
 
-def check_ram_before_load(checkpoint_filename, additional_state_dicts):
-    """Estimate the transient RAM peak of loading this checkpoint (full state dict
-    plus a copy of the largest component while modules are built), free RAM to make
-    room, and fail cleanly instead of letting the OS kill the process."""
-    import psutil
-
-    files = [checkpoint_filename] + [f for f in (additional_state_dicts or []) if isinstance(f, str)]
-    sizes = []
-    eager_bytes = 0
-    for f in files:
-        try:
-            size = os.path.getsize(f)
-        except OSError:
-            continue
-        sizes.append(size)
-        if not f.lower().endswith('.safetensors'):
-            eager_bytes += size
-
-    if not sizes:
-        return
-
-    # Safetensors state dicts are mmap-backed (reclaimable page cache), so the
-    # dedicated-RAM peak is roughly one copy of every file for the built modules,
-    # plus a second copy of any file loaded eagerly (.ckpt/.gguf).
-    peak_estimate = sum(sizes) + eager_bytes
-
-    memory_management.free_ram(target_headroom=peak_estimate, reason='loading checkpoint')
-
-    vm = psutil.virtual_memory()
-    swap_free = psutil.swap_memory().free
-    if peak_estimate > vm.available + swap_free:
-        raise RuntimeError(
-            f'Not enough free system RAM to load this model: loading needs roughly '
-            f'{peak_estimate / (1024 * 1024):.0f} MB but only {vm.available / (1024 * 1024):.0f} MB RAM '
-            f'plus {swap_free / (1024 * 1024):.0f} MB swap is available. '
-            f'Close other applications, lower the "Maximum RAM (MB)" slider so more models get evicted, '
-            f'or use a smaller/quantized checkpoint.'
-        )
-    if peak_estimate > vm.available:
-        print(f'[RAM Warning] Loading needs roughly {peak_estimate / (1024 * 1024):.0f} MB but only '
-              f'{vm.available / (1024 * 1024):.0f} MB RAM is free; the load will dip into swap and may be slow.')
-
-    if memory_management.current_ram_budget > 0:
-        projected = memory_management.get_process_ram() + peak_estimate
-        if projected > memory_management.current_ram_budget:
-            print(f'[RAM Warning] Loading this model will temporarily use about {projected / (1024 * 1024):.0f} MB, '
-                  f'above the {memory_management.current_ram_budget / (1024 * 1024):.0f} MB RAM limit.')
-
-
 @torch.inference_mode()
 def forge_model_reload():
     current_hash = str(model_data.forge_loading_parameters)
@@ -730,7 +681,6 @@ def forge_model_reload():
         memory_management.unload_all_models()
         memory_management.soft_empty_cache()
         gc.collect()
-        memory_management.malloc_trim()
 
     timer.record("unload existing model")
 
@@ -741,8 +691,6 @@ def forge_model_reload():
 
     state_dict = checkpoint_info.filename
     additional_state_dicts = model_data.forge_loading_parameters.get('additional_modules', [])
-
-    check_ram_before_load(checkpoint_info.filename, additional_state_dicts)
 
     timer.record("cache state dict")
 
@@ -773,8 +721,6 @@ def forge_model_reload():
     script_callbacks.model_loaded_callback(sd_model)
 
     timer.record("scripts callbacks")
-
-    memory_management.ram_report()
 
     print(f"Model loaded in {timer.summary()}.")
 

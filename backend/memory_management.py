@@ -718,7 +718,6 @@ class LoadedModel:
 
 
 current_inference_memory = 1024 * 1024 * 1024
-current_ram_budget = 0  # bytes; 0 = unlimited
 
 
 def minimum_inference_memory():
@@ -1438,176 +1437,6 @@ def unload_all_models():
     free_memory(1e30, get_torch_device(), free_all=True)
 
 
-_psutil_process = None
-
-
-def get_process_ram():
-    global _psutil_process
-    if _psutil_process is None:
-        _psutil_process = psutil.Process()
-    return _psutil_process.memory_info().rss
-
-
-def malloc_trim():
-    # glibc rarely returns freed CPU-tensor memory to the OS on its own, so RSS
-    # stays high after models are released unless we ask for it explicitly.
-    if platform.system() != 'Linux':
-        return
-    try:
-        import ctypes
-        ctypes.CDLL('libc.so.6').malloc_trim(0)
-    except Exception:
-        pass
-
-
-def _active_model_module_ids():
-    # id()s of the inner torch modules belonging to the currently active sd_model,
-    # across all forge_objects variants (they share the same underlying modules).
-    result = set()
-    try:
-        from modules import sd_models
-        sd_model = getattr(sd_models.model_data, 'sd_model', None)
-    except Exception:
-        return result
-    if sd_model is None:
-        return result
-    for attr in ['forge_objects', 'forge_objects_original', 'forge_objects_after_applying_lora']:
-        fo = getattr(sd_model, attr, None)
-        if fo is None:
-            continue
-        for comp_name in ['unet', 'clip', 'vae', 'clipvision']:
-            comp = getattr(fo, comp_name, None)
-            if comp is None:
-                continue
-            patcher = comp if isinstance(getattr(comp, 'model', None), torch.nn.Module) else getattr(comp, 'patcher', None)
-            inner = getattr(patcher, 'model', None)
-            if inner is not None:
-                result.add(id(inner))
-    return result
-
-
-def _loaded_model_device_size(loaded_model, device):
-    try:
-        return module_size(loaded_model.model.model, include_device=device)
-    except Exception:
-        return 0
-
-
-def _lora_backup_size(loaded_model):
-    loader = getattr(loaded_model.model.model, 'lora_loader', None)
-    if loader is None or not getattr(loader, 'backup', None):
-        return 0
-    try:
-        return sum(w.nelement() * w.element_size() for w in loader.backup.values())
-    except Exception:
-        return 0
-
-
-def ram_report(prefix='[RAM]'):
-    rss = get_process_ram()
-    budget_text = f' / budget {current_ram_budget / (1024 * 1024):.0f} MB' if current_ram_budget > 0 else ' (no RAM limit set)'
-    print(f'{prefix} Process RSS: {rss / (1024 * 1024):.0f} MB{budget_text}')
-    active = _active_model_module_ids()
-    for lm in current_loaded_models:
-        inner = lm.model.model
-        cpu_mb = _loaded_model_device_size(lm, cpu) / (1024 * 1024)
-        gpu_mb = 0 if is_device_cpu(lm.device) else _loaded_model_device_size(lm, lm.device) / (1024 * 1024)
-        backup_mb = _lora_backup_size(lm) / (1024 * 1024)
-        flag = 'active' if id(inner) in active else 'inactive'
-        extra = f', lora backup {backup_mb:.0f} MB' if backup_mb > 0 else ''
-        print(f'{prefix}   {type(inner).__name__}: {cpu_mb:.0f} MB RAM, {gpu_mb:.0f} MB GPU ({flag}{extra})')
-    return rss
-
-
-def free_ram(target_headroom=0, reason='', verbose=True):
-    """Evict CPU-resident models until process RSS fits within current_ram_budget
-    minus target_headroom. Safe only at generation/load boundaries."""
-    if current_ram_budget <= 0:
-        return
-    budget = current_ram_budget - target_headroom
-    rss = get_process_ram()
-    if rss <= budget:
-        return
-
-    reason_text = f' ({reason})' if reason else ''
-    print(f'[RAM] Over budget{reason_text}: RSS {rss / (1024 * 1024):.0f} MB > target {budget / (1024 * 1024):.0f} MB. Freeing RAM ...')
-    if verbose:
-        ram_report()
-
-    import gc
-
-    # Tier 1: fully release models that no longer belong to the active sd_model (LRU last).
-    active = _active_model_module_ids()
-    for i in range(len(current_loaded_models) - 1, -1, -1):
-        lm = current_loaded_models[i]
-        if id(lm.model.model) in active:
-            continue
-        cpu_mb = _loaded_model_device_size(lm, cpu) / (1024 * 1024)
-        gpu_resident = 0 if is_device_cpu(lm.device) else _loaded_model_device_size(lm, lm.device)
-        print(f'[RAM] Releasing inactive model {type(lm.model.model).__name__} ({cpu_mb:.0f} MB in RAM)')
-        current_loaded_models.pop(i)
-        try:
-            # If weights are still on GPU, move them off so we don't leak VRAM in
-            # case something else keeps the module tree alive.
-            lm.model_unload(avoid_model_moving=gpu_resident == 0)
-        except Exception as e:
-            print(f'[RAM] Warning while releasing model: {e}')
-        if hasattr(lm, 'real_model'):
-            del lm.real_model
-        del lm
-
-    gc.collect()
-    soft_empty_cache()
-    malloc_trim()
-    rss = get_process_ram()
-    if rss <= budget:
-        print(f'[RAM] Done. RSS now {rss / (1024 * 1024):.0f} MB.')
-        return
-
-    # Tier 2: drop the checkpoint state-dict RAM cache.
-    try:
-        from modules import sd_models
-        if len(sd_models.checkpoints_loaded) > 0:
-            print(f'[RAM] Clearing checkpoint RAM cache ({len(sd_models.checkpoints_loaded)} entries)')
-            sd_models.checkpoints_loaded.clear()
-            gc.collect()
-            malloc_trim()
-            rss = get_process_ram()
-    except Exception:
-        pass
-
-    # Tier 3: drop torch.compile caches. Compiled graphs keep references to
-    # modules and buffers, and after an OOM cleanup they can be the only thing
-    # left holding tens of GB. Costs a recompile on the next generation.
-    if rss > budget:
-        try:
-            import torch._dynamo
-            print('[RAM] Resetting torch.compile caches')
-            torch._dynamo.reset()
-            gc.collect()
-            soft_empty_cache()
-            malloc_trim()
-            rss = get_process_ram()
-        except Exception as e:
-            print(f'[RAM] Warning while resetting torch.compile caches: {e}')
-
-    if rss > budget:
-        try:
-            from modules import sd_models
-            has_active_model = getattr(sd_models.model_data, 'sd_model', None) is not None
-        except Exception:
-            has_active_model = True
-        if has_active_model:
-            print(f'[RAM] RSS still {rss / (1024 * 1024):.0f} MB after cleanup; remaining memory is held by the active model. '
-                  f'Raise the "Maximum RAM (MB)" slider or use a smaller/quantized checkpoint.')
-        else:
-            print(f'[RAM] RSS still {rss / (1024 * 1024):.0f} MB after cleanup with no model loaded; '
-                  f'memory is held by leaked references or allocator fragmentation. '
-                  f'If this persists, restarting the webui is the only way to reclaim it.')
-    else:
-        print(f'[RAM] Done. RSS now {rss / (1024 * 1024):.0f} MB.')
-
-
 def emergency_memory_cleanup():
     """
     Emergency memory cleanup function for OOM recovery.
@@ -1759,18 +1588,8 @@ def emergency_memory_cleanup():
     except Exception as e:
         print(f"[OOM Recovery] Warning during cache clearing: {e}")
 
-    # Step 8: Drop torch.compile caches - compiled graphs keep references to the
-    # models we just tried to delete, and can pin tens of GB of RAM and VRAM.
-    try:
-        import torch._dynamo
-        torch._dynamo.reset()
-        print("[OOM Recovery] Reset torch.compile caches")
-    except Exception as e:
-        print(f"[OOM Recovery] Warning during torch.compile reset: {e}")
-
-    # Final garbage collection after cache clear, and return freed CPU memory to the OS
+    # Step 8: Final garbage collection after cache clear
     gc.collect()
-    malloc_trim()
 
     # Step 9: Reset signal flags
     global signal_empty_cache

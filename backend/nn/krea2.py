@@ -568,7 +568,17 @@ def krea2_lora_key_map(sdk, key_map):
     ('transformer_blocks.N.attn.to_q'); register both spellings under the
     common LoRA prefix conventions."""
     for k in sdk:
-        if not (k.startswith('diffusion_model.') and k.endswith('.weight')):
+        if not k.startswith('diffusion_model.'):
+            continue
+        if not k.endswith('.weight'):
+            # Bare nn.Parameters (RMSNorm 'scale', modulation 'lin'): ComfyUI
+            # trainers address these with '.diff' offset keys.
+            if k.endswith('.bias'):
+                continue
+            inner = k[len('diffusion_model.'):]
+            if inner.startswith('mmdit.'):
+                inner = inner[len('mmdit.'):]
+            key_map['diffusion_model.{}'.format(inner)] = k
             continue
         inner = k[len('diffusion_model.'):-len('.weight')]
         if inner.startswith('mmdit.'):

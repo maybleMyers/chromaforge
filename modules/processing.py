@@ -879,6 +879,16 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         if 'forge_preset' not in p.override_settings and p.preset_override is not None and p.preset_override != shared.opts.forge_preset:
             shared.opts.set('forge_preset', p.preset_override)
 
+        # Krea2 patchifies latents 2x2, so pixel dimensions must be multiples of 16
+        if shared.opts.forge_preset == 'krea2':
+            for dim_attr in ('width', 'height'):
+                v = getattr(p, dim_attr, 0)
+                if v:
+                    snapped = max(64, round(v / 16) * 16)
+                    if snapped != v:
+                        print(f"[Krea2] Snapping {dim_attr} {v} -> {snapped} (must be a multiple of 16)")
+                        setattr(p, dim_attr, snapped)
+
         # stage this job's loading parameters (no-op if unchanged)
         main_entry.refresh_model_loading_parameters()
 
@@ -1305,15 +1315,39 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
         if deferred_batches:
             print(f"[Deferred Decode] Decoding {len(deferred_batches)} deferred batches at end of generation ...")
+            shared.state.job = f"Decoding {len(deferred_batches)} deferred batches"
+
+            # decode all deferred latents in a single VAE call so memory cleanup/model load runs once, not once per batch
+            all_samples = torch.cat([samples for _, samples in deferred_batches], dim=0)
+            devices.test_for_nans(all_samples, "unet")
+
+            if opts.sd_vae_decode_method != 'Full':
+                p.extra_generation_params['VAE Decoder'] = opts.sd_vae_decode_method
+            try:
+                decoded_all = decode_latent_batch(p.sd_model, all_samples, target_device=devices.cpu, check_for_nans=True)
+            except memory_management.OOM_EXCEPTION as e:
+                memory_management.emergency_memory_cleanup()
+                raise RuntimeError(
+                    "Out of memory during VAE decode. Memory has been cleared. "
+                    "Please try again with a smaller resolution or use tiled VAE decoding."
+                ) from e
+
+            del all_samples
+
+            offset = 0
             for n, samples_ddim in deferred_batches:
+                count = samples_ddim.shape[0]
+                batch_decoded = DecodedSamples(decoded_all[offset:offset + count])
+                offset += count
+
                 p.iteration = n
                 p.prompts = p.all_prompts[n * p.batch_size:(n + 1) * p.batch_size]
                 p.negative_prompts = p.all_negative_prompts[n * p.batch_size:(n + 1) * p.batch_size]
                 p.seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
                 p.subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
-                shared.state.job = f"Decoding batch {n + 1} out of {p.n_iter}"
+                shared.state.job = f"Finalizing batch {n + 1} out of {p.n_iter}"
 
-                finalize_batch(n, samples_ddim)
+                finalize_batch(n, batch_decoded)
 
             deferred_batches.clear()
             devices.torch_gc()
@@ -1473,6 +1507,13 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
                 self.truncate_x = (self.hr_upscale_to_x - target_w) // opt_f
                 self.truncate_y = (self.hr_upscale_to_y - target_h) // opt_f
+
+        if shared.opts.forge_preset == 'krea2':
+            # Krea2 patchifies latents 2x2: the sampled hires resolution (after truncation) must be a multiple of 16
+            target_x = max(64, (self.hr_upscale_to_x - self.truncate_x * opt_f) // 16 * 16)
+            target_y = max(64, (self.hr_upscale_to_y - self.truncate_y * opt_f) // 16 * 16)
+            self.truncate_x = (self.hr_upscale_to_x - target_x) // opt_f
+            self.truncate_y = (self.hr_upscale_to_y - target_y) // opt_f
 
     def init(self, all_prompts, all_seeds, all_subseeds):
         if self.enable_hr:

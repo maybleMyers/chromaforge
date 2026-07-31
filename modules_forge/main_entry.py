@@ -488,10 +488,10 @@ def preset_updates(preset=None):
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
             gr.update(visible=False, value=total_vram - 1024),                          # ui_forge_inference_memory
-            gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_width", 512)),                 # ui_txt2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "sd_i2i_width", 512)),                 # ui_img2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "sd_t2i_height", 640)),                # ui_txt2img_height
-            gr.update(maximum=2048, value=getattr(shared.opts, "sd_i2i_height", 512)),                # ui_img2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "sd_t2i_width", 512)),                 # ui_txt2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "sd_i2i_width", 512)),                 # ui_img2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "sd_t2i_height", 640)),                # ui_txt2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "sd_i2i_height", 512)),                # ui_img2img_height
             gr.update(value=getattr(shared.opts, "sd_t2i_cfg", 7)),                     # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "sd_i2i_cfg", 7)),                     # ui_img2img_cfg
             gr.update(visible=False, value=3.5),                                        # ui_txt2img_distilled_cfg
@@ -524,10 +524,10 @@ def preset_updates(preset=None):
             gr.update(visible=False, value='Queue'),                                    # ui_forge_async_loading
             gr.update(visible=False, value='CPU'),                                      # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
-            gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_width", 896)),                 # ui_txt2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "xl_i2i_width", 1024)),                # ui_img2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "xl_t2i_height", 1152)),               # ui_txt2img_height
-            gr.update(maximum=2048, value=getattr(shared.opts, "xl_i2i_height", 1024)),               # ui_img2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "xl_t2i_width", 896)),                 # ui_txt2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "xl_i2i_width", 1024)),                # ui_img2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "xl_t2i_height", 1152)),               # ui_txt2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "xl_i2i_height", 1024)),               # ui_img2img_height
             gr.update(value=getattr(shared.opts, "xl_t2i_cfg", 5)),                     # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "xl_i2i_cfg", 5)),                     # ui_img2img_cfg
             gr.update(visible=False, value=3.5),                                        # ui_txt2img_distilled_cfg
@@ -560,10 +560,10 @@ def preset_updates(preset=None):
             gr.update(visible=True, value='Queue'),                                     # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),                                       # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),                                   # ui_forge_inference_memory
-            gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_width", 896)),               # ui_txt2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "flux_i2i_width", 1024)),              # ui_img2img_width
-            gr.update(maximum=2048, value=getattr(shared.opts, "flux_t2i_height", 1152)),             # ui_txt2img_height
-            gr.update(maximum=2048, value=getattr(shared.opts, "flux_i2i_height", 1024)),             # ui_img2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "flux_t2i_width", 896)),               # ui_txt2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "flux_i2i_width", 1024)),              # ui_img2img_width
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "flux_t2i_height", 1152)),             # ui_txt2img_height
+            gr.update(maximum=2048, step=8, value=getattr(shared.opts, "flux_i2i_height", 1024)),             # ui_img2img_height
             gr.update(value=getattr(shared.opts, "flux_t2i_cfg", 1)),                   # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "flux_i2i_cfg", 1)),                   # ui_img2img_cfg
             gr.update(visible=True, value=getattr(shared.opts, "flux_t2i_d_cfg", 3.5)), # ui_txt2img_distilled_cfg
@@ -593,10 +593,10 @@ def preset_updates(preset=None):
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
             gr.update(visible=True, value=total_vram - 1024),  # ui_forge_inference_memory
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_width", 1024)),  # ui_txt2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_width", 1024)),  # ui_img2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma_t2i_height", 1024)),  # ui_txt2img_height
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma_t2i_width", 1024)),  # ui_txt2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma_i2i_width", 1024)),  # ui_img2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma_t2i_height", 1024)),  # ui_txt2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma_i2i_height", 1024)),  # ui_img2img_height
             gr.update(value=getattr(shared.opts, "chroma_t2i_cfg", 7.0)),  # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "chroma_i2i_cfg", 7.0)),  # ui_img2img_cfg
             gr.update(visible=True, value=getattr(shared.opts, "chroma_t2i_d_cfg", 3.5)),  # ui_txt2img_distilled_cfg
@@ -629,10 +629,10 @@ def preset_updates(preset=None):
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma2_t2i_width", 1024)),  # ui_txt2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma2_i2i_width", 1024)),  # ui_img2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma2_t2i_height", 1024)),  # ui_txt2img_height
-            gr.update(maximum=3072, value=getattr(shared.opts, "chroma2_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma2_t2i_width", 1024)),  # ui_txt2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma2_i2i_width", 1024)),  # ui_img2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma2_t2i_height", 1024)),  # ui_txt2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "chroma2_i2i_height", 1024)),  # ui_img2img_height
             gr.update(value=getattr(shared.opts, "chroma2_t2i_cfg", 3.0)),  # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "chroma2_i2i_cfg", 3.0)),  # ui_img2img_cfg
             gr.update(visible=True, value=getattr(shared.opts, "chroma2_t2i_d_cfg", 3.5)),  # ui_txt2img_distilled_cfg
@@ -665,10 +665,10 @@ def preset_updates(preset=None):
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
-            gr.update(maximum=3072, value=getattr(shared.opts, "z_t2i_width", 1024)),  # ui_txt2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "z_i2i_width", 1024)),  # ui_img2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "z_t2i_height", 1024)),  # ui_txt2img_height
-            gr.update(maximum=3072, value=getattr(shared.opts, "z_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "z_t2i_width", 1024)),  # ui_txt2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "z_i2i_width", 1024)),  # ui_img2img_width
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "z_t2i_height", 1024)),  # ui_txt2img_height
+            gr.update(maximum=3072, step=8, value=getattr(shared.opts, "z_i2i_height", 1024)),  # ui_img2img_height
             gr.update(value=getattr(shared.opts, "z_t2i_cfg", 1)),  # ui_txt2img_cfg
             gr.update(value=getattr(shared.opts, "z_i2i_cfg", 1)),  # ui_img2img_cfg
             gr.update(visible=False, value=0),  # ui_txt2img_distilled_cfg
@@ -694,6 +694,7 @@ def preset_updates(preset=None):
         model_mem = getattr(shared.opts, "krea2_GPU_MB", total_vram - 1024)
         if model_mem < 0 or model_mem > total_vram:
             model_mem = total_vram - 1024
+        snap16 = lambda v: max(64, round(v / 16) * 16)
         return [
             gr.update(visible=True),  # ui_vae (Krea2 needs the Qwen3-VL text encoder + Qwen-Image VAE selected here)
             gr.update(visible=False, value=1),  # ui_clip_skip
@@ -701,10 +702,10 @@ def preset_updates(preset=None):
             gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
             gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
             gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
-            gr.update(maximum=3072, value=getattr(shared.opts, "krea2_t2i_width", 1024)),  # ui_txt2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "krea2_i2i_width", 1024)),  # ui_img2img_width
-            gr.update(maximum=3072, value=getattr(shared.opts, "krea2_t2i_height", 1024)),  # ui_txt2img_height
-            gr.update(maximum=3072, value=getattr(shared.opts, "krea2_i2i_height", 1024)),  # ui_img2img_height
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "krea2_t2i_width", 1024))),  # ui_txt2img_width (Krea2 patchifies latents 2x2: multiples of 16 only)
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "krea2_i2i_width", 1024))),  # ui_img2img_width
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "krea2_t2i_height", 1024))),  # ui_txt2img_height
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "krea2_i2i_height", 1024))),  # ui_img2img_height
             gr.update(value=getattr(shared.opts, "krea2_t2i_cfg", 1)),  # ui_txt2img_cfg (Turbo is distilled: CFG disabled)
             gr.update(value=getattr(shared.opts, "krea2_i2i_cfg", 1)),  # ui_img2img_cfg
             gr.update(visible=False, value=0),  # ui_txt2img_distilled_cfg
@@ -734,10 +735,10 @@ def preset_updates(preset=None):
         gr.update(visible=True, value='Queue'),  # ui_forge_async_loading
         gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
         gr.update(visible=True, value=total_vram - 1024),  # ui_forge_inference_memory
-        gr.update(maximum=2048, value=ui_settings_from_file['txt2img/Width/value']),  # ui_txt2img_width
-        gr.update(maximum=2048, value=ui_settings_from_file['img2img/Width/value']),  # ui_img2img_width
-        gr.update(maximum=2048, value=ui_settings_from_file['txt2img/Height/value']),  # ui_txt2img_height
-        gr.update(maximum=2048, value=ui_settings_from_file['img2img/Height/value']),  # ui_img2img_height
+        gr.update(maximum=2048, step=8, value=ui_settings_from_file['txt2img/Width/value']),  # ui_txt2img_width
+        gr.update(maximum=2048, step=8, value=ui_settings_from_file['img2img/Width/value']),  # ui_img2img_width
+        gr.update(maximum=2048, step=8, value=ui_settings_from_file['txt2img/Height/value']),  # ui_txt2img_height
+        gr.update(maximum=2048, step=8, value=ui_settings_from_file['img2img/Height/value']),  # ui_img2img_height
         gr.update(value=ui_settings_from_file['txt2img/CFG Scale/value']),  # ui_txt2img_cfg
         gr.update(value=ui_settings_from_file['img2img/CFG Scale/value']),  # ui_img2img_cfg
         gr.update(visible=True, value=ui_settings_from_file['txt2img/Distilled CFG Scale/value']),  # ui_txt2img_distilled_cfg
@@ -826,15 +827,15 @@ shared.options_templates.update(shared.options_section(('ui_chroma2', "UI defaul
     "chroma2_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
 }))
 shared.options_templates.update(shared.options_section(('ui_krea2', "UI defaults 'krea2'", "ui"), {
-    "krea2_t2i_width":    shared.OptionInfo(1024,  "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
-    "krea2_t2i_height":   shared.OptionInfo(1024, "txt2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "krea2_t2i_width":    shared.OptionInfo(1024,  "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "krea2_t2i_height":   shared.OptionInfo(1024, "txt2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
     "krea2_t2i_steps":    shared.OptionInfo(8, "txt2img steps",                   gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
     "krea2_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
     "krea2_t2i_scheduler": shared.OptionInfo('Simple', "txt2img scheduler"),
     "krea2_t2i_cfg":      shared.OptionInfo(1,    "txt2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "krea2_t2i_hr_cfg":   shared.OptionInfo(1,    "txt2img HiRes CFG",            gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
-    "krea2_i2i_width":    shared.OptionInfo(1024, "img2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
-    "krea2_i2i_height":   shared.OptionInfo(1024, "img2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),
+    "krea2_i2i_width":    shared.OptionInfo(1024, "img2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "krea2_i2i_height":   shared.OptionInfo(1024, "img2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
     "krea2_i2i_steps":    shared.OptionInfo(8, "img2img steps",                   gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
     "krea2_i2i_sampler":  shared.OptionInfo('Euler', "img2img sampler"),
     "krea2_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),

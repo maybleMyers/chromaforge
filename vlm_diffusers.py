@@ -84,6 +84,20 @@ Now, based on the original problem and reference responses above, please provide
 """
 
 
+# Fallback chat template for DeepSeek V4 checkpoints (they ship no chat_template;
+# format derived from the repo's encoding/encoding_dsv4.py — chat mode, thinking disabled).
+# The checkpoint sets add_bos_token=false, so the template must emit BOS itself.
+DEEPSEEK_V4_CHAT_TEMPLATE = (
+    "{{ bos_token }}"
+    "{% if messages and messages[0]['role'] == 'system' %}{{ messages[0]['content'] }}{% endif %}"
+    "{% for message in messages %}"
+    "{% if message['role'] == 'user' %}<｜User｜>{{ message['content'] }}"
+    "{% elif message['role'] == 'assistant' %}<｜Assistant｜></think>{{ message['content'] }}<｜end▁of▁sentence｜>"
+    "{% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}<｜Assistant｜></think>{% endif %}"
+)
+
+
 # Settings file path
 SETTINGS_FILE = "vlm_diffusers_settings.json"
 
@@ -404,6 +418,15 @@ try:
     except Exception:
         pass  # accelerate not available or patch not needed
 
+    # DeepSeek V4 (deepseek_v4) requires transformers >= 5.8.0
+    try:
+        from transformers import DeepseekV4ForCausalLM  # noqa: F401
+        DEEPSEEK_V4_AVAILABLE = True
+        print("DeepSeek V4 support: available (native transformers)")
+    except ImportError:
+        DEEPSEEK_V4_AVAILABLE = False
+        print("Note: DeepSeek V4 not available (requires transformers >= 5.8.0)")
+
     # Try to import Qwen3 VL MoE class (requires newer transformers)
     try:
         from transformers import Qwen3VLMoeForConditionalGeneration
@@ -453,6 +476,7 @@ except ImportError as e:
     QWEN3_VL_AVAILABLE = False
     GLM4V_AVAILABLE = False
     GLM46V_AVAILABLE = False
+    DEEPSEEK_V4_AVAILABLE = False
     print(f"Error: transformers not installed or incompatible version: {e}")
 
 try:
@@ -748,6 +772,9 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                 # Detect InternVL models
                 if "internvl" in arch or "internvl" in model_type_str:
                     model_type = "internvl"
+                # Detect DeepSeek models (text-only, e.g. deepseek_v4)
+                elif "deepseek" in arch or model_type_str.startswith("deepseek"):
+                    model_type = "deepseek"
                 # Detect Qwen models
                 elif "qwen" in arch or "qwen" in model_type_str:
                     if "vl" in arch or "vision" in model_type_str or config.get("vision_config"):
@@ -766,8 +793,8 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
         except Exception:
             pass
 
-        # Include Qwen, GLM, InternVL, and Step3-VL models
-        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl", "internvl", "step3-vl"]:
+        # Include Qwen, GLM, InternVL, Step3-VL, and DeepSeek models
+        if model_type in ["qwen", "qwen-vl", "glm", "glm-vl", "internvl", "step3-vl", "deepseek"]:
             models.append({
                 "name": model_dir.name,
                 "path": str(model_dir),
@@ -864,6 +891,11 @@ class Qwen3VLMBackend:
             Status message
         """
         self.use_flash_attention = flash_attention
+        # DeepSeek FP8 checkpoints are only wired up for the transformers backend
+        if backend in ("lmdeploy", "vllm"):
+            _mi = next((m for m in self.get_available_models() if m["name"] == model_name), None)
+            if _mi is not None and _mi["type"] == "deepseek":
+                return "Error: DeepSeek V4 is only supported with the transformers backend here. Set Backend to 'transformers'."
         # Check backend availability
         if backend == "lmdeploy":
             if not LMDEPLOY_AVAILABLE:
@@ -897,14 +929,32 @@ class Qwen3VLMBackend:
         try:
             progress(0.1, desc="Configuring device map...")
 
-            # Check for pre-quantized SDNQ model (has quantization_config with quant_method=sdnq)
+            # Check for pre-quantized models (quantization_config embedded in config.json)
+            # - quant_method == "sdnq": reconstruct SDNQConfig and pass it explicitly
+            # - quant_method == "fp8": FineGrainedFP8 checkpoint (e.g. DeepSeek V4 FP8);
+            #   transformers auto-detects it, we just need to bypass the manual quant paths
             is_prequantized_sdnq = False
+            is_prequantized_fp8 = False
             prequantized_sdnq_config = None
             config_path = os.path.join(model_path, "config.json")
             if os.path.exists(config_path):
                 with open(config_path, "r") as f:
                     model_config = json.load(f)
                     embedded_quant = model_config.get("quantization_config", {})
+                    if embedded_quant.get("quant_method") == "fp8":
+                        is_prequantized_fp8 = True
+                        print(f"[FP8] Detected pre-quantized FineGrainedFP8 model "
+                              f"(scale_fmt={embedded_quant.get('scale_fmt')}, "
+                              f"expert_dtype={model_config.get('expert_dtype', embedded_quant.get('expert_dtype', 'fp8'))})")
+                        if model_config.get("model_type") == "deepseek_v4" and not DEEPSEEK_V4_AVAILABLE:
+                            return ("Error: deepseek_v4 requires transformers >= 5.8.0. "
+                                    "Run: pip install -U 'transformers>=5.8.0' accelerate")
+                        if self.num_gpus > 0:
+                            cap = torch.cuda.get_device_capability(0)
+                            if cap < (8, 9):
+                                return (f"Error: GPU compute capability {cap[0]}.{cap[1]} < 8.9. "
+                                        "transformers would silently dequantize this FP8 checkpoint to bf16 "
+                                        "(~2-4x memory) and OOM. This GPU cannot run it.")
                     if embedded_quant.get("quant_method") == "sdnq":
                         is_prequantized_sdnq = True
                         if SDNQ_AVAILABLE:
@@ -926,10 +976,10 @@ class Qwen3VLMBackend:
             # - q4_nf4: 4-bit NF4 with bf16 compute (smallest memory, good quality)
             # - fp8_scaled: Manual FP8 conversion (native on RTX 40/50 series)
             # - sdnq_*: SDNQ quantization (alternative to bitsandbytes)
-            use_fp8 = dtype == "fp8_scaled" and not is_prequantized_sdnq
-            use_q8_partial = dtype in ["q8_partial", "q8_fp16"] and not is_prequantized_sdnq
-            use_q4_nf4 = dtype == "q4_nf4" and not is_prequantized_sdnq
-            use_sdnq = (dtype in SDNQ_DTYPE_MAP and not is_prequantized_sdnq) or is_prequantized_sdnq
+            use_fp8 = dtype == "fp8_scaled" and not is_prequantized_sdnq and not is_prequantized_fp8
+            use_q8_partial = dtype in ["q8_partial", "q8_fp16"] and not is_prequantized_sdnq and not is_prequantized_fp8
+            use_q4_nf4 = dtype == "q4_nf4" and not is_prequantized_sdnq and not is_prequantized_fp8
+            use_sdnq = (dtype in SDNQ_DTYPE_MAP and not is_prequantized_sdnq and not is_prequantized_fp8) or is_prequantized_sdnq
 
             dtype_map = {
                 "bfloat16": torch.bfloat16,
@@ -945,6 +995,14 @@ class Qwen3VLMBackend:
             }
             torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
+            # Pre-quantized FP8: quantization comes from the checkpoint itself;
+            # the dtype selection only applies to non-quantized layers (embeddings/norms/lm_head)
+            if is_prequantized_fp8:
+                torch_dtype = torch.bfloat16
+                if dtype != "bfloat16":
+                    print(f"[FP8] Pre-quantized checkpoint: '{dtype}' selection ignored; "
+                          "non-quantized layers use bfloat16")
+
             # Check SDNQ availability
             if use_sdnq and not SDNQ_AVAILABLE:
                 return "Error: sdnq not installed. Run: pip install sdnq"
@@ -957,7 +1015,9 @@ class Qwen3VLMBackend:
             # 1. Multiple GPUs, OR
             # 2. CPU offloading enabled, OR
             # 3. max_memory_per_gpu is set (to respect the limit)
-            use_auto_device_map = (actual_gpus > 1) or cpu_offload or (max_memory_per_gpu is not None and max_memory_per_gpu > 0)
+            # Pre-quantized FP8 checkpoints (167GB-class) always need auto device map -
+            # a {"": 0} map would immediately OOM even if the user forgot to enable offload
+            use_auto_device_map = (actual_gpus > 1) or cpu_offload or (max_memory_per_gpu is not None and max_memory_per_gpu > 0) or is_prequantized_fp8
 
             if use_auto_device_map and self.num_gpus > 0:
                 device_map = "auto"
@@ -968,20 +1028,36 @@ class Qwen3VLMBackend:
                     # User specified a limit
                     for i in range(actual_gpus):
                         max_memory[i] = f"{max_memory_per_gpu}GiB"
-                elif cpu_offload:
+                elif cpu_offload or is_prequantized_fp8:
                     # CPU offload enabled but no GPU limit set - auto-detect and use most of available VRAM
+                    # FP8 pre-quantized models get a smaller fraction: Triton fp8 kernels and
+                    # accelerate staging buffers need extra headroom
+                    vram_fraction = 0.85 if is_prequantized_fp8 else 0.9
                     for i in range(actual_gpus):
                         if torch.cuda.is_available():
                             free_mem, total_mem = torch.cuda.mem_get_info(i)
-                            # Use 90% of free VRAM to leave headroom
-                            gpu_mem_gb = int((free_mem / (1024**3)) * 0.9)
+                            gpu_mem_gb = int((free_mem / (1024**3)) * vram_fraction)
                             max_memory[i] = f"{gpu_mem_gb}GiB"
                             print(f"GPU {i}: auto-detected {gpu_mem_gb}GB available for model")
 
                 # Add CPU memory allowance for offloading
-                if cpu_offload and cpu_offload_ram and cpu_offload_ram > 0:
+                if (cpu_offload or is_prequantized_fp8) and cpu_offload_ram and cpu_offload_ram > 0:
                     max_memory["cpu"] = f"{cpu_offload_ram}GiB"
                     print(f"CPU offloading enabled: allowing up to {max_memory['cpu']} CPU RAM")
+                elif max_memory and is_prequantized_fp8:
+                    # A 16GiB CPU fallback would push ~100GB+ of an FP8 MoE checkpoint to
+                    # disk offload; use most of the actually-available system RAM instead
+                    cpu_gb = 16
+                    try:
+                        with open("/proc/meminfo") as mf:
+                            for line in mf:
+                                if line.startswith("MemAvailable:"):
+                                    cpu_gb = int(int(line.split()[1]) / (1024 ** 2) * 0.85)
+                                    break
+                    except Exception:
+                        pass
+                    max_memory["cpu"] = f"{cpu_gb}GiB"
+                    print(f"[FP8] Pre-quantized model: allowing up to {max_memory['cpu']} CPU RAM (85% of available)")
                 elif max_memory:
                     # Even without explicit offload, allow some CPU as fallback
                     max_memory["cpu"] = "16GiB"
@@ -1106,9 +1182,17 @@ class Qwen3VLMBackend:
                 )
                 print(f"Loaded tokenizer for {model_name}")
 
+                # DeepSeek V4 checkpoints ship no chat_template (prompt encoding lives in
+                # the repo's encoding/encoding_dsv4.py) - install our built-in fallback
+                if model_type == "deepseek" and getattr(self.tokenizer, "chat_template", None) is None:
+                    self.tokenizer.chat_template = DEEPSEEK_V4_CHAT_TEMPLATE
+                    print("[DeepSeek] No chat_template in checkpoint; installed built-in DeepSeek-V4 template (chat mode)")
+
             # Build progress/status strings
             quant_str = ""
-            if use_fp8:
+            if is_prequantized_fp8:
+                quant_str = " (pre-quantized FP8)"
+            elif use_fp8:
                 quant_str = " (FP8 scaled)"
             elif use_q4_nf4:
                 quant_str = " (4-bit NF4)"
@@ -1124,7 +1208,10 @@ class Qwen3VLMBackend:
             # Load the model
             # Determine attention implementation
             attn_impl = "sdpa"  # Default to PyTorch's scaled dot product attention
-            if self.use_flash_attention:
+            if model_type == "deepseek" and self.use_flash_attention:
+                # DeepSeek V4's hybrid CSA/HCA attention is untested with flash_attention_2
+                print("[DeepSeek] Flash Attention untested with DeepSeek V4 hybrid attention; using SDPA")
+            elif self.use_flash_attention:
                 try:
                     import flash_attn
                     attn_impl = "flash_attention_2"
@@ -1261,8 +1348,9 @@ class Qwen3VLMBackend:
                 model_kwargs["device_map"] = device_map
                 if max_memory is not None:
                     model_kwargs["max_memory"] = max_memory
-                # MoE models may need offload_folder for disk offload
-                if cpu_offload:
+                # MoE models may need offload_folder for disk offload; pre-quantized FP8
+                # checkpoints are expected to spill their tail past GPU+CPU budgets
+                if cpu_offload or is_prequantized_fp8:
                     model_kwargs["offload_folder"] = os.path.join(os.path.dirname(model_path), "offload_cache")
 
             # Only set dtype if not using FP8 (FP8 loads native dtype first)
@@ -1460,7 +1548,17 @@ class Qwen3VLMBackend:
                     self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
                     print("Loaded as generic Vision2Seq model")
             else:
-                self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
+                except ValueError as e:
+                    # deepseek_v4 routes masks through eager attention and may reject sdpa
+                    if model_type == "deepseek" and "attn" in str(e).lower():
+                        print(f"[DeepSeek] {model_kwargs.get('attn_implementation')} attention rejected, "
+                              f"retrying with default: {e}")
+                        model_kwargs.pop("attn_implementation", None)
+                        self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
+                    else:
+                        raise
                 print("Loaded as CausalLM model")
 
             self.model.eval()
@@ -3742,7 +3840,7 @@ def create_ui():
                             "sdnq_int4",    # SDNQ INT4 (smallest memory)
                         ],
                         value="bfloat16",
-                        info="bfloat16: full | q8_fp16: INT8 | sdnq_*: SDNQ quantization",
+                        info="bfloat16: full | q8_fp16: INT8 | sdnq_*: SDNQ | pre-quantized FP8/SDNQ checkpoints auto-detected (selection applies to non-quantized layers)",
                     )
 
                 with gr.Column(scale=1):

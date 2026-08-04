@@ -29,16 +29,12 @@ qwen-vl-utils>=0.0.14
 
 # Transformers backend
 # GLM-4.6V-Flash requires transformers v5.0.0rc0+ (PR #42122 added GLM-4.6V support)
+# DeepSeek V4 (deepseek_v4, FP8/FP4 checkpoints) requires transformers >= 5.8.0
 # NOT available in v4.57.x stable releases!
-#
-# Install ONE of these options:
-#   pip install transformers==5.0.0rc0      # Pre-release from PyPI
-#   pip install transformers --pre          # Latest pre-release
-#   pip install git+https://github.com/huggingface/transformers  # Dev (5.0.0.dev0)
-#
-# Source: https://github.com/huggingface/transformers/releases/tag/v5.0.0rc0
-transformers==5.0.0rc0
-accelerate
+transformers>=5.8.0
+# accelerate must be recent for float8 tensor dispatch/offload (DeepSeek V4 FP8);
+# versions older than ~1.0 cannot dispatch float8 weights
+accelerate>=1.2.0
 safetensors
 
 # Gradio UI - 6.x required for huggingface_hub 1.x compatibility (used by transformers 5.x)

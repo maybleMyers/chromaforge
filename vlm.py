@@ -421,16 +421,21 @@ class LlamaCppVLM:
             # Detect GPT-OSS models (text-only with Harmony format)
             is_gpt_oss = any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
 
+            # Detect DeepSeek models (text-only thinking models, e.g. DeepSeek V4 Flash)
+            is_deepseek = "deepseek" in model_name_lower or "deepseek" in model_path_lower
+
             # More specific detection
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
 
             # Set model type tracking
-            self.is_text_only_model = is_gpt_oss or (mmproj_path is None)
+            self.is_text_only_model = is_gpt_oss or is_deepseek or (mmproj_path is None)
             if is_gpt_oss:
                 self.model_type = "gpt-oss"
+            elif is_deepseek:
+                self.model_type = "deepseek"
             elif is_qwen_vl:
                 self.model_type = "qwen-vl"
             elif is_llava:
@@ -440,6 +445,11 @@ class LlamaCppVLM:
 
             if is_gpt_oss:
                 print("[llama.cpp] GPT-OSS model detected - using text-only mode with Harmony format")
+
+            if is_deepseek:
+                print("[llama.cpp] DeepSeek model detected - text-only mode")
+                print("[llama.cpp] Note: for large DeepSeek MoE models, the llama-server backend is recommended")
+                print("[llama.cpp]       (supports --override-tensor to keep experts on CPU, e.g. \\.ffn_.*_exps\\.weight=CPU)")
 
             # Set up chat handler for vision models
             self.chat_handler = None
@@ -588,6 +598,11 @@ class LlamaCppVLM:
                     self.model_type = "gpt-oss"
                     self.is_text_only_model = True
                     print(f"[llama.cpp] Detected GPT-OSS architecture from model metadata")
+                elif "deepseek" in arch:
+                    # DeepSeek V3/V4 report deepseek* architectures (e.g. "deepseek2")
+                    self.model_type = "deepseek"
+                    self.is_text_only_model = True
+                    print(f"[llama.cpp] Detected DeepSeek architecture '{arch}' from model metadata")
             except Exception as e:
                 print(f"[llama.cpp] Could not read model metadata: {e}")
 
@@ -751,6 +766,18 @@ class LlamaCppVLM:
         if type_v:
             cmd.extend(["--cache-type-v", type_v])
 
+        # DeepSeek models: use the GGUF's embedded jinja chat template and extract
+        # <think> reasoning into reasoning_content (handled by generate_via_api's
+        # existing reasoning_content -> <think> wrapping)
+        is_deepseek = "deepseek" in model_name.lower() or "deepseek" in model_path.lower()
+        extra_args_str = extra_args or ""
+        if is_deepseek:
+            if "--jinja" not in extra_args_str:
+                cmd.append("--jinja")
+            if "--reasoning-format" not in extra_args_str:
+                cmd.extend(["--reasoning-format", "deepseek"])
+            print("[llama-server] DeepSeek model detected: enabling --jinja and --reasoning-format deepseek")
+
         # Add override tensor (the key MoE optimization!)
         if override_tensor and override_tensor.strip():
             # Support multiple patterns separated by semicolons
@@ -833,7 +860,8 @@ class LlamaCppVLM:
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path
             self.use_server_backend = True
-            self.is_text_only_model = not (mmproj_path and os.path.exists(mmproj_path))
+            self.is_text_only_model = is_deepseek or not (mmproj_path and os.path.exists(mmproj_path))
+            self.model_type = "deepseek" if is_deepseek else self.model_type
             self.n_ctx = n_ctx  # Store context size for usage tracking
 
             vision_status = "with vision" if not self.is_text_only_model else "text-only"

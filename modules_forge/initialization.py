@@ -55,6 +55,9 @@ def initialize_forge():
         from modules_forge.cuda_malloc import try_cuda_malloc
         try_cuda_malloc()
 
+    # Must be set before torch initializes CUDA; respects user overrides and --cuda-malloc
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
     from backend import memory_management
     import torch
 

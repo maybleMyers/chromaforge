@@ -780,10 +780,13 @@ class LlamaCppVLM:
 
         # Add override tensor (the key MoE optimization!)
         if override_tensor and override_tensor.strip():
-            # Support multiple patterns separated by semicolons
+            # Support multiple patterns separated by semicolons.
+            # Newer llama.cpp deprecates repeating -ot (only the last one applies),
+            # so pass all patterns as a single comma-separated -ot value - the
+            # comma-separated form is parsed by all llama.cpp versions.
             patterns = [p.strip() for p in override_tensor.split(";") if p.strip()]
-            for pattern in patterns:
-                cmd.extend(["-ot", pattern])
+            if patterns:
+                cmd.extend(["-ot", ",".join(patterns)])
 
         # Add any extra arguments
         if extra_args and extra_args.strip():

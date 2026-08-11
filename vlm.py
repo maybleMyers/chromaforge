@@ -205,9 +205,9 @@ def is_kimi_model(*values: Optional[str]) -> bool:
 # Folder names that identify a quantization variant rather than a model. The unsloth
 # GGUF repos are laid out as <repo>/UD-Q2_K_XL/*.gguf with the vision projector
 # (mmproj-*.gguf) sitting one level up in the repo root.
-# Anchored so a model folder that merely starts with a quant-ish token (e.g. "Q3-Chat")
-# isn't mistaken for one.
-_QUANT_DIR_RE = re.compile(r"^(ud-)?(i?q\d[\w.]*|bf16|f16|f32)$", re.IGNORECASE)
+# Anchored so a model folder that merely starts with a quant-ish token isn't mistaken
+# for one. The trailing run covers compound names like "UD-Q2_K_XL-MXFP4".
+_QUANT_DIR_RE = re.compile(r"^(ud-)?(i?q\d|bf16|f16|f32|mxfp4)[\w.\-]*$", re.IGNORECASE)
 
 # mmproj precision preference - F16 is what unsloth recommends for Kimi K2.6
 _MMPROJ_PREFERENCE = ("f16", "bf16", "f32")
@@ -945,11 +945,15 @@ class LlamaCppVLM:
 
             progress(0.3, desc="Waiting for server to load model...")
 
-            max_wait = 1200  # 20 minutes max wait (large models on CPU need more time)
+            # Terabyte-class MoE models spend a long time here: with --no-mmap the whole
+            # file is read into RAM, and warmup then touches every weight. Kimi K2.6
+            # Q2_K_XL (317GB) needs well over the 20 minutes this used to allow.
+            max_wait = 5400  # 90 minutes
             start_time = time.time()
             server_ready = False
             last_status = None
             check_count = 0
+            last_elapsed_report = 0
 
             while time.time() - start_time < max_wait:
                 # Check if process died
@@ -957,6 +961,7 @@ class LlamaCppVLM:
                     return f"Error: llama-server exited with code {self.server_process.returncode}"
 
                 check_count += 1
+                elapsed = time.time() - start_time
                 try:
                     resp = requests.get(health_url, timeout=2)
                     if resp.status_code == 200:
@@ -967,23 +972,32 @@ class LlamaCppVLM:
                             last_status = status
                         if status == "ok":
                             server_ready = True
-                            print("[llama-server] Server is ready!")
+                            print(f"[llama-server] Server is ready! (took {elapsed / 60:.1f} min)")
                             break
                         elif status == "loading model":
-                            progress(0.5, desc="Server loading model...")
+                            progress(0.5, desc=f"Server loading model... ({elapsed / 60:.0f} min)")
                     elif resp.status_code != last_status:
                         print(f"[llama-server] Health check: {resp.status_code}")
                         last_status = resp.status_code
                 except requests.exceptions.RequestException as e:
                     if check_count == 1:
                         print(f"[llama-server] Waiting for server to start...")
+                    progress(0.5, desc=f"Waiting for llama-server... ({elapsed / 60:.0f} min)")
+
+                # Reassure the console that we are still waiting, not wedged
+                if elapsed - last_elapsed_report >= 60:
+                    last_elapsed_report = elapsed
+                    print(f"[llama-server] Still loading after {elapsed / 60:.0f} min "
+                          f"(timeout at {max_wait / 60:.0f} min)")
 
                 time.sleep(5)
 
             if not server_ready:
                 self.server_process.terminate()
                 self.server_process = None
-                return "Error: Server failed to become ready within timeout"
+                return (f"Error: Server failed to become ready within {max_wait / 60:.0f} min. "
+                        "For very large MoE models, keep the experts off the GPU with Override "
+                        "Tensor / --n-cpu-moe and consider leaving MMap enabled.")
 
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path

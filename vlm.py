@@ -127,6 +127,44 @@ def clean_harmony_tags(content: str) -> str:
     return cleaned.strip()
 
 
+def format_think_tags_for_display(text: str) -> str:
+    """
+    Convert <think>...</think> markers into markdown Gradio renders reliably.
+    A literal <think> tag is stripped as unknown HTML by the chatbot's
+    sanitizer, which can blank the entire message.
+    """
+    if not text or "<think>" not in text:
+        return text
+    formatted = text.replace("<think>", "**[Thinking]**\n\n", 1)
+    formatted = formatted.replace("</think>", "\n\n**[Response]**\n\n", 1)
+    return formatted
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_DISPLAY_THINK_RE = re.compile(r"\*\*\[Thinking\]\*\*.*?\*\*\[Response\]\*\*\s*", re.DOTALL)
+
+
+def strip_reasoning_for_context(text: str) -> str:
+    """
+    Remove reasoning blocks from a previous assistant response before sending
+    it back to the model. Thinking models (DeepSeek, GLM, Qwen) expect prior
+    turns without reasoning; resending it wastes context (thousands of tokens
+    per turn) and degrades output.
+    Handles both raw <think>...</think> and the display form from
+    format_think_tags_for_display, including unclosed blocks from stopped
+    generations.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _DISPLAY_THINK_RE.sub("", text)
+    if "<think>" in text:
+        text = text.split("<think>")[0]
+    if "**[Thinking]**" in text:
+        text = text.split("**[Thinking]**")[0]
+    return text.strip()
+
+
 def format_gpt_oss_system_prompt(user_prompt: str, reasoning_level: str = "medium") -> str:
     """
     Format a system prompt for GPT-OSS models with proper Harmony format requirements.
@@ -153,6 +191,50 @@ Reasoning: {reasoning_level}
         return f"{user_prompt.strip()}\n\n{harmony_header}"
     else:
         return f"You are a helpful AI assistant.\n\n{harmony_header}"
+
+
+def is_kimi_model(*values: Optional[str]) -> bool:
+    """
+    Detect Kimi K2 / K2.6 from a model name or path.
+    These GGUFs report the deepseek2 architecture but need their own handling:
+    K2.6 ships a vision projector and its chat template emits <think> blocks.
+    """
+    return any("kimi" in str(v).lower() for v in values if v)
+
+
+# Folder names that identify a quantization variant rather than a model. The unsloth
+# GGUF repos are laid out as <repo>/UD-Q2_K_XL/*.gguf with the vision projector
+# (mmproj-*.gguf) sitting one level up in the repo root.
+# Anchored so a model folder that merely starts with a quant-ish token (e.g. "Q3-Chat")
+# isn't mistaken for one.
+_QUANT_DIR_RE = re.compile(r"^(ud-)?(i?q\d[\w.]*|bf16|f16|f32)$", re.IGNORECASE)
+
+# mmproj precision preference - F16 is what unsloth recommends for Kimi K2.6
+_MMPROJ_PREFERENCE = ("f16", "bf16", "f32")
+
+_MMPROJ_PATTERNS = ["mmproj", "clip", "vision-encoder", "image-encoder"]
+
+
+def _is_mmproj(gguf_path: Path) -> bool:
+    stem_lower = gguf_path.stem.lower()
+    return any(p in stem_lower for p in _MMPROJ_PATTERNS)
+
+
+def _pick_mmproj(candidates: List[Path]) -> Optional[str]:
+    """Choose one vision projector from a folder, preferring F16 over BF16/F32."""
+    if not candidates:
+        return None
+
+    def rank(path: Path) -> Tuple[int, str]:
+        # Match on the separator too: "mmproj-bf16".endswith("f16") is True, which
+        # would otherwise let BF16 tie with F16 and win the name tiebreak.
+        stem = path.stem.lower()
+        for i, tag in enumerate(_MMPROJ_PREFERENCE):
+            if stem.endswith(f"-{tag}") or stem.endswith(f"_{tag}") or stem == tag:
+                return (i, path.name)
+        return (len(_MMPROJ_PREFERENCE), path.name)
+
+    return str(sorted(candidates, key=rank)[0])
 
 
 def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448), every_other_frame: bool = False) -> List[Image.Image]:
@@ -243,7 +325,7 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
             file_stem = gguf_file.stem
 
             # Skip mmproj/clip files as main models
-            if any(x in file_stem.lower() for x in ["mmproj", "clip", "vision-encoder", "image-encoder"]):
+            if _is_mmproj(gguf_file):
                 continue
 
             # Skip split model shards (not the first one)
@@ -271,21 +353,28 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
         all_ggufs = list(parent.glob("*.gguf"))
 
         # Separate mmproj/clip files from model files
-        mmproj_path = None
+        mmproj_candidates = []
         model_files = []
 
-        mmproj_patterns = ["mmproj", "clip", "vision-encoder", "image-encoder"]
-
         for gf in all_ggufs:
-            stem_lower = gf.stem.lower()
-            if any(p in stem_lower for p in mmproj_patterns):
-                if mmproj_path is None:
-                    mmproj_path = str(gf)
+            if _is_mmproj(gf):
+                mmproj_candidates.append(gf)
             else:
                 model_files.append(gf)
 
         if not model_files:
             continue
+
+        # Repos that split quants into subfolders (unsloth's Kimi-K2.6-GGUF has
+        # UD-Q2_K_XL/*.gguf) keep the vision projector in the repo root, one level
+        # up. Qualify the name as well, so several quants of the same repo stay
+        # tellable apart in the dropdown.
+        if _QUANT_DIR_RE.match(parent.name) and parent.parent != models_path:
+            name = f"{parent.parent.name}/{parent.name}"
+            if not mmproj_candidates:
+                mmproj_candidates = [gf for gf in parent.parent.glob("*.gguf") if _is_mmproj(gf)]
+
+        mmproj_path = _pick_mmproj(mmproj_candidates)
 
         # Sort model files to get consistent ordering
         # For split models, this ensures we get the first shard
@@ -421,19 +510,26 @@ class LlamaCppVLM:
             # Detect GPT-OSS models (text-only with Harmony format)
             is_gpt_oss = any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
 
+            # Detect Kimi K2 / K2.6 before DeepSeek: K2.6 is built on the deepseek2
+            # architecture but is multimodal and needs its own handling
+            is_kimi = is_kimi_model(model_name, model_path)
+
             # Detect DeepSeek models (text-only thinking models, e.g. DeepSeek V4 Flash)
-            is_deepseek = "deepseek" in model_name_lower or "deepseek" in model_path_lower
+            is_deepseek = not is_kimi and ("deepseek" in model_name_lower or "deepseek" in model_path_lower)
 
             # More specific detection
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Kimi={is_kimi}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
 
-            # Set model type tracking
-            self.is_text_only_model = is_gpt_oss or is_deepseek or (mmproj_path is None)
+            # Set model type tracking. Kimi is text-only here because llama-cpp-python
+            # has no handler for its MoonViT projector - vision needs llama-server.
+            self.is_text_only_model = is_gpt_oss or is_deepseek or is_kimi or (mmproj_path is None)
             if is_gpt_oss:
                 self.model_type = "gpt-oss"
+            elif is_kimi:
+                self.model_type = "kimi"
             elif is_deepseek:
                 self.model_type = "deepseek"
             elif is_qwen_vl:
@@ -451,9 +547,18 @@ class LlamaCppVLM:
                 print("[llama.cpp] Note: for large DeepSeek MoE models, the llama-server backend is recommended")
                 print("[llama.cpp]       (supports --override-tensor to keep experts on CPU, e.g. \\.ffn_.*_exps\\.weight=CPU)")
 
+            if is_kimi:
+                print("[llama.cpp] Kimi K2 model detected - text-only mode")
+                if mmproj_path:
+                    print("[llama.cpp] Note: llama-cpp-python has no Kimi vision handler, so the mmproj is ignored.")
+                    print("[llama.cpp]       Use the llama-server backend for K2.6 image input.")
+                print("[llama.cpp] Note: for the 1T MoE weights, the llama-server backend is recommended")
+                print("[llama.cpp]       (supports --override-tensor to keep experts on CPU, e.g. \\.ffn_.*_exps\\.weight=CPU)")
+                print("[llama.cpp] Recommended sampling: temperature 1.0, top_p 0.95 (thinking mode)")
+
             # Set up chat handler for vision models
             self.chat_handler = None
-            if mmproj_path and os.path.exists(mmproj_path):
+            if mmproj_path and os.path.exists(mmproj_path) and not is_kimi:
                 progress(0.2, desc="Loading vision encoder...")
                 print(f"[llama.cpp] Loading mmproj from: {mmproj_path}")
 
@@ -598,6 +703,10 @@ class LlamaCppVLM:
                     self.model_type = "gpt-oss"
                     self.is_text_only_model = True
                     print(f"[llama.cpp] Detected GPT-OSS architecture from model metadata")
+                elif is_kimi and "deepseek" in arch:
+                    # Kimi K2/K2.6 ship on the deepseek2 architecture - expected, and
+                    # not a reason to treat the model as DeepSeek
+                    print(f"[llama.cpp] Kimi model reports architecture '{arch}' (expected)")
                 elif "deepseek" in arch:
                     # DeepSeek V3/V4 report deepseek* architectures (e.g. "deepseek2")
                     self.model_type = "deepseek"
@@ -766,17 +875,33 @@ class LlamaCppVLM:
         if type_v:
             cmd.extend(["--cache-type-v", type_v])
 
-        # DeepSeek models: use the GGUF's embedded jinja chat template and extract
+        # Thinking models: use the GGUF's embedded jinja chat template and extract
         # <think> reasoning into reasoning_content (handled by generate_via_api's
-        # existing reasoning_content -> <think> wrapping)
-        is_deepseek = "deepseek" in model_name.lower() or "deepseek" in model_path.lower()
+        # existing reasoning_content -> <think> wrapping).
+        # Kimi is tested first - K2/K2.6 are built on deepseek2 but are their own family.
+        is_kimi = is_kimi_model(model_name, model_path)
+        is_deepseek = not is_kimi and ("deepseek" in model_name.lower() or "deepseek" in model_path.lower())
         extra_args_str = extra_args or ""
-        if is_deepseek:
+        if is_deepseek or is_kimi:
+            # --jinja is mandatory for Kimi: it is the only way llama.cpp reaches its
+            # kimi_k2 chat handler, and chat_template_kwargs are inert without it.
             if "--jinja" not in extra_args_str:
                 cmd.append("--jinja")
             if "--reasoning-format" not in extra_args_str:
                 cmd.extend(["--reasoning-format", "deepseek"])
-            print("[llama-server] DeepSeek model detected: enabling --jinja and --reasoning-format deepseek")
+            family = "Kimi K2" if is_kimi else "DeepSeek"
+            print(f"[llama-server] {family} model detected: enabling --jinja and --reasoning-format deepseek")
+
+        if is_kimi:
+            print("[llama-server] Kimi K2.6: recommended sampling is temperature 1.0 / top_p 0.95 (thinking),")
+            print("[llama-server]   0.6 / 0.95 (instant); recommended context 98304, max 262144")
+            if mmproj_path and os.path.exists(mmproj_path):
+                print("[llama-server] Kimi K2.6 vision enabled")
+            else:
+                print("[llama-server] No mmproj found - text only. K2.6 vision needs mmproj-F16.gguf,")
+                print("[llama-server]   which unsloth ships in the repo root next to the quant folder")
+            print("[llama-server] The Q2_K_XL weights need ~350GB across RAM+VRAM; keep experts on CPU")
+            print("[llama-server]   via Override Tensor (\\.ffn_.*_exps\\.weight=CPU) or Extra Args (--n-cpu-moe)")
 
         # Add override tensor (the key MoE optimization!)
         if override_tensor and override_tensor.strip():
@@ -864,7 +989,14 @@ class LlamaCppVLM:
             self.current_mmproj_path = mmproj_path
             self.use_server_backend = True
             self.is_text_only_model = is_deepseek or not (mmproj_path and os.path.exists(mmproj_path))
-            self.model_type = "deepseek" if is_deepseek else self.model_type
+            # Set the type explicitly - unload_model() resets it to None, so carrying
+            # over "self.model_type" here left every non-DeepSeek server load untyped
+            if is_kimi:
+                self.model_type = "kimi"
+            elif is_deepseek:
+                self.model_type = "deepseek"
+            else:
+                self.model_type = self.model_type or "generic"
             self.n_ctx = n_ctx  # Store context size for usage tracking
 
             vision_status = "with vision" if not self.is_text_only_model else "text-only"
@@ -918,6 +1050,7 @@ class LlamaCppVLM:
         video_max_frames: int = 81,
         every_other_frame: bool = False,
         stream: bool = False,
+        thinking: bool = True,
     ):
         """Generate response via llama-server OpenAI-compatible API using requests only.
         Yields: (display_text, raw_text, speed_stats, context_info)
@@ -1031,6 +1164,11 @@ class LlamaCppVLM:
                             api_messages.append({"role": role, "content": text_only})
 
             elif content:  # Simple string content
+                if role == "assistant":
+                    # Don't resend prior reasoning to the model
+                    content = strip_reasoning_for_context(str(content))
+                    if not content:
+                        continue
                 api_messages.append({"role": role, "content": str(content)})
 
         if not api_messages:
@@ -1062,6 +1200,14 @@ class LlamaCppVLM:
 
         if seed is not None and int(seed) >= 0:
             payload["seed"] = int(seed)
+
+        if not thinking:
+            # Kimi K2.6 instant mode. Both spellings are sent because Kimi's own
+            # template reads "thinking" while llama.cpp's server special-cases
+            # "enable_thinking"; both must be JSON booleans (a string is rejected).
+            # Templates that use neither just ignore the extra context keys.
+            payload["chat_template_kwargs"] = {"thinking": False, "enable_thinking": False}
+            print("[llama-server] Thinking disabled for this request (instant mode)")
 
         # Request usage info in streaming responses (OpenAI-compatible extension)
         if stream:
@@ -1163,6 +1309,10 @@ class LlamaCppVLM:
                                         display_text = accumulated
                                         if "</think>" in display_text:
                                             display_text = display_text.split("</think>")[-1].strip()
+                                        elif in_reasoning or display_text.lstrip().startswith("<think>"):
+                                            # Still inside reasoning - show a placeholder instead of
+                                            # raw <think> text (which Gradio renders as nothing)
+                                            display_text = "*Thinking…*"
                                         yield display_text, accumulated, f"{tps:.1f} tok/s", ctx_info
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
@@ -1190,6 +1340,8 @@ class LlamaCppVLM:
                     final_display = accumulated
                     if "</think>" in final_display:
                         final_display = final_display.split("</think>")[-1].strip()
+                    elif final_display.lstrip().startswith("<think>"):
+                        final_display = "*Thinking…* (no final response - hit max tokens during reasoning)"
                     yield final_display, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
@@ -1249,6 +1401,7 @@ class LlamaCppVLM:
         every_other_frame: bool = False,
         stream: bool = False,
         reasoning_level: str = "medium",
+        thinking: bool = True,
     ):
         """
         Generate a response.
@@ -1262,6 +1415,8 @@ class LlamaCppVLM:
             every_other_frame: If True, use every other frame from videos
             stream: If True, yields partial responses as a generator
             reasoning_level: GPT-OSS reasoning level (low, medium, high)
+            thinking: If False, ask the server to skip reasoning (Kimi K2.6 instant mode).
+                Only honoured by the llama-server backend.
 
         Returns:
             Generated response string, or generator if stream=True
@@ -1284,6 +1439,7 @@ class LlamaCppVLM:
                 video_max_frames=video_max_frames,
                 every_other_frame=every_other_frame,
                 stream=stream,
+                thinking=thinking,
             )
             return
 
@@ -1332,6 +1488,7 @@ class LlamaCppVLM:
                     if isinstance(content, str):
                         if is_gpt_oss:
                             content = clean_harmony_tags(content)
+                        content = strip_reasoning_for_context(content)
                         llama_messages.append({"role": "assistant", "content": content})
                     elif isinstance(content, list):
                         # Extract text from list content
@@ -1344,6 +1501,7 @@ class LlamaCppVLM:
                         text_content = " ".join(text_parts) if text_parts else ""
                         if is_gpt_oss:
                             text_content = clean_harmony_tags(text_content)
+                        text_content = strip_reasoning_for_context(text_content)
                         if text_content:
                             llama_messages.append({"role": "assistant", "content": text_content})
 
@@ -1497,6 +1655,10 @@ class LlamaCppVLM:
             # The template will use its default "medium" reasoning level
             if is_gpt_oss:
                 print(f"[llama.cpp] GPT-OSS: Using template default reasoning (reasoning_level={reasoning_level} only works with llama-server)")
+
+            if not thinking:
+                print("[llama.cpp] Note: instant mode needs chat_template_kwargs, which llama-cpp-python")
+                print("[llama.cpp]       does not support - using the template default (thinking on)")
 
             if stream:
                 # Streaming mode - yield partial responses
@@ -1672,6 +1834,7 @@ DEFAULT_SETTINGS = {
     "every_other_frame": False,
     "show_thinking": True,
     "reasoning_level": "medium",  # GPT-OSS reasoning level: low, medium, high
+    "thinking_mode": True,  # Kimi K2.6: off = instant mode (llama-server backend only)
     # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
     "batch_prompt": "Describe this image in detail, including the subject, style, composition, colors, lighting, and any notable features.",
@@ -1705,6 +1868,7 @@ def save_settings(
     every_other_frame: bool,
     show_thinking: bool,
     reasoning_level: str,
+    thinking_mode: bool,
     # Batch Caption Settings
     batch_system_prompt: str,
     batch_prompt: str,
@@ -1737,6 +1901,7 @@ def save_settings(
         "every_other_frame": every_other_frame,
         "show_thinking": show_thinking,
         "reasoning_level": reasoning_level,
+        "thinking_mode": thinking_mode,
         # Batch Caption Settings
         "batch_system_prompt": batch_system_prompt,
         "batch_prompt": batch_prompt,
@@ -1852,6 +2017,33 @@ PROFILE_KEYS = [
 ]
 
 
+# Starting points for models that need non-default load settings, matched on a
+# substring of the model name. Only used when the model has no saved profile yet -
+# the first successful load replaces it with whatever actually worked.
+RECOMMENDED_PROFILES = {
+    "kimi": {
+        "n_gpu_layers": 99,
+        "n_ctx": 98304,  # unsloth's recommendation; K2.6 supports up to 262144
+        "backend_type": "llama-server",
+        "kv_cache_type": "f16",
+        "flash_attn": True,
+        "use_mmap": True,
+        "use_mlock": False,
+        "override_tensor": r"\.ffn_.*_exps\.weight=CPU",
+        "extra_args": "",
+    },
+}
+
+
+def get_recommended_profile(model_name: str) -> Optional[Dict[str, Any]]:
+    """Built-in load settings for a known model family, or None."""
+    lowered = (model_name or "").lower()
+    for key, profile in RECOMMENDED_PROFILES.items():
+        if key in lowered:
+            return profile
+    return None
+
+
 def load_model_profiles() -> Dict[str, Dict[str, Any]]:
     """Load per-model settings profiles from JSON file."""
     try:
@@ -1885,6 +2077,10 @@ def apply_model_profile(model_name: str):
     """
     profiles = load_model_profiles()
     profile = profiles.get(model_name)
+    source = "Restored saved"
+    if not profile:
+        profile = get_recommended_profile(model_name)
+        source = "Applied recommended"
     if not profile:
         return [gr.update()] * (len(PROFILE_KEYS) + 1)
 
@@ -1893,7 +2089,7 @@ def apply_model_profile(model_name: str):
         for key in PROFILE_KEYS
     ]
     updates.append(gr.update(visible=(profile.get("backend_type") == "llama-server")))
-    print(f"[vlm.py] Restored settings profile for '{model_name}'")
+    print(f"[vlm.py] {source} settings for '{model_name}'")
     return updates
 
 
@@ -2049,6 +2245,7 @@ def stream_chat_response(
     every_other_frame: bool,
     show_thinking: bool,
     reasoning_level: str,
+    thinking_mode: bool = True,
 ):
     """Stream a generation into the last (assistant) entry of new_history.
 
@@ -2070,6 +2267,7 @@ def stream_chat_response(
         every_other_frame=every_other_frame,
         stream=True,
         reasoning_level=reasoning_level,
+        thinking=thinking_mode,
     ):
         # Check stop flag
         if stop_generation:
@@ -2080,7 +2278,9 @@ def stream_chat_response(
 
         # Show thinking if enabled, otherwise show cleaned text
         if show_thinking:
-            new_history[-1]["content"] = raw_text
+            # Convert <think> tags to markdown - Gradio strips literal <think>
+            # as unknown HTML, blanking the whole message
+            new_history[-1]["content"] = format_think_tags_for_display(raw_text)
         else:
             new_history[-1]["content"] = display_text
         yield new_history, stats, ctx_info
@@ -2105,6 +2305,7 @@ def chat_handler(
     every_other_frame: bool = False,
     show_thinking: bool = False,
     reasoning_level: str = "medium",
+    thinking_mode: bool = True,
 ):
     """Handle chat messages from UI with streaming support."""
     # Check if any model is loaded (either local or server mode)
@@ -2204,6 +2405,7 @@ def chat_handler(
     for streamed_history, stats, ctx_info in stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+        thinking_mode,
     ):
         yield streamed_history, "", stats, ctx_info
 
@@ -2220,6 +2422,7 @@ def regenerate_handler(
     every_other_frame: bool = False,
     show_thinking: bool = False,
     reasoning_level: str = "medium",
+    thinking_mode: bool = True,
 ):
     """Re-run the last user turn, discarding the previous assistant reply.
 
@@ -2248,6 +2451,7 @@ def regenerate_handler(
     yield from stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+        thinking_mode,
     )
 
 
@@ -2792,6 +2996,11 @@ def create_ui():
                     value=saved_settings.get("reasoning_level", DEFAULT_SETTINGS["reasoning_level"]),
                     info="GPT-OSS reasoning effort",
                 )
+                thinking_mode = gr.Checkbox(
+                    label="Thinking Mode",
+                    value=saved_settings.get("thinking_mode", DEFAULT_SETTINGS["thinking_mode"]),
+                    info="Kimi K2.6: off = instant mode (also drop temperature to 0.6). llama-server only",
+                )
                 save_settings_btn = gr.Button("Save Settings", variant="secondary")
                 save_status = gr.Textbox(
                     label="",
@@ -2862,7 +3071,7 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning):
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
             if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None and aud is None:
                 yield history, "", None, None, None, None, None, None, "", ""
                 return
@@ -2870,7 +3079,8 @@ def create_ui():
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, img1, img2, img3, img4, vid, aud,
-                max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning
+                max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
+                think_mode
             ):
                 yield new_history, "", None, None, None, None, None, None, stats, ctx_info
 
@@ -2879,7 +3089,8 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+                thinking_mode
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
         )
@@ -2889,7 +3100,8 @@ def create_ui():
             inputs=[
                 msg_input, chatbot, system_prompt,
                 image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level
+                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+                thinking_mode
             ],
             outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
         )
@@ -2899,7 +3111,7 @@ def create_ui():
             inputs=[
                 chatbot, system_prompt, max_tokens, temperature, top_p,
                 repeat_penalty, seed, video_max_frames, every_other_frame,
-                show_thinking, reasoning_level
+                show_thinking, reasoning_level, thinking_mode
             ],
             outputs=[chatbot, stats_display, context_display],
         )
@@ -2976,6 +3188,7 @@ def create_ui():
                 # Generation Settings
                 system_prompt, max_tokens, temperature, top_p, repeat_penalty,
                 seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+                thinking_mode,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt
             ],

@@ -11,6 +11,36 @@ git clone https://github.com/Disty0/sdnq
   
 pip install -e ./sdnq
   
+## Building / updating llama-server (CUDA)
+
+vlm.py runs GGUF models through a native llama-server subprocess. The path is set in the UI (and saved to vlm_settings.json) and defaults to `llama.cpp/build/bin/llama-server`, relative to the chromaforge root. Update it whenever you need support for a newly released model family, a new mmproj/vision projector, or an upstream speed fix.
+
+Prerequisites (Ubuntu/Debian): the CUDA toolkit plus build tools. `nvcc --version` should print a version; if it doesn't, install `cuda-toolkit` from NVIDIA's repo.
+
+    sudo apt install -y build-essential cmake ccache libcurl4-openssl-dev
+
+First build, from the chromaforge root:
+
+    git clone https://github.com/ggml-org/llama.cpp
+    cd llama.cpp
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_CUDA_ARCHITECTURES=native
+    cmake --build build --config Release -j $(nproc) --target llama-server
+
+Updating an existing checkout:
+
+    cd llama.cpp
+    git pull
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_CUDA_ARCHITECTURES=native
+    cmake --build build --config Release -j $(nproc) --target llama-server
+
+Re-running the configure line is cheap and picks up any new upstream options. Drop `--target llama-server` if you also want llama-cli, llama-quantize, etc.
+
+Notes:  
+Unload the model in the UI (or `pkill -f llama-server`) before rebuilding - the binary is replaced in place.  
+`-DCMAKE_CUDA_ARCHITECTURES=native` compiles only for the GPU in that machine, which is the fastest build. If the build box and the run box differ, set it explicitly: 86 for 30xx, 89 for 40xx, 120 for 50xx (semicolon separated for several, e.g. `"89;120"`).  
+If the build breaks after a large upstream change, `rm -rf build` and re-run both cmake commands.  
+Check it worked with `./build/bin/llama-server --version`, then reload the model in the UI.  
+
 ## Fork of forge to use Chroma!
 
 This is a fork with the patch from https://github.com/croquelois/forgeChroma preinstalled thanks Thanks to [@croquelois](https://github.com/croquelois) && [@lllyasviel](https://github.com/lllyasviel)!   

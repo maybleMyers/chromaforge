@@ -140,6 +140,33 @@ def format_think_tags_for_display(text: str) -> str:
     return formatted
 
 
+# Muse Glimmer turn markers. llama.cpp b10353+ parses these itself and returns
+# clean content, so these should never reach us. They do if llama-server predates
+# the muse_glimmer chat parser, in which case content starts with a literal
+# "to=self<|message|>" - stripping it turns a baffling transcript into an obvious
+# "your llama-server is too old" signal instead of raw markup in the chat window.
+# A full header, with or without a leading <|start|> and with or without a
+# " to=<recipient>" - e.g. "<|start|>assistant to=self<|message|>" or a bare
+# "to=self<|message|>" when the header was consumed as the generation prompt.
+_MUSE_HEADER_RE = re.compile(
+    r"(?:<\|start\|>\s*\w+)?[ \t]*(?:to=\S+)?[ \t]*<\|message\|>"
+)
+_MUSE_MARKER_RE = re.compile(r"<\|(?:start|end|message|eom|eot|end_of_text)\|>")
+
+
+def clean_muse_glimmer_markers(text: str) -> str:
+    """Defensive: strip Muse Glimmer channel markup that a pre-b10353 llama-server
+    would leave in the response body."""
+    if not text or not isinstance(text, str):
+        return text
+    if not any(t in text for t in ("<|message|>", "<|eom|>", "<|eot|>", "<|start|>")):
+        return text
+    # Headers become paragraph breaks so consecutive messages don't run together
+    cleaned = _MUSE_HEADER_RE.sub("\n\n", text)
+    cleaned = _MUSE_MARKER_RE.sub("", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _DISPLAY_THINK_RE = re.compile(r"\*\*\[Thinking\]\*\*.*?\*\*\[Response\]\*\*\s*", re.DOTALL)
 
@@ -202,6 +229,18 @@ def is_kimi_model(*values: Optional[str]) -> bool:
     return any("kimi" in str(v).lower() for v in values if v)
 
 
+def is_muse_glimmer_model(*values: Optional[str]) -> bool:
+    """
+    Detect meta-models/Muse-Glimmer-30B from a model name or path.
+    The GGUFs report general.architecture "muse-glimmer" (HF model_type is
+    "muse_glimmer"), need llama.cpp b10353+, and are llama-server only.
+    Both tokens are required: a bare "muse" would over-match unrelated repos,
+    while requiring the literal "muse-glimmer" would miss MuseGlimmer/Muse_Glimmer.
+    """
+    return any("muse" in str(v).lower() and "glimmer" in str(v).lower()
+               for v in values if v)
+
+
 # Folder names that identify a quantization variant rather than a model. The unsloth
 # GGUF repos are laid out as <repo>/UD-Q2_K_XL/*.gguf with the vision projector
 # (mmproj-*.gguf) sitting one level up in the repo root.
@@ -209,10 +248,27 @@ def is_kimi_model(*values: Optional[str]) -> bool:
 # for one. The trailing run covers compound names like "UD-Q2_K_XL-MXFP4".
 _QUANT_DIR_RE = re.compile(r"^(ud-)?(i?q\d|bf16|f16|f32|mxfp4)[\w.\-]*$", re.IGNORECASE)
 
-# mmproj precision preference - F16 is what unsloth recommends for Kimi K2.6
+# Some repos prefix the quant folder with the model name instead of naming it after
+# the quant alone - K2.7-Code-GGUF/k2.7-code-UD-Q2_K_XL-MXFP4 vs Kimi-K2.6-GGUF/UD-Q2_K_XL.
+# The projector still sits in the repo root, so a trailing quant token is enough to
+# recognise the folder and look one level up.
+_QUANT_SUFFIX_RE = re.compile(r"[-_](ud-)?(i?q\d|bf16|f16|f32|mxfp4)[\w.\-]*$", re.IGNORECASE)
+
+# mmproj precision preference - F16 is what unsloth recommends for Kimi K2.6, but
+# K2.7-Code ships the projector as fp32 only (mmproj-F32.gguf), so F32 is a first
+# class option rather than a fallback.
 _MMPROJ_PREFERENCE = ("f16", "bf16", "f32")
 
 _MMPROJ_PATTERNS = ["mmproj", "clip", "vision-encoder", "image-encoder"]
+
+# Speculative-decoding drafters shipped alongside the weights. Muse Glimmer's
+# DFlash drafter (dflash-*.gguf) sits in the same folder as the main quants, so
+# without this it would be offered in the dropdown as a loadable model.
+_DRAFT_PATTERNS = ["dflash", "draft", "drafter"]
+
+# Drafters are tiny and pure overhead on a tight VRAM budget, so prefer the
+# smallest useful quant rather than the highest precision.
+_DRAFT_PREFERENCE = ("q4_k_m", "q4_0", "q5_k_m", "q6_k", "q8_0", "f16", "bf16", "f32")
 
 
 def _is_mmproj(gguf_path: Path) -> bool:
@@ -220,8 +276,13 @@ def _is_mmproj(gguf_path: Path) -> bool:
     return any(p in stem_lower for p in _MMPROJ_PATTERNS)
 
 
-def _pick_mmproj(candidates: List[Path]) -> Optional[str]:
-    """Choose one vision projector from a folder, preferring F16 over BF16/F32."""
+def _is_draft(gguf_path: Path) -> bool:
+    stem_lower = gguf_path.stem.lower()
+    return any(p in stem_lower for p in _DRAFT_PATTERNS)
+
+
+def _pick_by_precision(candidates: List[Path], preference: Tuple[str, ...]) -> Optional[str]:
+    """Choose one companion file from a folder, ranked by a precision preference."""
     if not candidates:
         return None
 
@@ -229,12 +290,22 @@ def _pick_mmproj(candidates: List[Path]) -> Optional[str]:
         # Match on the separator too: "mmproj-bf16".endswith("f16") is True, which
         # would otherwise let BF16 tie with F16 and win the name tiebreak.
         stem = path.stem.lower()
-        for i, tag in enumerate(_MMPROJ_PREFERENCE):
+        for i, tag in enumerate(preference):
             if stem.endswith(f"-{tag}") or stem.endswith(f"_{tag}") or stem == tag:
                 return (i, path.name)
-        return (len(_MMPROJ_PREFERENCE), path.name)
+        return (len(preference), path.name)
 
     return str(sorted(candidates, key=rank)[0])
+
+
+def _pick_mmproj(candidates: List[Path]) -> Optional[str]:
+    """Choose one vision projector from a folder, preferring F16 over BF16/F32."""
+    return _pick_by_precision(candidates, _MMPROJ_PREFERENCE)
+
+
+def _pick_draft(candidates: List[Path]) -> Optional[str]:
+    """Choose one speculative-decoding drafter from a folder, smallest quant first."""
+    return _pick_by_precision(candidates, _DRAFT_PREFERENCE)
 
 
 def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448), every_other_frame: bool = False) -> List[Image.Image]:
@@ -324,8 +395,8 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
             # Handle loose files in root - treat each as its own model
             file_stem = gguf_file.stem
 
-            # Skip mmproj/clip files as main models
-            if _is_mmproj(gguf_file):
+            # Skip mmproj/clip and speculative drafters as main models
+            if _is_mmproj(gguf_file) or _is_draft(gguf_file):
                 continue
 
             # Skip split model shards (not the first one)
@@ -340,6 +411,7 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
                 "name": file_stem,
                 "model_path": str(gguf_file),
                 "mmproj_path": None,
+                "draft_path": None,
             })
             continue
 
@@ -352,12 +424,17 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
         # Find all gguf files in this folder
         all_ggufs = list(parent.glob("*.gguf"))
 
-        # Separate mmproj/clip files from model files
+        # Separate mmproj/clip files and speculative drafters from model files.
+        # Drafters are tested first so a "mmproj-dflash-*" style name can't be
+        # misfiled as a projector.
         mmproj_candidates = []
+        draft_candidates = []
         model_files = []
 
         for gf in all_ggufs:
-            if _is_mmproj(gf):
+            if _is_draft(gf):
+                draft_candidates.append(gf)
+            elif _is_mmproj(gf):
                 mmproj_candidates.append(gf)
             else:
                 model_files.append(gf)
@@ -369,12 +446,20 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
         # UD-Q2_K_XL/*.gguf) keep the vision projector in the repo root, one level
         # up. Qualify the name as well, so several quants of the same repo stay
         # tellable apart in the dropdown.
-        if _QUANT_DIR_RE.match(parent.name) and parent.parent != models_path:
-            name = f"{parent.parent.name}/{parent.name}"
+        is_quant_dir = bool(_QUANT_DIR_RE.match(parent.name))
+        if (is_quant_dir or _QUANT_SUFFIX_RE.search(parent.name)) and parent.parent != models_path:
+            # A bare quant name ("UD-Q2_K_XL") is meaningless on its own in the
+            # dropdown; a model-prefixed one ("k2.7-code-UD-Q2_K_XL-MXFP4") already
+            # identifies itself, so it keeps its own name.
+            if is_quant_dir:
+                name = f"{parent.parent.name}/{parent.name}"
             if not mmproj_candidates:
                 mmproj_candidates = [gf for gf in parent.parent.glob("*.gguf") if _is_mmproj(gf)]
+            if not draft_candidates:
+                draft_candidates = [gf for gf in parent.parent.glob("*.gguf") if _is_draft(gf)]
 
         mmproj_path = _pick_mmproj(mmproj_candidates)
+        draft_path = _pick_draft(draft_candidates)
 
         # Sort model files to get consistent ordering
         # For split models, this ensures we get the first shard
@@ -387,6 +472,7 @@ def find_gguf_models(models_dir: str) -> List[Dict[str, str]]:
             "name": name,
             "model_path": model_path,
             "mmproj_path": mmproj_path,
+            "draft_path": draft_path,
         })
 
     return sorted(models, key=lambda x: x["name"])
@@ -507,21 +593,39 @@ class LlamaCppVLM:
             is_qwen_vl = any(x in model_name_lower or x in model_path_lower for x in ["qwen", "qwen2-vl", "qwen3-vl", "qwen2.5-vl"])
             is_llava = any(x in model_name_lower or x in model_path_lower for x in ["llava", "llava-v1"])
 
+            # Detect Muse Glimmer first: its chat format is Harmony-LIKE
+            # (<|start|>assistant to=self<|message|> ... <|eom|>) but NOT GPT-OSS's
+            # <|channel|> format, so clean_harmony_tags would mangle it into a
+            # literal "assistant to=self" in the transcript.
+            is_muse_glimmer = is_muse_glimmer_model(model_name, model_path)
+
             # Detect GPT-OSS models (text-only with Harmony format)
-            is_gpt_oss = any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
+            is_gpt_oss = not is_muse_glimmer and any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
 
             # Detect Kimi K2 / K2.6 before DeepSeek: K2.6 is built on the deepseek2
             # architecture but is multimodal and needs its own handling
             is_kimi = is_kimi_model(model_name, model_path)
 
             # Detect DeepSeek models (text-only thinking models, e.g. DeepSeek V4 Flash)
-            is_deepseek = not is_kimi and ("deepseek" in model_name_lower or "deepseek" in model_path_lower)
+            is_deepseek = not is_kimi and not is_muse_glimmer and ("deepseek" in model_name_lower or "deepseek" in model_path_lower)
 
             # More specific detection
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Kimi={is_kimi}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Kimi={is_kimi}, MuseGlimmer={is_muse_glimmer}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+
+            # Muse Glimmer cannot run in-process at all. llama-cpp-python vendors its
+            # own llama.cpp build, so rebuilding ./llama.cpp does not reach it, and
+            # anything older than b10353 has no LLM_ARCH_MUSE_GLIMMER - Llama() would
+            # raise "unknown model architecture" from deep inside the constructor.
+            # Fail here with something actionable instead.
+            if is_muse_glimmer:
+                self.model_type = "muse-glimmer"
+                return ("Error: Muse Glimmer requires the llama-server backend. "
+                        "llama-cpp-python vendors its own llama.cpp build, which almost "
+                        "certainly predates LLM_ARCH_MUSE_GLIMMER (needs b10353+). "
+                        "Set Backend to 'llama-server' and load again.")
 
             # Set model type tracking. Kimi is text-only here because llama-cpp-python
             # has no handler for its MoonViT projector - vision needs llama-server.
@@ -828,6 +932,7 @@ class LlamaCppVLM:
 
         model_path = model_info["model_path"]
         mmproj_path = model_info.get("mmproj_path")
+        draft_path = model_info.get("draft_path")
 
         # Unload current model if any
         if self.model is not None or self.server_process is not None:
@@ -880,13 +985,23 @@ class LlamaCppVLM:
         # existing reasoning_content -> <think> wrapping).
         # Kimi is tested first - K2/K2.6 are built on deepseek2 but are their own family.
         is_kimi = is_kimi_model(model_name, model_path)
-        is_deepseek = not is_kimi and ("deepseek" in model_name.lower() or "deepseek" in model_path.lower())
+        is_muse_glimmer = is_muse_glimmer_model(model_name, model_path)
+        is_deepseek = not is_kimi and not is_muse_glimmer and ("deepseek" in model_name.lower() or "deepseek" in model_path.lower())
         extra_args_str = extra_args or ""
-        if is_deepseek or is_kimi:
-            # --jinja is mandatory for Kimi: it is the only way llama.cpp reaches its
-            # kimi_k2 chat handler, and chat_template_kwargs are inert without it.
+
+        # --jinja is mandatory for every family whose chat handler llama.cpp only
+        # reaches through the GGUF's embedded template. chat_template_kwargs
+        # (Kimi's instant mode, Muse Glimmer's reasoning_strength) are inert without it.
+        if is_deepseek or is_kimi or is_muse_glimmer:
             if "--jinja" not in extra_args_str:
                 cmd.append("--jinja")
+
+        # Only the <think>-emitting families need the deepseek reasoning parser.
+        # Muse Glimmer is deliberately excluded: llama.cpp's default
+        # --reasoning-format auto already routes its "<|start|>assistant to=self
+        # <|message|> ... <|eom|>" turns into reasoning_content via
+        # common_chat_params_init_muse_glimmer. Forcing "deepseek" breaks that parse.
+        if is_deepseek or is_kimi:
             if "--reasoning-format" not in extra_args_str:
                 cmd.extend(["--reasoning-format", "deepseek"])
             family = "Kimi K2" if is_kimi else "DeepSeek"
@@ -898,10 +1013,40 @@ class LlamaCppVLM:
             if mmproj_path and os.path.exists(mmproj_path):
                 print("[llama-server] Kimi K2.6 vision enabled")
             else:
-                print("[llama-server] No mmproj found - text only. K2.6 vision needs mmproj-F16.gguf,")
-                print("[llama-server]   which unsloth ships in the repo root next to the quant folder")
+                print("[llama-server] No mmproj found - text only. Kimi vision needs mmproj-F16.gguf")
+                print("[llama-server]   (K2.6) or mmproj-F32.gguf (K2.7-Code), which unsloth ships in")
+                print("[llama-server]   the repo root next to the quant folder")
             print("[llama-server] The Q2_K_XL weights need ~350GB across RAM+VRAM; keep experts on CPU")
             print("[llama-server]   via Override Tensor (\\.ffn_.*_exps\\.weight=CPU) or Extra Args (--n-cpu-moe)")
+
+        if is_muse_glimmer:
+            print("[llama-server] Muse Glimmer detected: enabling --jinja (no --reasoning-format;")
+            print("[llama-server]   llama.cpp's muse_glimmer parser handles reasoning_content itself)")
+            print("[llama-server] Requires llama.cpp b10353+ - older builds do not register the")
+            print("[llama-server]   architecture and will refuse to load these files")
+            print("[llama-server] Recommended sampling: temperature 1.0 / top_p 0.95 / top_k 64")
+            print("[llama-server] Reasoning cannot be disabled on this model - Thinking Mode has no")
+            print("[llama-server]   effect. Use Reasoning Level (low/medium/high/xhigh) instead")
+            print("[llama-server] This is a DENSE model: leave Override Tensor blank, the MoE expert")
+            print("[llama-server]   pattern matches no tensors here")
+            if mmproj_path and os.path.exists(mmproj_path):
+                print("[llama-server] Muse Glimmer vision enabled")
+            else:
+                print("[llama-server] No mmproj found - text only. Vision needs mmproj-*.gguf from the")
+                print("[llama-server]   same GGUF repo as the weights")
+
+        # Speculative decoding drafter (Muse Glimmer ships DFlash as dflash-*.gguf).
+        # Auto-wired when one is found next to the weights, but an explicit -md in
+        # Extra Args wins - that is how you turn drafting off, or retune --draft-max,
+        # when the ~1.6GB of extra VRAM is better spent on the vision projector.
+        if draft_path and os.path.exists(draft_path):
+            if not any(f in extra_args_str for f in ("-md", "--spec-draft-model", "--model-draft")):
+                cmd.extend(["-md", draft_path])
+                if not any(f in extra_args_str for f in ("-ngld", "--spec-draft-ngl")):
+                    cmd.extend(["-ngld", "99"])
+                print(f"[llama-server] Speculative drafter: {draft_path} (fully offloaded)")
+            else:
+                print("[llama-server] Drafter found but -md supplied in Extra Args - using yours")
 
         # Add override tensor (the key MoE optimization!)
         if override_tensor and override_tensor.strip():
@@ -1005,7 +1150,10 @@ class LlamaCppVLM:
             self.is_text_only_model = is_deepseek or not (mmproj_path and os.path.exists(mmproj_path))
             # Set the type explicitly - unload_model() resets it to None, so carrying
             # over "self.model_type" here left every non-DeepSeek server load untyped
-            if is_kimi:
+            if is_muse_glimmer:
+                # generate_via_api keys the reasoning_strength kwarg off this
+                self.model_type = "muse-glimmer"
+            elif is_kimi:
                 self.model_type = "kimi"
             elif is_deepseek:
                 self.model_type = "deepseek"
@@ -1065,6 +1213,7 @@ class LlamaCppVLM:
         every_other_frame: bool = False,
         stream: bool = False,
         thinking: bool = True,
+        reasoning_level: str = "default",
     ):
         """Generate response via llama-server OpenAI-compatible API using requests only.
         Yields: (display_text, raw_text, speed_stats, context_info)
@@ -1210,18 +1359,38 @@ class LlamaCppVLM:
             "top_p": top_p,
             "repeat_penalty": repeat_penalty,
             "stream": stream,
+            # NOTE: top_k is deliberately absent, so a server-side default such as
+            # Muse Glimmer's recommended "--top-k 64" (set via the recommended
+            # profile's Extra Args) takes effect. Adding a top_k key here would
+            # silently override it.
         }
 
         if seed is not None and int(seed) >= 0:
             payload["seed"] = int(seed)
+
+        # Accumulate template kwargs rather than assigning the dict outright, so the
+        # Kimi and Muse Glimmer paths cannot clobber one another.
+        chat_template_kwargs: Dict[str, Any] = {}
 
         if not thinking:
             # Kimi K2.6 instant mode. Both spellings are sent because Kimi's own
             # template reads "thinking" while llama.cpp's server special-cases
             # "enable_thinking"; both must be JSON booleans (a string is rejected).
             # Templates that use neither just ignore the extra context keys.
-            payload["chat_template_kwargs"] = {"thinking": False, "enable_thinking": False}
+            chat_template_kwargs.update({"thinking": False, "enable_thinking": False})
             print("[llama-server] Thinking disabled for this request (instant mode)")
+
+        if self.model_type == "muse-glimmer":
+            # Muse Glimmer's reasoning cannot be switched off, only dialled. Anything
+            # outside the supported set (including the "default" sentinel) is omitted
+            # so the model's own "high" default stands rather than being downgraded.
+            strength = (reasoning_level or "").strip().lower()
+            if strength in ("low", "medium", "high", "xhigh"):
+                chat_template_kwargs["reasoning_strength"] = strength
+                print(f"[llama-server] Muse Glimmer reasoning_strength={strength}")
+
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
 
         # Request usage info in streaming responses (OpenAI-compatible extension)
         if stream:
@@ -1356,6 +1525,9 @@ class LlamaCppVLM:
                         final_display = final_display.split("</think>")[-1].strip()
                     elif final_display.lstrip().startswith("<think>"):
                         final_display = "*Thinking…* (no final response - hit max tokens during reasoning)"
+                    if self.model_type == "muse-glimmer":
+                        final_display = clean_muse_glimmer_markers(final_display)
+                        accumulated = clean_muse_glimmer_markers(accumulated)
                     yield final_display, accumulated, f"{final_speed:.1f} tok/s | {generation_time:.1f}s", final_ctx_info
                 else:
                     print(f"[llama-server] Warning: No content accumulated from stream")
@@ -1365,6 +1537,8 @@ class LlamaCppVLM:
                 data = response.json()
                 print(f"[llama-server] Got JSON response: {str(data)[:200]}")
                 result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if self.model_type == "muse-glimmer":
+                    result = clean_muse_glimmer_markers(result)
                 end_time = time.perf_counter()
                 elapsed = end_time - start_time
 
@@ -1414,7 +1588,7 @@ class LlamaCppVLM:
         video_max_frames: int = 8,
         every_other_frame: bool = False,
         stream: bool = False,
-        reasoning_level: str = "medium",
+        reasoning_level: str = "default",
         thinking: bool = True,
     ):
         """
@@ -1428,7 +1602,8 @@ class LlamaCppVLM:
             video_max_frames: Max frames for video processing
             every_other_frame: If True, use every other frame from videos
             stream: If True, yields partial responses as a generator
-            reasoning_level: GPT-OSS reasoning level (low, medium, high)
+            reasoning_level: Muse Glimmer reasoning_strength (low, medium, high,
+                xhigh) / GPT-OSS reasoning level. "default" leaves it to the model.
             thinking: If False, ask the server to skip reasoning (Kimi K2.6 instant mode).
                 Only honoured by the llama-server backend.
 
@@ -1454,6 +1629,7 @@ class LlamaCppVLM:
                 every_other_frame=every_other_frame,
                 stream=stream,
                 thinking=thinking,
+                reasoning_level=reasoning_level,
             )
             return
 
@@ -1847,7 +2023,9 @@ DEFAULT_SETTINGS = {
     "video_max_frames": 8,
     "every_other_frame": False,
     "show_thinking": True,
-    "reasoning_level": "medium",  # GPT-OSS reasoning level: low, medium, high
+    # "default" = send nothing and let the model's own default stand. Naming a level
+    # here would silently downgrade Muse Glimmer from its native "high".
+    "reasoning_level": "default",  # Muse Glimmer strength / GPT-OSS effort
     "thinking_mode": True,  # Kimi K2.6: off = instant mode (llama-server backend only)
     # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
@@ -2045,6 +2223,23 @@ RECOMMENDED_PROFILES = {
         "use_mlock": False,
         "override_tensor": r"\.ffn_.*_exps\.weight=CPU",
         "extra_args": "",
+    },
+    "muse-glimmer": {
+        "n_gpu_layers": 99,
+        "n_ctx": 32768,  # model supports 131072; KV is cheap here (SWA on 39 of 52
+                         # layers, 2 KV heads, head_dim 128 -> ~0.5GB f16 at 32k)
+        "backend_type": "llama-server",
+        "kv_cache_type": "f16",
+        "flash_attn": True,
+        "use_mmap": True,
+        "use_mlock": False,
+        # DENSE model - the default MoE expert-offload pattern matches no tensors
+        # here and only produces a confusing -ot on the command line.
+        "override_tensor": "",
+        # Recommended sampling is temp 1.0 / top_p 0.95 / top_k 64. There is no
+        # top_k control in this UI, but the API payload deliberately omits top_k,
+        # so this server-side default is what takes effect.
+        "extra_args": "--top-k 64",
     },
 }
 
@@ -2318,7 +2513,7 @@ def chat_handler(
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     show_thinking: bool = False,
-    reasoning_level: str = "medium",
+    reasoning_level: str = "default",
     thinking_mode: bool = True,
 ):
     """Handle chat messages from UI with streaming support."""
@@ -2435,7 +2630,7 @@ def regenerate_handler(
     video_max_frames: int = 8,
     every_other_frame: bool = False,
     show_thinking: bool = False,
-    reasoning_level: str = "medium",
+    reasoning_level: str = "default",
     thinking_mode: bool = True,
 ):
     """Re-run the last user turn, discarding the previous assistant reply.
@@ -3006,14 +3201,14 @@ def create_ui():
                 )
                 reasoning_level = gr.Dropdown(
                     label="Reasoning Level",
-                    choices=["low", "medium", "high"],
+                    choices=["default", "low", "medium", "high", "xhigh"],
                     value=saved_settings.get("reasoning_level", DEFAULT_SETTINGS["reasoning_level"]),
-                    info="GPT-OSS reasoning effort",
+                    info="Muse Glimmer reasoning strength (xhigh included) / GPT-OSS effort. default = model's own",
                 )
                 thinking_mode = gr.Checkbox(
                     label="Thinking Mode",
                     value=saved_settings.get("thinking_mode", DEFAULT_SETTINGS["thinking_mode"]),
-                    info="Kimi K2.6: off = instant mode (also drop temperature to 0.6). llama-server only",
+                    info="Kimi K2.6: off = instant mode (also drop temperature to 0.6). llama-server only. No effect on Muse Glimmer - use Reasoning Level",
                 )
                 save_settings_btn = gr.Button("Save Settings", variant="secondary")
                 save_status = gr.Textbox(
@@ -3274,7 +3469,8 @@ def main():
         print(f"\nFound {len(models)} GGUF model(s):")
         for m in models:
             vision = " [+vision]" if m.get("mmproj_path") else ""
-            print(f"  - {m['name']}{vision}")
+            draft = " [+draft]" if m.get("draft_path") else ""
+            print(f"  - {m['name']}{vision}{draft}")
     else:
         print(f"\nNo GGUF models found in {args.models_dir}")
         print("Download GGUF vision models and place them in this directory.")

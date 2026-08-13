@@ -2503,6 +2503,12 @@ def chat_handler(
     image2,
     image3,
     image4,
+    image5,
+    image6,
+    image7,
+    image8,
+    image9,
+    image10,
     video,
     audio,
     max_tokens: int,
@@ -2543,7 +2549,12 @@ def chat_handler(
     model_content = []
 
     # Add all provided images
-    images = [img for img in [image1, image2, image3, image4] if img is not None]
+    images = [
+        img for img in [
+            image1, image2, image3, image4, image5,
+            image6, image7, image8, image9, image10,
+        ] if img is not None
+    ]
     for img in images:
         model_content.append({"type": "image", "image": img})
 
@@ -2858,6 +2869,30 @@ def create_ui():
         min-height: 200px;
         max-height: 90vh;
     }
+    /* Keep every media slot (image/video/audio) the same size whether or not
+       something is uploaded - empty drop zones otherwise grow much taller */
+    .media-slot {
+        height: 210px !important;
+        min-height: 210px !important;
+        max-height: 210px !important;
+        overflow: hidden !important;
+    }
+    .media-slot > .wrap,
+    .media-slot .upload-container,
+    .media-slot .image-container,
+    .media-slot .image-frame,
+    .media-slot .audio-container,
+    .media-slot .video-container,
+    .media-slot .empty {
+        height: 150px !important;
+        min-height: 150px !important;
+        max-height: 150px !important;
+    }
+    .media-slot img,
+    .media-slot video {
+        max-height: 150px !important;
+        object-fit: contain !important;
+    }
     """
 
     # Get initial model list
@@ -2882,29 +2917,80 @@ def create_ui():
                         label="Image 1",
                         type="pil",
                         height=150,
+                        elem_classes=["media-slot"],
                     )
                     image_input_2 = gr.Image(
                         label="Image 2",
                         type="pil",
                         height=150,
+                        elem_classes=["media-slot"],
                     )
                     image_input_3 = gr.Image(
                         label="Image 3",
                         type="pil",
                         height=150,
+                        elem_classes=["media-slot"],
                     )
                     image_input_4 = gr.Image(
                         label="Image 4",
                         type="pil",
                         height=150,
+                        elem_classes=["media-slot"],
                     )
                     video_input = gr.Video(
                         label="Upload Video (optional)",
                         height=150,
+                        elem_classes=["media-slot"],
                     )
                     audio_input = gr.Audio(
                         label="Upload Audio (optional)",
                         type="filepath",
+                        elem_classes=["media-slot"],
+                    )
+
+                # Optional second row of image inputs (5-10)
+                with gr.Row():
+                    show_more_images = gr.Checkbox(
+                        label="More images (5-10)",
+                        value=False,
+                    )
+
+                with gr.Row(visible=False) as extra_images_row:
+                    image_input_5 = gr.Image(
+                        label="Image 5",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
+                    )
+                    image_input_6 = gr.Image(
+                        label="Image 6",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
+                    )
+                    image_input_7 = gr.Image(
+                        label="Image 7",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
+                    )
+                    image_input_8 = gr.Image(
+                        label="Image 8",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
+                    )
+                    image_input_9 = gr.Image(
+                        label="Image 9",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
+                    )
+                    image_input_10 = gr.Image(
+                        label="Image 10",
+                        type="pil",
+                        height=150,
+                        elem_classes=["media-slot"],
                     )
 
                 # Message input row
@@ -3280,39 +3366,53 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
-            if not msg.strip() and img1 is None and img2 is None and img3 is None and img4 is None and vid is None and aud is None:
-                yield history, "", None, None, None, None, None, None, "", ""
+        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, img5, img6, img7, img8, img9, img10, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
+            imgs = [img1, img2, img3, img4, img5, img6, img7, img8, img9, img10]
+            # One cleared slot per media input, so every input resets after send
+            cleared = [None] * (len(imgs) + 2)
+
+            if not msg.strip() and all(i is None for i in imgs) and vid is None and aud is None:
+                yield history, "", *cleared, "", ""
                 return
 
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
-                msg, history, sys_prompt, img1, img2, img3, img4, vid, aud,
+                msg, history, sys_prompt, *imgs, vid, aud,
                 max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
                 think_mode
             ):
-                yield new_history, "", None, None, None, None, None, None, stats, ctx_info
+                yield new_history, "", *cleared, stats, ctx_info
+
+        chat_media_inputs = [
+            image_input_1, image_input_2, image_input_3, image_input_4, image_input_5,
+            image_input_6, image_input_7, image_input_8, image_input_9, image_input_10,
+            video_input, audio_input,
+        ]
+
+        send_inputs = [
+            msg_input, chatbot, system_prompt,
+            *chat_media_inputs,
+            max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
+            thinking_mode
+        ]
+        send_outputs = [chatbot, msg_input, *chat_media_inputs, stats_display, context_display]
 
         send_btn.click(
             fn=send_message,
-            inputs=[
-                msg_input, chatbot, system_prompt,
-                image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-                thinking_mode
-            ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
+            inputs=send_inputs,
+            outputs=send_outputs,
         )
 
         msg_input.submit(
             fn=send_message,
-            inputs=[
-                msg_input, chatbot, system_prompt,
-                image_input_1, image_input_2, image_input_3, image_input_4,
-                video_input, audio_input, max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-                thinking_mode
-            ],
-            outputs=[chatbot, msg_input, image_input_1, image_input_2, image_input_3, image_input_4, video_input, audio_input, stats_display, context_display],
+            inputs=send_inputs,
+            outputs=send_outputs,
+        )
+
+        show_more_images.change(
+            fn=lambda show: gr.update(visible=show),
+            inputs=[show_more_images],
+            outputs=[extra_images_row],
         )
 
         regen_btn.click(

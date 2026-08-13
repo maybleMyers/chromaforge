@@ -169,6 +169,10 @@
     user-select: none;
 }
 
+.forge-container.forge-maximized .forge-toolbar {
+    opacity: 1;
+}
+
 .forge-upload-hint {
     position: absolute;
     top: 50%;

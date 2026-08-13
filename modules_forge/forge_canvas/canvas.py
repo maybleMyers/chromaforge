@@ -53,6 +53,7 @@ canvas_html = open(os.path.join(canvas_js_root_path, 'canvas.html'), encoding='u
 canvas_head = ''
 canvas_head += web_css('canvas.css')
 canvas_head += web_js('canvas.min.js')
+canvas_head += web_js('canvas_keep_toolbar.js')
 
 
 def image_to_base64(image_array, numpy=True):

@@ -25,8 +25,10 @@ import subprocess
 import signal
 import threading
 import requests
+import html
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import quote as url_quote
 from typing import Optional, List, Tuple, Dict, Any, Generator
 
 import gradio as gr
@@ -2495,22 +2497,104 @@ def stream_chat_response(
         yield new_history, stats, ctx_info
 
 
+# ===== Chat media gallery =====
+# One multi-upload dropzone feeds a card grid, replacing the fixed image/video/audio
+# slots. The model still takes at most one video and one audio clip per turn.
+VLM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+VLM_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+VLM_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv"}
+VLM_MEDIA_LIMITS = {"image": 10, "video": 1, "audio": 1}
+
+
+def vlm_media_kind(path: str) -> Optional[str]:
+    """image / video / audio for a dropped file, or None when we cannot send it."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in VLM_IMAGE_EXTENSIONS:
+        return "image"
+    if ext in VLM_AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in VLM_VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+def vlm_media_counts(files) -> Dict[str, int]:
+    counts = {"image": 0, "video": 0, "audio": 0}
+    for path in (files or []):
+        kind = vlm_media_kind(path)
+        if kind:
+            counts[kind] += 1
+    return counts
+
+
+def vlm_media_preview_html(files) -> str:
+    """Render the accumulated media list as a card grid (index badge, kind badge, inline
+    preview, per-card remove button wired through the hidden textbox+button)."""
+    files = files or []
+    if not files:
+        return (
+            '<div class="vlm-media-empty">No media attached — drop images, a video or '
+            'an audio clip into the box above.</div>'
+        )
+    cards = []
+    for i, path in enumerate(files):
+        kind = vlm_media_kind(path) or "image"
+        url = "/gradio_api/file=" + url_quote(path)
+        name = html.escape(os.path.basename(path))
+        if kind == "image":
+            media = f'<img src="{url}" loading="lazy" alt="{name}">'
+        elif kind == "video":
+            media = f'<video src="{url}" controls preload="metadata"></video>'
+        else:
+            media = f'<audio src="{url}" controls preload="metadata"></audio>'
+        cards.append(
+            f'<div class="vlm-media-card">'
+            f'<div class="vlm-media-head">'
+            f'<span class="vlm-media-index">{i + 1}</span>'
+            f'<span class="vlm-media-kind vlm-media-kind-{kind}">{kind}</span>'
+            f'<button type="button" class="vlm-media-remove" title="Remove this file" '
+            f'onclick="vlmRemoveMedia({i + 1})">&#10005;</button>'
+            f'</div>'
+            f'<div class="vlm-media-body">{media}</div>'
+            f'<div class="vlm-media-name" title="{name}">{name}</div>'
+            f'</div>'
+        )
+    counts = vlm_media_counts(files)
+    summary = (
+        f'<div class="vlm-media-summary">'
+        f'{counts["image"]}/{VLM_MEDIA_LIMITS["image"]} images &middot; '
+        f'{counts["video"]}/{VLM_MEDIA_LIMITS["video"]} video &middot; '
+        f'{counts["audio"]}/{VLM_MEDIA_LIMITS["audio"]} audio</div>'
+    )
+    return summary + '<div class="vlm-media-grid">' + "".join(cards) + "</div>"
+
+
+def vlm_split_media(media_paths) -> Tuple[List[Image.Image], Optional[str], Optional[str]]:
+    """Parse the gallery into the model's content slots: PIL images in drop order,
+    plus at most one video and one audio path. Unreadable files are dropped with a warning."""
+    images: List[Image.Image] = []
+    video = None
+    audio = None
+    for path in (media_paths or []):
+        kind = vlm_media_kind(path)
+        if kind == "image":
+            try:
+                with Image.open(path) as opened:
+                    images.append(opened.convert("RGB"))
+            except Exception as e:
+                gr.Warning(f"Could not read image {os.path.basename(path)}: {e}")
+        elif kind == "video" and video is None:
+            video = path
+        elif kind == "audio" and audio is None:
+            audio = path
+    return images, video, audio
+
+
 def chat_handler(
     message: str,
     history: List[Dict[str, Any]],
     system_prompt: str,
-    image1,
-    image2,
-    image3,
-    image4,
-    image5,
-    image6,
-    image7,
-    image8,
-    image9,
-    image10,
-    video,
-    audio,
+    media_paths: List[str],
     max_tokens: int,
     temperature: float,
     top_p: float,
@@ -2549,12 +2633,7 @@ def chat_handler(
     model_content = []
 
     # Add all provided images
-    images = [
-        img for img in [
-            image1, image2, image3, image4, image5,
-            image6, image7, image8, image9, image10,
-        ] if img is not None
-    ]
+    images, video, audio = vlm_split_media(media_paths)
     for img in images:
         model_content.append({"type": "image", "image": img})
 
@@ -2869,29 +2948,83 @@ def create_ui():
         min-height: 200px;
         max-height: 90vh;
     }
-    /* Keep every media slot (image/video/audio) the same size whether or not
-       something is uploaded - empty drop zones otherwise grow much taller */
-    .media-slot {
-        height: 210px !important;
-        min-height: 210px !important;
-        max-height: 210px !important;
-        overflow: hidden !important;
+    /* Chat media gallery: one dropzone plus a card grid of what is attached */
+    .vlm-hidden { display: none !important; }
+    .vlm-media-summary {
+        font-size: 0.85em;
+        opacity: 0.8;
+        margin: 4px 0 6px 2px;
     }
-    .media-slot > .wrap,
-    .media-slot .upload-container,
-    .media-slot .image-container,
-    .media-slot .image-frame,
-    .media-slot .audio-container,
-    .media-slot .video-container,
-    .media-slot .empty {
-        height: 150px !important;
-        min-height: 150px !important;
-        max-height: 150px !important;
+    .vlm-media-empty {
+        font-size: 0.85em;
+        opacity: 0.6;
+        margin: 4px 0 6px 2px;
     }
-    .media-slot img,
-    .media-slot video {
-        max-height: 150px !important;
-        object-fit: contain !important;
+    .vlm-media-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 10px;
+    }
+    .vlm-media-card {
+        border: 1px solid var(--border-color-primary, #444);
+        border-radius: 8px;
+        padding: 6px;
+        background: var(--background-fill-secondary, rgba(128,128,128,0.05));
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+    }
+    .vlm-media-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .vlm-media-index {
+        font-weight: bold;
+        background: #0060df;
+        color: white;
+        border-radius: 4px;
+        padding: 0 6px;
+        font-size: 0.85em;
+    }
+    .vlm-media-kind {
+        font-size: 0.75em;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        border-radius: 4px;
+        padding: 0 5px;
+        color: white;
+    }
+    .vlm-media-kind-image { background: #27ae60; }
+    .vlm-media-kind-video { background: #8e44ad; }
+    .vlm-media-kind-audio { background: #e67e22; }
+    .vlm-media-remove {
+        margin-left: auto;
+        border: none;
+        background: transparent;
+        color: var(--body-text-color, inherit);
+        opacity: 0.6;
+        cursor: pointer;
+        font-size: 0.95em;
+        line-height: 1;
+        padding: 2px 4px;
+    }
+    .vlm-media-remove:hover { opacity: 1; color: #e74c3c; }
+    .vlm-media-body img, .vlm-media-body video {
+        width: 100%;
+        max-height: 140px;
+        object-fit: contain;
+        border-radius: 4px;
+        display: block;
+    }
+    .vlm-media-body audio { width: 100%; }
+    .vlm-media-name {
+        font-size: 0.75em;
+        opacity: 0.75;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
     """
 
@@ -2911,87 +3044,33 @@ def create_ui():
                     elem_classes=["resizable-chatbot"],
                 )
 
-                # Media inputs row - 4 image inputs
+                # Media gallery - one multi-upload dropzone feeding a card grid
+                gr.Markdown(
+                    "Drop **multiple files at once** below (or click to browse). New drops are "
+                    "**added** to the set; up to **10 images / 1 video / 1 audio clip**. "
+                    "Images are sent in the order shown — remove one with its ✕."
+                )
+                chat_media_state = gr.State(value=[])
+                chat_media_files = gr.File(
+                    label="Drop images / video / audio here (or click to browse)",
+                    file_count="multiple",
+                    type="filepath",
+                    height=110,
+                    elem_id="vlm_media_dropzone",
+                )
+                chat_media_preview = gr.HTML(value=vlm_media_preview_html([]))
                 with gr.Row():
-                    image_input_1 = gr.Image(
-                        label="Image 1",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_2 = gr.Image(
-                        label="Image 2",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_3 = gr.Image(
-                        label="Image 3",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_4 = gr.Image(
-                        label="Image 4",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    video_input = gr.Video(
-                        label="Upload Video (optional)",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    audio_input = gr.Audio(
-                        label="Upload Audio (optional)",
-                        type="filepath",
-                        elem_classes=["media-slot"],
-                    )
-
-                # Optional second row of image inputs (5-10)
-                with gr.Row():
-                    show_more_images = gr.Checkbox(
-                        label="More images (5-10)",
-                        value=False,
-                    )
-
-                with gr.Row(visible=False) as extra_images_row:
-                    image_input_5 = gr.Image(
-                        label="Image 5",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_6 = gr.Image(
-                        label="Image 6",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_7 = gr.Image(
-                        label="Image 7",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_8 = gr.Image(
-                        label="Image 8",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_9 = gr.Image(
-                        label="Image 9",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
-                    image_input_10 = gr.Image(
-                        label="Image 10",
-                        type="pil",
-                        height=150,
-                        elem_classes=["media-slot"],
-                    )
+                    chat_media_clear_btn = gr.Button("Clear all media", size="sm")
+                # Hidden plumbing for the per-card ✕ buttons in the HTML preview
+                # (kept visible=True so they exist in the DOM; hidden via CSS).
+                chat_media_remove_idx = gr.Textbox(
+                    value="", elem_id="vlm_media_remove_idx",
+                    elem_classes=["vlm-hidden"],
+                )
+                chat_media_remove_btn = gr.Button(
+                    "remove", elem_id="vlm_media_remove_btn",
+                    elem_classes=["vlm-hidden"],
+                )
 
                 # Message input row
                 with gr.Row():
@@ -3366,36 +3445,32 @@ def create_ui():
             outputs=[status_display],
         )
 
-        def send_message(msg, history, sys_prompt, img1, img2, img3, img4, img5, img6, img7, img8, img9, img10, vid, aud, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
-            imgs = [img1, img2, img3, img4, img5, img6, img7, img8, img9, img10]
-            # One cleared slot per media input, so every input resets after send
-            cleared = [None] * (len(imgs) + 2)
+        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
+            media = list(media or [])
+            # The gallery empties after a send: state, dropzone and preview all reset.
+            cleared = ([], None, vlm_media_preview_html([]))
 
-            if not msg.strip() and all(i is None for i in imgs) and vid is None and aud is None:
+            if not msg.strip() and not media:
                 yield history, "", *cleared, "", ""
                 return
 
             # Stream responses from chat_handler generator
             for new_history, _, stats, ctx_info in chat_handler(
-                msg, history, sys_prompt, *imgs, vid, aud,
+                msg, history, sys_prompt, media,
                 max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
                 think_mode
             ):
                 yield new_history, "", *cleared, stats, ctx_info
 
-        chat_media_inputs = [
-            image_input_1, image_input_2, image_input_3, image_input_4, image_input_5,
-            image_input_6, image_input_7, image_input_8, image_input_9, image_input_10,
-            video_input, audio_input,
-        ]
+        chat_media_outputs = [chat_media_state, chat_media_files, chat_media_preview]
 
         send_inputs = [
             msg_input, chatbot, system_prompt,
-            *chat_media_inputs,
+            chat_media_state,
             max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
             thinking_mode
         ]
-        send_outputs = [chatbot, msg_input, *chat_media_inputs, stats_display, context_display]
+        send_outputs = [chatbot, msg_input, *chat_media_outputs, stats_display, context_display]
 
         send_btn.click(
             fn=send_message,
@@ -3409,11 +3484,91 @@ def create_ui():
             outputs=send_outputs,
         )
 
-        show_more_images.change(
-            fn=lambda show: gr.update(visible=show),
-            inputs=[show_more_images],
-            outputs=[extra_images_row],
+        def add_chat_media(state_files, uploaded):
+            """Append newly dropped files to the accumulated set, then clear the dropzone
+            so it stays an always-available drop target.
+
+            Anything the model cannot take - an unknown extension, or a second video or
+            audio clip - is rejected here rather than silently ignored at send time.
+            """
+            files = list(state_files or [])
+            counts = vlm_media_counts(files)
+            unsupported, over_limit = [], []
+
+            for f in (uploaded or []):
+                path = f if isinstance(f, str) else getattr(f, "name", str(f))
+                if not path or path in files:
+                    continue
+                kind = vlm_media_kind(path)
+                if kind is None:
+                    unsupported.append(os.path.basename(path))
+                elif counts[kind] >= VLM_MEDIA_LIMITS[kind]:
+                    over_limit.append(f"{os.path.basename(path)} ({kind})")
+                else:
+                    counts[kind] += 1
+                    files.append(path)
+
+            if unsupported:
+                gr.Warning("Not an image, video or audio file: " + ", ".join(unsupported))
+            if over_limit:
+                gr.Warning(
+                    "Already at the per-turn limit (%s), skipped: %s" % (
+                        ", ".join(f"{v} {k}" for k, v in VLM_MEDIA_LIMITS.items()),
+                        ", ".join(over_limit),
+                    )
+                )
+            return files, None, vlm_media_preview_html(files)
+
+        chat_media_files.upload(
+            fn=add_chat_media,
+            inputs=[chat_media_state, chat_media_files],
+            outputs=chat_media_outputs,
         )
+
+        def remove_chat_media(state_files, idx_text):
+            files = list(state_files or [])
+            try:
+                idx = int(str(idx_text).strip())
+            except ValueError:
+                return files, None, vlm_media_preview_html(files)
+            if 1 <= idx <= len(files):
+                files.pop(idx - 1)
+            return files, None, vlm_media_preview_html(files)
+
+        chat_media_remove_btn.click(
+            fn=remove_chat_media,
+            inputs=[chat_media_state, chat_media_remove_idx],
+            outputs=chat_media_outputs,
+        )
+
+        chat_media_clear_btn.click(
+            fn=lambda: ([], None, vlm_media_preview_html([])),
+            inputs=None,
+            outputs=chat_media_outputs,
+        )
+
+        demo.load(None, None, None, js=r"""
+            () => {
+                // A file dropped outside an upload zone would otherwise navigate the
+                // browser to the file, wiping out the page. Swallow stray drops at the
+                // window level; Gradio's own dropzones handle their drops first.
+                window.addEventListener('dragover', (e) => { e.preventDefault(); }, false);
+                window.addEventListener('drop', (e) => { e.preventDefault(); }, false);
+
+                // Per-card remove buttons in the media preview: write the 1-based index
+                // into the hidden textbox, then click the hidden button.
+                window.vlmRemoveMedia = (idx) => {
+                    const box = document.querySelector('#vlm_media_remove_idx textarea, #vlm_media_remove_idx input');
+                    if (!box) return;
+                    box.value = String(idx);
+                    box.dispatchEvent(new Event('input', { bubbles: true }));
+                    setTimeout(() => {
+                        const btn = document.querySelector('#vlm_media_remove_btn button, button#vlm_media_remove_btn, #vlm_media_remove_btn');
+                        if (btn) btn.click();
+                    }, 60);
+                };
+            }
+        """)
 
         regen_btn.click(
             fn=regenerate_handler,

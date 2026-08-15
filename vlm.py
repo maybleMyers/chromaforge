@@ -3227,7 +3227,9 @@ def create_ui():
                 with gr.Column(scale=1):
                     n_ctx = gr.Slider(
                         minimum=512,
-                        maximum=200000,
+                        # 262144 is Qwen3.5/3.6/3.8's native window (and Kimi K2.6's
+                        # maximum). The old 200000 ceiling could not reach either.
+                        maximum=262144,
                         value=saved_settings.get("n_ctx", DEFAULT_SETTINGS["n_ctx"]),
                         step=512,
                         label="Context Length",

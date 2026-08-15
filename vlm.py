@@ -521,6 +521,9 @@ class LlamaCppVLM:
         self.server_url: Optional[str] = None
         self.use_server_backend = False
         self.llama_server_path = self.DEFAULT_LLAMA_SERVER_PATH
+        # Set from /props after the server comes up. True only when the binary was
+        # built with MTMD_VIDEO, ffmpeg/ffprobe are on PATH, and an mmproj is loaded.
+        self.server_supports_video = False
 
         # Context tracking
         self.n_ctx: int = 0  # Store context size for usage display
@@ -860,6 +863,7 @@ class LlamaCppVLM:
                 self.server_process = None
                 self.server_url = None
                 self.use_server_backend = False
+                self.server_supports_video = False
 
             # Clean up local model if loaded
             if self.model is not None:
@@ -1146,6 +1150,21 @@ class LlamaCppVLM:
                         "For very large MoE models, keep the experts off the GPU with Override "
                         "Tensor / --n-cpu-moe and consider leaving MMap enabled.")
 
+            # Ask the server what modalities it actually accepts rather than guessing
+            # from the model name. mtmd only reports video when llama.cpp was built
+            # with MTMD_VIDEO *and* ffmpeg/ffprobe are on PATH *and* an mmproj is
+            # loaded, so this is the only reliable gate for the input_video path.
+            self.server_supports_video = False
+            try:
+                props = requests.get(f"{self.server_url}/props", timeout=10).json()
+                modalities = props.get("modalities", {}) or {}
+                self.server_supports_video = bool(modalities.get("video", False))
+                print(f"[llama-server] Modalities: {modalities}")
+            except Exception as e:
+                # Older builds have no /props modalities block; fall back to frames.
+                print(f"[llama-server] Could not read /props modalities ({e}); "
+                      "assuming no native video support")
+
             self.current_model_path = model_path
             self.current_mmproj_path = mmproj_path
             self.use_server_backend = True
@@ -1164,7 +1183,7 @@ class LlamaCppVLM:
             self.n_ctx = n_ctx  # Store context size for usage tracking
 
             vision_status = "with vision" if not self.is_text_only_model else "text-only"
-            print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, vision={not self.is_text_only_model}")
+            print(f"[llama-server] Flags set: use_server_backend={self.use_server_backend}, server_url={self.server_url}, vision={not self.is_text_only_model}, native_video={self.server_supports_video}")
 
             progress(1.0, desc="Server ready!")
             return f"Server started: {model_name} ({vision_status}, ctx={n_ctx}) @ {self.server_url}"
@@ -1263,25 +1282,52 @@ class LlamaCppVLM:
                             has_images = True
 
                         elif item_type == "video" and "video" in item:
-                            # Extract frames from video and convert to images
                             video_path = item["video"]
                             if isinstance(video_path, str) and os.path.exists(video_path):
                                 try:
-                                    frames = extract_video_frames(video_path, max_frames=video_max_frames, every_other_frame=every_other_frame)
-                                    print(f"[llama-server] Extracted {len(frames)} frames from video: {video_path}")
-                                    for frame in frames:
-                                        b64_url = image_to_base64(frame)
+                                    if self.server_supports_video:
+                                        # Hand the whole clip to mtmd. It shells out to
+                                        # ffmpeg, samples at its own fps target and
+                                        # interleaves "[MM:SSs]" timestamp text chunks
+                                        # between frames - which is exactly what
+                                        # Qwen3-VL's text time alignment expects, and
+                                        # what the frame-dumping path below cannot give.
+                                        # Frames also keep their aspect ratio here.
+                                        #
+                                        # Raw base64 only, no "data:video/mp4;base64,"
+                                        # prefix: llama.cpp parses input_video with
+                                        # accept_base64_uri=false (server-common.cpp),
+                                        # so a data: URI is rejected. Same convention as
+                                        # the input_audio branch below.
+                                        with open(video_path, "rb") as f:
+                                            b64_video = base64.b64encode(f.read()).decode("utf-8")
+                                        print(f"[llama-server] Sending video natively "
+                                              f"({len(b64_video) // 1024} KB base64): {video_path}")
                                         content_parts.append({
-                                            "type": "image_url",
-                                            "image_url": {"url": b64_url}
+                                            "type": "input_video",
+                                            "input_video": {"data": b64_video},
                                         })
-                                    content_parts.append({
-                                        "type": "text",
-                                        "text": f"[Video with {len(frames)} frames]"
-                                    })
-                                    has_images = True
+                                        has_images = True
+                                    else:
+                                        # Fallback: no native video on this server, so
+                                        # decode to stills client-side and send them as
+                                        # separate images. Loses timestamps and squashes
+                                        # every frame to a square.
+                                        frames = extract_video_frames(video_path, max_frames=video_max_frames, every_other_frame=every_other_frame)
+                                        print(f"[llama-server] Extracted {len(frames)} frames from video: {video_path}")
+                                        for frame in frames:
+                                            b64_url = image_to_base64(frame)
+                                            content_parts.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": b64_url}
+                                            })
+                                        content_parts.append({
+                                            "type": "text",
+                                            "text": f"[Video with {len(frames)} frames]"
+                                        })
+                                        has_images = True
                                 except Exception as e:
-                                    print(f"[llama-server] Video extraction error: {e}")
+                                    print(f"[llama-server] Video error: {e}")
                                     content_parts.append({
                                         "type": "text",
                                         "text": f"[Video error: {e}]"
@@ -1749,6 +1795,10 @@ class LlamaCppVLM:
                                                 "image_url": {"url": b64_url}
                                             })
                                     elif item.get("type") == "video" and "video" in item:
+                                        # Frame extraction only. llama-cpp-python vendors
+                                        # its own llama.cpp build with no input_video
+                                        # endpoint, so native video decoding is
+                                        # llama-server-only (see generate_via_api).
                                         video_path = item["video"]
                                         if isinstance(video_path, str) and os.path.exists(video_path):
                                             try:
@@ -3337,12 +3387,12 @@ def create_ui():
                     value=saved_settings.get("video_max_frames", DEFAULT_SETTINGS["video_max_frames"]),
                     step=1,
                     label="Max Video Frames",
-                    info="Frames to extract from videos",
+                    info="Frame-extraction fallback only - ignored when the server decodes video natively",
                 )
                 every_other_frame = gr.Checkbox(
                     label="Every Other Frame",
                     value=saved_settings.get("every_other_frame", DEFAULT_SETTINGS["every_other_frame"]),
-                    info="Use every other frame (for long videos)",
+                    info="Fallback only - ignored when the server decodes video natively",
                 )
 
             with gr.Row():

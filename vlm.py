@@ -19,6 +19,7 @@ import re
 import json
 import base64
 import argparse
+import shutil
 import tempfile
 import time
 import subprocess
@@ -308,6 +309,128 @@ def _pick_mmproj(candidates: List[Path]) -> Optional[str]:
 def _pick_draft(candidates: List[Path]) -> Optional[str]:
     """Choose one speculative-decoding drafter from a folder, smallest quant first."""
     return _pick_by_precision(candidates, _DRAFT_PREFERENCE)
+
+
+# llama-server always hands video to mtmd as an in-memory buffer (handle_media reads
+# input_video.data into a raw_buffer before mtmd sees it), so mtmd probes it by piping
+# the bytes to ffprobe on *stdin*. mtmd-helper.cpp asks ffmpeg for "cache:pipe:0",
+# which can seek backwards for a container header, but asks ffprobe for a bare
+# "pipe:0", which cannot. An MP4 written without +faststart keeps its moov atom after
+# the mdat payload, so over that non-seekable pipe ffprobe reports width/height/fps
+# but "duration=N/A". probe() still returns true, mtmd_helper_video_init succeeds, the
+# request comes back 200 - and n_frames lands at -1, so no frames ever reach the model.
+# The symptom is a video that is silently ignored while the chat answers instantly.
+#
+# Remuxing with -movflags +faststart moves the moov atom to the front, which makes the
+# duration readable over a pipe. It is a stream copy, so no re-encode and no quality
+# loss. Cached per (path, size, mtime) because the same clip is re-sent every turn.
+_FASTSTART_CACHE: Dict[Tuple[str, int, float], str] = {}
+
+
+def _mp4_is_faststart(video_path: str) -> Optional[bool]:
+    """
+    Walk the top-level ISO-BMFF box list and report whether 'moov' precedes 'mdat'.
+
+    True  = already faststart, nothing to do.
+    False = moov sits after the payload, which is what breaks mtmd's pipe probe.
+    None  = not an MP4/MOV (no 'ftyp'), so this test does not apply.
+
+    Reads only the box headers, so it costs a handful of seeks regardless of file size.
+    """
+    try:
+        with open(video_path, "rb") as f:
+            head = f.read(8)
+            if len(head) < 8 or head[4:8] != b"ftyp":
+                return None  # not ISO-BMFF (mkv, webm, avi, ...)
+
+            f.seek(0)
+            offset = 0
+            size = os.path.getsize(video_path)
+            while offset + 8 <= size:
+                f.seek(offset)
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                box_size = int.from_bytes(header[0:4], "big")
+                box_type = header[4:8]
+
+                if box_size == 1:  # 64-bit extended size follows the type
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    box_size = int.from_bytes(ext, "big")
+                elif box_size == 0:  # box runs to end of file
+                    box_size = size - offset
+
+                if box_type == b"moov":
+                    return True
+                if box_type == b"mdat":
+                    return False
+                if box_size <= 0:
+                    break
+                offset += box_size
+    except OSError as e:
+        print(f"[video] Could not inspect MP4 box order ({e})")
+        return None
+
+    return None
+
+
+def ensure_video_pipe_safe(video_path: str) -> Tuple[str, bool]:
+    """
+    Return a path whose container mtmd can probe over a pipe, remuxing if needed.
+
+    Returns (path_to_send, was_remuxed). On any failure the original path is returned
+    so the caller still tries - a failed remux should not block the request.
+    """
+    try:
+        stat = os.stat(video_path)
+        cache_key = (os.path.abspath(video_path), stat.st_size, stat.st_mtime)
+    except OSError:
+        return video_path, False
+
+    cached = _FASTSTART_CACHE.get(cache_key)
+    if cached and os.path.exists(cached):
+        return cached, True
+
+    if _mp4_is_faststart(video_path) is not False:
+        # Already faststart, or a container this does not apply to. Send as-is.
+        return video_path, False
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        # mtmd shells out to ffmpeg too, so if it is missing the server would not have
+        # advertised video support in the first place. Nothing we can do here.
+        print("[video] moov atom is at end of file but ffmpeg is not on PATH; "
+              "sending as-is (the model will probably not see the video)")
+        return video_path, False
+
+    print(f"[video] {os.path.basename(video_path)} has its moov atom after mdat, "
+          "which breaks mtmd's pipe probe; remuxing with +faststart")
+
+    out_dir = os.path.join(tempfile.gettempdir(), "vlm_faststart")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    out_path = os.path.join(out_dir, f"{stem}_{stat.st_size}_{int(stat.st_mtime)}_faststart.mp4")
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-nostdin", "-y", "-i", video_path,
+             "-c", "copy", "-movflags", "+faststart", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            tail = result.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+            print(f"[video] Remux failed (exit {result.returncode}); sending the original. "
+                  f"ffmpeg said: {' | '.join(tail)}")
+            return video_path, False
+    except Exception as e:
+        print(f"[video] Remux failed ({e}); sending the original")
+        return video_path, False
+
+    _FASTSTART_CACHE[cache_key] = out_path
+    print(f"[video] Remuxed to {out_path}")
+    return out_path, True
 
 
 def extract_video_frames(video_path: str, max_frames: int = 8, target_size: Tuple[int, int] = (448, 448), every_other_frame: bool = False) -> List[Image.Image]:
@@ -1299,10 +1422,15 @@ class LlamaCppVLM:
                                         # accept_base64_uri=false (server-common.cpp),
                                         # so a data: URI is rejected. Same convention as
                                         # the input_audio branch below.
-                                        with open(video_path, "rb") as f:
+                                        # mtmd probes the buffer with ffprobe on a
+                                        # non-seekable pipe, so a non-faststart MP4 is
+                                        # accepted and then silently yields no frames.
+                                        send_path, remuxed = ensure_video_pipe_safe(video_path)
+                                        with open(send_path, "rb") as f:
                                             b64_video = base64.b64encode(f.read()).decode("utf-8")
                                         print(f"[llama-server] Sending video natively "
-                                              f"({len(b64_video) // 1024} KB base64): {video_path}")
+                                              f"({len(b64_video) // 1024} KB base64"
+                                              f"{', remuxed +faststart' if remuxed else ''}): {send_path}")
                                         content_parts.append({
                                             "type": "input_video",
                                             "input_video": {"data": b64_video},
@@ -1393,8 +1521,17 @@ class LlamaCppVLM:
             if isinstance(content, list):
                 # Multimodal content - summarize
                 text_parts = [p.get("text", "")[:50] for p in content if p.get("type") == "text"]
-                image_count = sum(1 for p in content if p.get("type") == "image_url")
-                preview = f"[{image_count} image(s)] {' '.join(text_parts)}"[:80]
+                # Count every media kind, not just image_url - a natively-sent video
+                # is one "input_video" part and used to print as "[0 image(s)]",
+                # which reads exactly like the video was dropped.
+                kinds = {"image_url": "image", "input_video": "video", "input_audio": "audio"}
+                counts: Dict[str, int] = {}
+                for p in content:
+                    kind = kinds.get(p.get("type"))
+                    if kind:
+                        counts[kind] = counts.get(kind, 0) + 1
+                media = ", ".join(f"{n} {k}(s)" for k, n in counts.items()) or "no media"
+                preview = f"[{media}] {' '.join(text_parts)}"[:80]
             else:
                 preview = content[:80] + "..." if len(content) > 80 else content
             print(f"[llama-server]   [{i}] {msg['role']}: {preview}")

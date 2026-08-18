@@ -21,13 +21,15 @@ function dimensionChange(e, is_width, is_height) {
     var tabIndex = get_tab_index('mode_img2img');
     if (tabIndex == 0) { // img2img
         targetElement = gradioApp().querySelector('#img2img_image div[class=forge-image-container] img');
-    } else if (tabIndex == 1) { //Sketch
+    } else if (tabIndex == 1) { // Reference Edit
+        targetElement = gradioApp().querySelector('#img2img_ref_edit_main div[data-testid=image] img');
+    } else if (tabIndex == 2) { // Sketch
         targetElement = gradioApp().querySelector('#img2img_sketch div[class=forge-image-container] img');
-    } else if (tabIndex == 2) { // Inpaint
+    } else if (tabIndex == 3) { // Inpaint
         targetElement = gradioApp().querySelector('#img2maskimg div[class=forge-image-container] img');
-    } else if (tabIndex == 3) { // Inpaint sketch
+    } else if (tabIndex == 4) { // Inpaint sketch
         targetElement = gradioApp().querySelector('#inpaint_sketch div[class=forge-image-container] img');
-    } else if (tabIndex == 4) { // Inpaint upload
+    } else if (tabIndex == 5) { // Inpaint upload
         targetElement = gradioApp().querySelector('#img_inpaint_base div[data-testid=image] img');
     }
 

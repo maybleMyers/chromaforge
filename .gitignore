@@ -17,6 +17,7 @@ __pycache__
 /repositories/BLIP
 /repositories/stable-diffusion-webui-assets
 /venv
+/.venv
 /tmp
 /output
 /model.ckpt

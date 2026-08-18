@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import torch
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 import random
 import cv2
 from skimage import exposure
@@ -89,6 +89,53 @@ def apply_overlay(image, paste_loc, overlay):
     image = image.convert('RGB')
 
     return image, original_denoised_image
+
+def blur_mask(image_mask, blur_x, blur_y):
+    """Separable gaussian feathering of an inpaint mask. A blur radius of 0 leaves that axis alone."""
+
+    if blur_x > 0:
+        np_mask = np.array(image_mask)
+        kernel_size = 2 * int(2.5 * blur_x + 0.5) + 1
+        np_mask = cv2.GaussianBlur(np_mask, (kernel_size, 1), blur_x)
+        image_mask = Image.fromarray(np_mask)
+
+    if blur_y > 0:
+        np_mask = np.array(image_mask)
+        kernel_size = 2 * int(2.5 * blur_y + 0.5) + 1
+        np_mask = cv2.GaussianBlur(np_mask, (1, kernel_size), blur_y)
+        image_mask = Image.fromarray(np_mask)
+
+    return image_mask
+
+
+def paint_fill_area(image_mask, fill_mask_rect, fill_mask_mode, overlap=0):
+    """
+    Paint the border created by a directional "Resize and fill" into an inpaint mask.
+
+    fill_mask_rect is where the original image sits inside the expanded frame; everything outside it
+    is new. The painted area is grown `overlap` pixels *inward* so the model gets some of the original
+    picture to blend against instead of a hard seam - same trick as scripts/poor_mans_outpainting.py.
+
+    fill_mask_mode 1 adds the new area to whatever the user masked, 2 masks the new area alone.
+    """
+
+    x1, y1, x2, y2 = fill_mask_rect
+
+    keep = Image.new('L', image_mask.size, 0)
+    ImageDraw.Draw(keep).rectangle(
+        (x1 + (overlap if x1 > 0 else 0),
+         y1 + (overlap if y1 > 0 else 0),
+         x2 - 1 - (overlap if x2 < image_mask.width else 0),
+         y2 - 1 - (overlap if y2 < image_mask.height else 0)),
+        fill=255,
+    )
+    border = ImageOps.invert(keep)
+
+    if fill_mask_mode == 2:
+        return border
+
+    return ImageChops.lighter(image_mask.convert('L'), border)
+
 
 def create_binary_mask(image, round=True):
     if image.mode == 'RGBA' and image.getextrema()[-1] != (255, 255):
@@ -1917,6 +1964,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     init_images: list = None
     resize_mode: int = 0
+    resize_fill_bias: tuple = (0.5, 0.5)    #   where "Resize and fill" puts the empty space; see images.resize_image
+    fill_mask_rect: tuple = None            #   (x1, y1, x2, y2) of the original image inside the expanded frame
+    fill_mask_mode: int = 0                 #   0 leave mask alone, 1 add the new area to it, 2 mask only the new area
     denoising_strength: float = 0.75
     image_cfg_scale: float = None
     mask: Any = None
@@ -1980,17 +2030,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                 image_mask = ImageOps.invert(image_mask)
                 self.extra_generation_params["Mask mode"] = "Inpaint not masked"
 
-            if self.mask_blur_x > 0:
-                np_mask = np.array(image_mask)
-                kernel_size = 2 * int(2.5 * self.mask_blur_x + 0.5) + 1
-                np_mask = cv2.GaussianBlur(np_mask, (kernel_size, 1), self.mask_blur_x)
-                image_mask = Image.fromarray(np_mask)
-
-            if self.mask_blur_y > 0:
-                np_mask = np.array(image_mask)
-                kernel_size = 2 * int(2.5 * self.mask_blur_y + 0.5) + 1
-                np_mask = cv2.GaussianBlur(np_mask, (1, kernel_size), self.mask_blur_y)
-                image_mask = Image.fromarray(np_mask)
+            image_mask = blur_mask(image_mask, self.mask_blur_x, self.mask_blur_y)
 
             if self.mask_blur_x > 0 or self.mask_blur_y > 0:
                 self.extra_generation_params["Mask blur"] = self.mask_blur
@@ -2016,7 +2056,17 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                     self.sd_model.comments.append(massage)
                     logging.info(massage)
             else:
-                image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height)
+                image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height, fill_bias=self.resize_fill_bias)
+
+                #   Must happen here: mask_for_overlay below, and latent_mask further down, are both
+                #   derived from image_mask. Painting the expanded border in any later would leave the
+                #   new area inside the overlay, and apply_overlay() would then composite the stretched
+                #   edge pixels straight back over whatever was generated there.
+                if self.fill_mask_mode and self.fill_mask_rect is not None:
+                    image_mask = paint_fill_area(image_mask, self.fill_mask_rect, self.fill_mask_mode, overlap=2 * max(self.mask_blur_x, self.mask_blur_y))
+                    image_mask = blur_mask(image_mask, self.mask_blur_x, self.mask_blur_y)
+                    self.extra_generation_params["New area"] = ["", "added to mask", "masked alone"][self.fill_mask_mode]
+
                 np_mask = np.array(image_mask)
                 np_mask = np.clip((np_mask.astype(np.float32)) * 2, 0, 255).astype(np.uint8)
                 self.mask_for_overlay = Image.fromarray(np_mask)
@@ -2042,11 +2092,11 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
             image = images.flatten(img, opts.img2img_background_color)
 
             if crop_region is None and self.resize_mode != 3:
-                image = images.resize_image(self.resize_mode, image, self.width, self.height)
+                image = images.resize_image(self.resize_mode, image, self.width, self.height, fill_bias=self.resize_fill_bias)
 
             if image_mask is not None:
                 if self.mask_for_overlay.size != (image.width, image.height):
-                    self.mask_for_overlay = images.resize_image(self.resize_mode, self.mask_for_overlay, image.width, image.height)
+                    self.mask_for_overlay = images.resize_image(self.resize_mode, self.mask_for_overlay, image.width, image.height, fill_bias=self.resize_fill_bias)
                 image_masked = Image.new('RGBa', (image.width, image.height))
                 image_masked.paste(image.convert("RGBA").convert("RGBa"), mask=ImageOps.invert(self.mask_for_overlay.convert('L')))
 

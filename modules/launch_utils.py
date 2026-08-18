@@ -150,7 +150,19 @@ def run_pip(command, desc=None, live=default_command_live):
         return
 
     index_url_line = f' --index-url {index_url}' if index_url != '' else ''
-    return run(f'"{python}" -m pip {command} --prefer-binary{index_url_line}', desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
+    pip_command = f'"{python}" -m pip {command} --prefer-binary{index_url_line}'
+
+    # Prefer uv when it is available: it is what manages the environment under
+    # `uv run`, and a uv-created venv has no pip at all. Fall back to pip if uv
+    # chokes on a flag we passed through (e.g. pip-only options).
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            return run(f'"{uv}" pip {command} --python "{python}" --prefer-binary{index_url_line}', desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
+        except RuntimeError:
+            print(f"uv could not install {desc}, retrying with pip...")
+
+    return run(pip_command, desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
 
 
 def check_run_python(code: str) -> bool:

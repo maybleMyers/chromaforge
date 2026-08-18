@@ -1290,7 +1290,7 @@ def create_ui():
                                 tab.select(fn=lambda tabnum=i: tabnum, inputs=[], outputs=[img2img_selected_tab])
 
                         def copyCanvas_img2img (background, foreground, source):
-                            if source == 1 or source == 3: #   1 is sketch, 3 is Inpaint sketch
+                            if source == 2 or source == 4: #   2 is Sketch, 4 is Inpaint sketch
                                 bg = Image.alpha_composite(background, foreground)
                                 return bg, None
                             return background, None
@@ -1432,7 +1432,8 @@ def create_ui():
                         scripts.scripts_img2img.setup_ui_for_section(category)
 
             def select_img2img_tab(tab):
-                return gr.update(visible=tab in [2, 3, 4]), gr.update(visible=tab == 3),
+                #   3 Inpaint, 4 Inpaint sketch, 5 Inpaint upload; mask transparency is Inpaint sketch only
+                return gr.update(visible=tab in [3, 4, 5]), gr.update(visible=tab == 4),
 
             for i, elem in enumerate(img2img_tabs):
                 elem.select(

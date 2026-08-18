@@ -249,7 +249,7 @@ def draw_prompt_matrix(im, width, height, all_prompts, margin=0):
     return draw_grid_annotations(im, width, height, hor_texts, ver_texts, margin)
 
 
-def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=False):
+def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=False, fill_bias=(0.5, 0.5)):
     """
     Resizes an image with the specified resize_mode, width, and height.
 
@@ -262,6 +262,9 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=
         width: The width to resize the image to.
         height: The height to resize the image to.
         upscaler_name: The name of the upscaler to use. If not provided, defaults to opts.upscaler_for_img2img.
+        fill_bias: for resize_mode 2 only, the fraction of the empty space placed on the left/top side.
+            The default (0.5, 0.5) centers the image, i.e. splits the fill evenly between opposing sides.
+            (0.0, 0.5) pins the image to the left edge so all horizontal fill lands on the right, and so on.
     """
 
     if not force_RGBA and im.mode == 'RGBA':
@@ -313,18 +316,33 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=
 
         resized = resize(im, src_w, src_h)
         res = Image.new("RGB" if not force_RGBA else "RGBA", (width, height))
-        res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
 
-        if ratio < src_ratio:
-            fill_height = height // 2 - src_h // 2
-            if fill_height > 0:
-                res.paste(resized.resize((width, fill_height), box=(0, 0, width, 0)), box=(0, 0))
-                res.paste(resized.resize((width, fill_height), box=(0, resized.height, width, resized.height)), box=(0, fill_height + src_h))
-        elif ratio > src_ratio:
-            fill_width = width // 2 - src_w // 2
-            if fill_width > 0:
-                res.paste(resized.resize((fill_width, height), box=(0, 0, 0, height)), box=(0, 0))
-                res.paste(resized.resize((fill_width, height), box=(resized.width, 0, resized.width, height)), box=(fill_width + src_w, 0))
+        # How much empty space there is, and how it is split between opposing sides. A bias of
+        # exactly 0.5 keeps the historical centering expression so centered output is unchanged.
+        pad_w = max(width - src_w, 0)
+        pad_h = max(height - src_h, 0)
+        bias_x, bias_y = fill_bias
+
+        fill_left = width // 2 - src_w // 2 if bias_x == 0.5 else int(round(pad_w * bias_x))
+        fill_top = height // 2 - src_h // 2 if bias_y == 0.5 else int(round(pad_h * bias_y))
+
+        fill_left = min(max(fill_left, 0), pad_w)
+        fill_top = min(max(fill_top, 0), pad_h)
+        fill_right = pad_w - fill_left
+        fill_bottom = pad_h - fill_top
+
+        res.paste(resized, box=(fill_left, fill_top))
+
+        # The empty bars are filled by stretching the single edge row/column of the resized image
+        # over them - `box` here is a degenerate zero-height/zero-width source region.
+        if fill_top > 0:
+            res.paste(resized.resize((width, fill_top), box=(0, 0, width, 0)), box=(0, 0))
+        if fill_bottom > 0:
+            res.paste(resized.resize((width, fill_bottom), box=(0, resized.height, width, resized.height)), box=(0, fill_top + src_h))
+        if fill_left > 0:
+            res.paste(resized.resize((fill_left, height), box=(0, 0, 0, height)), box=(0, 0))
+        if fill_right > 0:
+            res.paste(resized.resize((fill_right, height), box=(resized.width, 0, resized.width, height)), box=(fill_left + src_w, 0))
 
     return res
 

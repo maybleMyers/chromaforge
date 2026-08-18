@@ -387,6 +387,14 @@ function selectVAE(vae) {
     desiredVAEName = vae;
 }
 
+function currentImg2imgExpandResolution() {
+    var args = Array.from(arguments);
+    var img = gradioApp().querySelector('#mode_img2img > div[style="display: block;"] :is(img, canvas)');
+    args[0] = img ? (img.naturalWidth || img.width) : 0;
+    args[1] = img ? (img.naturalHeight || img.height) : 0;
+    return args;
+}
+
 function currentImg2imgSourceResolution(w, h, r) {
     var img = gradioApp().querySelector('#mode_img2img > div[style="display: block;"] :is(img, canvas)');
     return img ? [img.naturalWidth || img.width, img.naturalHeight || img.height, r] : [0, 0, r];

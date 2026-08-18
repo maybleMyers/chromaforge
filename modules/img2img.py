@@ -234,10 +234,6 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     image = images.fix_image(image)
     mask = images.fix_image(mask)
 
-    #   Directional "Resize and fill": grow the canvas outward by a percentage per side and let the
-    #   model paint the new area. The expansion is done here, in one place, rather than inside
-    #   resize_image: that one contain-fits first, so an expansion which happens to preserve the
-    #   aspect ratio would silently upscale the picture instead of adding any new area at all.
     expanding = resize_mode == 2 and not is_batch and image is not None and mode != 1 \
         and any(float(pct) > 0 for pct in (fill_left, fill_right, fill_up, fill_down))
     fill_mask_rect = None

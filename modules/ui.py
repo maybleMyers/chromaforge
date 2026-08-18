@@ -1358,15 +1358,8 @@ def create_ui():
                                     scale_by.change(**on_change_args)
                                     button_update_resize_to.click(**on_change_args)
 
-                                    def updateWH (img, w, h):
-                                        if img and shared.opts.img2img_autosize == True:
-                                            return img.size[0], img.size[1]
-                                        else:
-                                            return w, h
-
                                     img_sources = [init_img.background, ref_edit_main_img, sketch.background, init_img_with_mask.background, inpaint_color_sketch.background, init_img_inpaint]
                                     for i in img_sources:
-                                        i.change(fn=updateWH, inputs=[i, width, height], outputs=[width, height], show_progress='hidden')
                                         i.change(**on_change_args)
 
                             tab_scale_to.select(fn=lambda: 0, inputs=[], outputs=[selected_scale_tab])
@@ -1444,8 +1437,40 @@ def create_ui():
                     if category not in {"accordions"}:
                         scripts.scripts_img2img.setup_ui_for_section(category)
 
+            def expand_target_size(src_w, src_h, l, r, u, d, w, h):
+                if not src_w or not src_h:
+                    return w, h
+
+                if any(float(pct) > 0 for pct in (l, r, u, d)):
+                    return modules.img2img.compute_expansion(int(src_w), int(src_h), l, r, u, d)[4:]
+
+                return (int(src_w), int(src_h)) if shared.opts.img2img_autosize else (w, h)
+
+            def updateWH(img, w, h, l, r, u, d):
+                if img is None:
+                    return w, h
+                return expand_target_size(img.size[0], img.size[1], l, r, u, d, w, h)
+
+            fill_sliders = [fill_left, fill_right, fill_up, fill_down]
+
+            for i in img_sources:
+                i.change(fn=updateWH, inputs=[i, width, height] + fill_sliders, outputs=[width, height], show_progress='hidden')
+
+            expand_size_args = dict(
+                fn=expand_target_size,
+                _js="currentImg2imgExpandResolution",
+                inputs=[dummy_component, dummy_component] + fill_sliders + [width, height],
+                outputs=[width, height],
+                show_progress=False,
+                queue=False,
+            )
+
+            for slider in fill_sliders:
+                slider.change(**expand_size_args)
+
+            resize_mode.change(**expand_size_args)
+
             def select_img2img_tab(tab):
-                #   3 Inpaint, 4 Inpaint sketch, 5 Inpaint upload; mask transparency is Inpaint sketch only
                 return gr.update(visible=tab in [3, 4, 5]), gr.update(visible=tab == 4),
 
             for i, elem in enumerate(img2img_tabs):

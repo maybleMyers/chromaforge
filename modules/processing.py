@@ -108,28 +108,33 @@ def blur_mask(image_mask, blur_x, blur_y):
     return image_mask
 
 
-def paint_fill_area(image_mask, fill_mask_rect, fill_mask_mode, overlap=0):
+def paint_fill_area(image_mask, fill_mask_rect, fill_mask_mode, blur_x=0, blur_y=0):
     """
     Paint the border created by a directional "Resize and fill" into an inpaint mask.
 
     fill_mask_rect is where the original image sits inside the expanded frame; everything outside it
-    is new. The painted area is grown `overlap` pixels *inward* so the model gets some of the original
-    picture to blend against instead of a hard seam - same trick as scripts/poor_mans_outpainting.py.
+    is new. The painted rectangle is grown *inward* by the blur radius before being feathered, so the
+    ramp lands inside the original picture and the new area stays fully masked - otherwise the model
+    only half-paints its own border. Same trick as scripts/poor_mans_outpainting.py.
+
+    The border is blurred on its own rather than the combined result, so whatever the user painted
+    keeps exactly the feathering their Mask blur asked for.
 
     fill_mask_mode 1 adds the new area to whatever the user masked, 2 masks the new area alone.
     """
 
     x1, y1, x2, y2 = fill_mask_rect
+    over_x, over_y = 2 * blur_x, 2 * blur_y
 
     keep = Image.new('L', image_mask.size, 0)
     ImageDraw.Draw(keep).rectangle(
-        (x1 + (overlap if x1 > 0 else 0),
-         y1 + (overlap if y1 > 0 else 0),
-         x2 - 1 - (overlap if x2 < image_mask.width else 0),
-         y2 - 1 - (overlap if y2 < image_mask.height else 0)),
+        (x1 + (over_x if x1 > 0 else 0),
+         y1 + (over_y if y1 > 0 else 0),
+         x2 - 1 - (over_x if x2 < image_mask.width else 0),
+         y2 - 1 - (over_y if y2 < image_mask.height else 0)),
         fill=255,
     )
-    border = ImageOps.invert(keep)
+    border = blur_mask(ImageOps.invert(keep), blur_x, blur_y)
 
     if fill_mask_mode == 2:
         return border
@@ -2062,8 +2067,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                 #   new area inside the overlay, and apply_overlay() would then composite the stretched
                 #   edge pixels straight back over whatever was generated there.
                 if self.fill_mask_mode and self.fill_mask_rect is not None:
-                    image_mask = paint_fill_area(image_mask, self.fill_mask_rect, self.fill_mask_mode, overlap=2 * max(self.mask_blur_x, self.mask_blur_y))
-                    image_mask = blur_mask(image_mask, self.mask_blur_x, self.mask_blur_y)
+                    image_mask = paint_fill_area(image_mask, self.fill_mask_rect, self.fill_mask_mode, self.mask_blur_x, self.mask_blur_y)
                     self.extra_generation_params["New area"] = ["", "added to mask", "masked alone"][self.fill_mask_mode]
 
                 np_mask = np.array(image_mask)

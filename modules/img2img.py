@@ -148,6 +148,41 @@ def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, 
     return batch_results
 
 
+def compute_expansion(src_w, src_h, pct_left, pct_right, pct_up, pct_down, snap=8):
+    """
+    Turn the four "expand by N%" sliders into per-side pixel counts and a target resolution.
+
+    Percentages are relative to the source dimension, so 1024 wide with right=50 gives 512px of new
+    canvas on the right. The target is snapped up to a multiple of `snap` because the VAE needs it;
+    the leftover goes to a side that is already growing, so an axis the user left alone gains at
+    most `snap - 1` pixels rather than a whole extra band.
+
+    Returns (left, right, up, down, target_w, target_h).
+    """
+
+    left, right = int(round(src_w * pct_left / 100.0)), int(round(src_w * pct_right / 100.0))
+    up, down = int(round(src_h * pct_up / 100.0)), int(round(src_h * pct_down / 100.0))
+
+    #   a side the user asked for must never round away to nothing
+    left, right = (max(left, 1) if pct_left > 0 else 0), (max(right, 1) if pct_right > 0 else 0)
+    up, down = (max(up, 1) if pct_up > 0 else 0), (max(down, 1) if pct_down > 0 else 0)
+
+    target_w = math.ceil((src_w + left + right) / snap) * snap
+    target_h = math.ceil((src_h + up + down) / snap) * snap
+
+    if right or not left:
+        right = target_w - src_w - left
+    else:
+        left = target_w - src_w - right
+
+    if down or not up:
+        down = target_h - src_h - up
+    else:
+        up = target_h - src_h - down
+
+    return left, right, up, down, target_w, target_h
+
+
 def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, ref_edit_main_img, ref_edit_img1, ref_edit_img2, ref_edit_img3, ref_edit_img4, ref_edit_img5, ref_edit_img6, ref_edit_lora_strength: float, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, zimage_shift: float, sigma_rescale_start: float, sigma_rescale_end: float, apg_enabled: bool, apg_eta: float, apg_momentum: float, apg_threshold: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, fill_left: float, fill_right: float, fill_up: float, fill_down: float, fill_mask_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, checkpoint_name: str, vae_te_modules: list, forge_preset_name: str, *args):
 
     override_settings = create_override_settings_dict(override_settings_texts)
@@ -199,6 +234,40 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     image = images.fix_image(image)
     mask = images.fix_image(mask)
 
+    #   Directional "Resize and fill": grow the canvas outward by a percentage per side and let the
+    #   model paint the new area. The expansion is done here, in one place, rather than inside
+    #   resize_image: that one contain-fits first, so an expansion which happens to preserve the
+    #   aspect ratio would silently upscale the picture instead of adding any new area at all.
+    expanding = resize_mode == 2 and not is_batch and image is not None and mode != 1 \
+        and any(float(pct) > 0 for pct in (fill_left, fill_right, fill_up, fill_down))
+    fill_mask_rect = None
+
+    if expanding:
+        src_w, src_h = image.size
+        left, right, up, down, width, height = compute_expansion(src_w, src_h, fill_left, fill_right, fill_up, fill_down)
+
+        assert width * height <= 8192 * 8192, 'Expansion produces an image that is too large'
+
+        image = images.expand_image(image, left, up, right, down)
+        fill_mask_rect = (left, up, left + src_w, up + src_h)
+
+        if mask is not None:
+            #   Rebuild the mask in the expanded frame, in the same shape modes 3/4 already produce,
+            #   so that a fully opaque alpha channel keeps create_binary_mask on the luminance path.
+            mask_l = images.expand_image(processing.create_binary_mask(mask), left, up, right, down, smear=False)
+            mask = Image.merge('RGBA', (mask_l, mask_l, mask_l, Image.new('L', mask_l.size, 255)))
+        elif fill_mask_mode:
+            #   No mask at all (img2img / Sketch): synthesise a blank one so the new area alone gets
+            #   regenerated, otherwise the whole picture is re-denoised and the original is lost.
+            blank = Image.new('L', (width, height), 0)
+            mask = Image.merge('RGBA', (blank, blank, blank, Image.new('L', blank.size, 255)))
+
+        if inpaint_full_res:
+            #   An expansion border touches every grown edge, so its bounding box is the whole frame
+            #   and "Only masked" degenerates into a lossy full-frame round trip. Both outpainting
+            #   scripts disable it for the same reason.
+            inpaint_full_res = False
+
     if selected_scale_tab == 1 and not is_batch:
         assert image, "Can't scale by because no image is selected"
 
@@ -246,6 +315,11 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
 
     p.scripts = modules.scripts.scripts_img2img
     p.script_args = args
+
+    if expanding:
+        p.fill_mask_rect = fill_mask_rect
+        p.fill_mask_mode = fill_mask_mode
+        p.extra_generation_params["Expand"] = f"{left},{right},{up},{down}"
 
     # Reference images for editing - pass both to processing.py for model-type detection
     # (Model isn't loaded yet here, so we can't check if it's Z-Image)

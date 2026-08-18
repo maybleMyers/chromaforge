@@ -54,6 +54,8 @@ canvas_head = ''
 canvas_head += web_css('canvas.css')
 canvas_head += web_js('canvas.min.js')
 canvas_head += web_js('canvas_keep_toolbar.js')
+canvas_head += web_css('canvas_crop.css')
+canvas_head += web_js('canvas_crop.js')
 
 
 def image_to_base64(image_array, numpy=True):

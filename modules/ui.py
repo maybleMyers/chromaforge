@@ -1311,6 +1311,19 @@ def create_ui():
                         with FormRow():
                             resize_mode = gr.Radio(label="Resize mode", elem_id="resize_mode", choices=["Just resize", "Crop and resize", "Resize and fill", "Just resize (latent upscale)"], type="index", value="Just resize")
 
+                        with FormGroup(elem_id="img2img_fill_direction", visible=False) as fill_direction_controls:
+                            with FormRow():
+                                fill_left = gr.Slider(label='Expand left %', minimum=0, maximum=200, step=1, value=0, elem_id="img2img_fill_left")
+                                fill_right = gr.Slider(label='Expand right %', minimum=0, maximum=200, step=1, value=0, elem_id="img2img_fill_right")
+                            with FormRow():
+                                fill_up = gr.Slider(label='Expand up %', minimum=0, maximum=200, step=1, value=0, elem_id="img2img_fill_up")
+                                fill_down = gr.Slider(label='Expand down %', minimum=0, maximum=200, step=1, value=0, elem_id="img2img_fill_down")
+                            with FormRow():
+                                fill_mask_mode = gr.Radio(label='New area', choices=['Leave mask unchanged', 'Add new area to mask', 'Mask only the new area'], type="index", value='Add new area to mask', elem_id="img2img_fill_mask_mode",
+                                                          info="Percentages grow the canvas outward and set the target size, overriding Width/Height. 'Leave mask unchanged' composites the old edge back over the new area, so it will not outpaint.")
+
+                        resize_mode.change(fn=lambda m: gr.update(visible=(m == 2)), inputs=[resize_mode], outputs=[fill_direction_controls], queue=False, show_progress=False)
+
                     elif category == "dimensions":
                         with FormRow():
                             with gr.Column(elem_id="img2img_column_size", scale=4):
@@ -1488,6 +1501,11 @@ def create_ui():
                 width,
                 scale_by,
                 resize_mode,
+                fill_left,
+                fill_right,
+                fill_up,
+                fill_down,
+                fill_mask_mode,
                 inpaint_full_res,
                 inpaint_full_res_padding,
                 inpainting_mask_invert,

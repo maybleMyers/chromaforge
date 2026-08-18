@@ -1,0 +1,93 @@
+/* Drag-to-crop overlay for ForgeCanvas. Kept out of canvas.css so the widget's own styling
+   stays pristine and this can be dropped by removing one line from canvas.py. */
+
+.forge-crop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    overflow: hidden;
+    cursor: crosshair;
+    touch-action: none;
+}
+
+.forge-crop-sel {
+    position: absolute;
+    box-sizing: border-box;
+    cursor: move;
+    outline: 1px dashed #fff;
+    /* one element dims everything outside the selection, no four-rect bookkeeping */
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 0 9999px rgba(0, 0, 0, 0.55);
+}
+
+.forge-crop-handle {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    background: #fff;
+    border: 1px solid #444;
+    border-radius: 2px;
+}
+
+.forge-crop-nw { left: -5px;                top: -5px;                 cursor: nwse-resize; }
+.forge-crop-n  { left: calc(50% - 5px);     top: -5px;                 cursor: ns-resize; }
+.forge-crop-ne { right: -5px;               top: -5px;                 cursor: nesw-resize; }
+.forge-crop-e  { right: -5px;               top: calc(50% - 5px);      cursor: ew-resize; }
+.forge-crop-se { right: -5px;               bottom: -5px;              cursor: nwse-resize; }
+.forge-crop-s  { left: calc(50% - 5px);     bottom: -5px;              cursor: ns-resize; }
+.forge-crop-sw { left: -5px;                bottom: -5px;              cursor: nesw-resize; }
+.forge-crop-w  { left: -5px;                top: calc(50% - 5px);      cursor: ew-resize; }
+
+.forge-crop-size {
+    position: absolute;
+    left: 0;
+    top: -22px;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-family: monospace;
+    white-space: nowrap;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 3px;
+    pointer-events: none;
+}
+
+.forge-crop-bar {
+    position: absolute;
+    left: 50%;
+    bottom: 10px;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 8px;
+    font-size: 12px;
+    color: #eee;
+    white-space: nowrap;
+    background: rgba(20, 20, 20, 0.85);
+    border-radius: 4px;
+    cursor: default;
+}
+
+.forge-crop-bar button {
+    padding: 2px 8px;
+    color: #eee;
+    background: #3a3a3a;
+    border: 1px solid #555;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.forge-crop-bar button:hover {
+    background: #4a4a4a;
+}
+
+.forge-crop-bar label {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    cursor: pointer;
+}
+
+.forge-crop-btn.forge-crop-active {
+    outline: 2px solid #2a9df4;
+}

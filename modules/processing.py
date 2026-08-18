@@ -1964,7 +1964,6 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     init_images: list = None
     resize_mode: int = 0
-    resize_fill_bias: tuple = (0.5, 0.5)    #   where "Resize and fill" puts the empty space; see images.resize_image
     fill_mask_rect: tuple = None            #   (x1, y1, x2, y2) of the original image inside the expanded frame
     fill_mask_mode: int = 0                 #   0 leave mask alone, 1 add the new area to it, 2 mask only the new area
     denoising_strength: float = 0.75
@@ -2056,7 +2055,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                     self.sd_model.comments.append(massage)
                     logging.info(massage)
             else:
-                image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height, fill_bias=self.resize_fill_bias)
+                image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height)
 
                 #   Must happen here: mask_for_overlay below, and latent_mask further down, are both
                 #   derived from image_mask. Painting the expanded border in any later would leave the
@@ -2092,11 +2091,11 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
             image = images.flatten(img, opts.img2img_background_color)
 
             if crop_region is None and self.resize_mode != 3:
-                image = images.resize_image(self.resize_mode, image, self.width, self.height, fill_bias=self.resize_fill_bias)
+                image = images.resize_image(self.resize_mode, image, self.width, self.height)
 
             if image_mask is not None:
                 if self.mask_for_overlay.size != (image.width, image.height):
-                    self.mask_for_overlay = images.resize_image(self.resize_mode, self.mask_for_overlay, image.width, image.height, fill_bias=self.resize_fill_bias)
+                    self.mask_for_overlay = images.resize_image(self.resize_mode, self.mask_for_overlay, image.width, image.height)
                 image_masked = Image.new('RGBa', (image.width, image.height))
                 image_masked.paste(image.convert("RGBA").convert("RGBa"), mask=ImageOps.invert(self.mask_for_overlay.convert('L')))
 

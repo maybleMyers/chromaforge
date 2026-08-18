@@ -3634,13 +3634,23 @@ def create_ui():
             outputs=[status_display],
         )
 
+        # The turn being sent is captured into state before the composer is
+        # cleared, so the streaming step below never has to write back to the
+        # message box or the dropzone - leaving both free to type into and drop
+        # onto while the model is still generating.
+        pending_msg = gr.State("")
+        pending_media = gr.State([])
+
+        def start_send(msg, media):
+            """Take the pending turn, then empty the composer: message box,
+            media state, dropzone and preview all reset in one shot."""
+            return msg, list(media or []), "", [], None, vlm_media_preview_html([])
+
         def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
             media = list(media or [])
-            # The gallery empties after a send: state, dropzone and preview all reset.
-            cleared = ([], None, vlm_media_preview_html([]))
 
             if not msg.strip() and not media:
-                yield history, "", *cleared, "", ""
+                yield history, "", ""
                 return
 
             # Stream responses from chat_handler generator
@@ -3649,29 +3659,30 @@ def create_ui():
                 max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
                 think_mode
             ):
-                yield new_history, "", *cleared, stats, ctx_info
+                yield new_history, stats, ctx_info
 
         chat_media_outputs = [chat_media_state, chat_media_files, chat_media_preview]
 
+        start_send_outputs = [pending_msg, pending_media, msg_input, *chat_media_outputs]
+
         send_inputs = [
-            msg_input, chatbot, system_prompt,
-            chat_media_state,
+            pending_msg, chatbot, system_prompt,
+            pending_media,
             max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
             thinking_mode
         ]
-        send_outputs = [chatbot, msg_input, *chat_media_outputs, stats_display, context_display]
+        send_outputs = [chatbot, stats_display, context_display]
 
-        send_btn.click(
-            fn=send_message,
-            inputs=send_inputs,
-            outputs=send_outputs,
-        )
-
-        msg_input.submit(
-            fn=send_message,
-            inputs=send_inputs,
-            outputs=send_outputs,
-        )
+        for send_trigger in (send_btn.click, msg_input.submit):
+            send_trigger(
+                fn=start_send,
+                inputs=[msg_input, chat_media_state],
+                outputs=start_send_outputs,
+            ).then(
+                fn=send_message,
+                inputs=send_inputs,
+                outputs=send_outputs,
+            )
 
         def add_chat_media(state_files, uploaded):
             """Append newly dropped files to the accumulated set, then clear the dropzone

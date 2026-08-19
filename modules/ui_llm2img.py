@@ -33,7 +33,9 @@ DEFAULTS = {
     'server_port': 8080,
     'llama_server_path': "llama.cpp/build/bin/llama-server",
 
-    'max_tokens': 2048,
+    #   A thinking model spends this budget on its reasoning before it writes a word of the
+    #   answer, so 2048 routinely left the review cut off mid-critique with no prompt in it.
+    'max_tokens': 8192,
     'temperature': 0.7,
     'top_p': 0.95,
     'repeat_penalty': 1.0,
@@ -231,7 +233,8 @@ def create_llm2img_interface():
             with gr.Accordion("LLM Generation Settings", open=False):
                 with FormRow():
                     max_tokens = gr.Slider(minimum=64, maximum=262048, step=64, label="Max New Tokens",
-                                           value=saved['max_tokens'], elem_id="llm2img_max_tokens")
+                                           value=saved['max_tokens'], elem_id="llm2img_max_tokens",
+                                           info="Shared by the reasoning and the answer — too low and the review is cut off before it reaches the revised prompt")
                     temperature = gr.Slider(minimum=0.0, maximum=2.0, step=0.05, label="Temperature",
                                             value=saved['temperature'], elem_id="llm2img_temperature")
                     top_p = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, label="Top P",

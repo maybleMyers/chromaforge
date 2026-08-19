@@ -76,6 +76,14 @@ MAX_REVIEW_IMAGES = 100
 #   cannot render that fast anyway.
 STREAM_PUSH_INTERVAL = 0.15
 
+#   Shown whenever a reply arrives without a usable prompt in it. On a thinking model the
+#   reasoning and the answer come out of the same Max New Tokens budget, so a budget that
+#   looks generous can still leave the answer cut off a few words in.
+_TRUNCATION_HINT = (
+    "If the reply in the console stops mid-sentence, raise **Max New Tokens** — on a "
+    "thinking model the reasoning eats the same budget as the answer."
+)
+
 
 DEFAULT_WRITER_SYSTEM_PROMPT = """You write prompts for a text-to-image diffusion model.
 
@@ -97,7 +105,7 @@ went wrong: missing or wrong subject matter, anatomy and structure errors, muddy
 composition, flat or inconsistent lighting, wrong style, artefacts, sameness across the \
 batch.
 
-Reply in exactly this shape:
+Reply in exactly this shape, and always finish with the fenced block:
 
 CRITIQUE:
 <three to six short bullet points on what this batch got right and wrong>
@@ -106,8 +114,10 @@ CRITIQUE:
 <the full revised prompt, self-contained, ready to paste into the model>
 ```
 
-The revised prompt must be a complete prompt, not a diff or a list of changes. Keep what \
-worked, fix what did not."""
+Keep the critique brief — the fenced prompt is the part that matters, and a reply that \
+runs out of room before reaching it is wasted. The revised prompt must be a complete \
+prompt, not a diff or a list of changes, and it must still deliver the user's original \
+idea. Keep what worked, fix what did not."""
 
 
 def _manager():
@@ -240,40 +250,64 @@ def _run_llm(cfg, messages):
         yield text
 
 
-_FENCE_RE = re.compile(r"```(?:[\w+-]*)\n(.*?)```", re.DOTALL)
-_LABEL_RE = re.compile(r"^\s*(?:revised\s+)?prompt\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_FENCE_RE = re.compile(r"```(?:[\w+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+#   DOTALL so a multi-line prompt after the label is taken whole - anchoring on $ instead
+#   would silently keep only its first line.
+_LABEL_RE = re.compile(r"^[ \t]*(?:revised |final |new |updated )?prompt\s*:[ \t]*\n?(.+)\Z",
+                       re.IGNORECASE | re.MULTILINE | re.DOTALL)
+_CRITIQUE_RE = re.compile(r"^\s*(?:critique|review|analysis|notes)\s*:", re.IGNORECASE)
 
 
 def extract_prompt(text):
-    """Pull the image prompt out of a model reply.
+    """Pull the image prompt out of a model reply, or "" when there isn't one.
 
-    Models are asked for a fenced block, but they wander: sometimes a "PROMPT:" line,
-    sometimes just the prompt as the final paragraph. Try each in turn rather than
-    failing the round.
+    Returning "" rather than guessing is the point. There used to be a "just take the last
+    paragraph" fallback, and when a reply was cut short - a thinking model spends the same
+    Max New Tokens budget on its reasoning and its answer, so the answer is what gets
+    truncated - that fallback happily handed back a fragment of the critique and the next
+    round generated images from "CRITIQUE:\\n- Style and". The caller now keeps the prompt
+    it already had and says so.
     """
     if not text:
         return ""
 
     text = vlm_llamacpp.strip_reasoning_for_context(text)
 
-    fences = _FENCE_RE.findall(text)
-    if fences:
-        #   Last fence: a chatty model puts the critique first and the prompt last.
-        return fences[-1].strip()
+    def acceptable(candidate):
+        candidate = (candidate or "").strip().strip("`").strip()
+        if not candidate or _CRITIQUE_RE.match(candidate):
+            return None
+        return candidate
 
-    labelled = _LABEL_RE.findall(text)
+    #   Last fence: a chatty model puts the critique first and the prompt last.
+    for fence in reversed(_FENCE_RE.findall(text)):
+        found = acceptable(fence)
+        if found:
+            return found
+
+    labelled = _LABEL_RE.search(text)
     if labelled:
-        return labelled[-1].strip()
+        found = acceptable(labelled.group(1))
+        if found:
+            return found
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    if paragraphs:
-        return paragraphs[-1]
-
-    return text.strip()
+    return ""
 
 
-def _build_review_message(prompt_used, images, limit):
-    """One user turn holding the batch plus the prompt that produced it."""
+def _report_unparsed(kind, text):
+    """Say why a round could not move on, in the console where the reply is visible."""
+    tail = (text or "").strip()[-400:]
+    print(f"[llm2img] No prompt found in the {kind} reply ({len(text or '')} chars). "
+          f"Tail of the reply:\n...{tail}")
+
+
+def _build_review_message(idea, prompt_used, images, limit):
+    """One user turn holding the batch, the prompt that produced it, and the original idea.
+
+    The idea has to be repeated every round. The reviewer only ever sees one prompt and one
+    batch, so without it each revision is judged against the previous revision and the run
+    drifts away from what was actually asked for.
+    """
     content = []
     for image in images[:limit]:
         content.append({"type": "image", "image": image})
@@ -283,7 +317,13 @@ def _build_review_message(prompt_used, images, limit):
     if len(images) > shown:
         note = f" (showing the first {shown} of {len(images)})"
 
+    goal = ""
+    if idea and idea.strip():
+        goal = ("The user asked for this, and every revision must still serve it:\n\n"
+                f"{idea.strip()}\n\n")
+
     content.append({"type": "text", "text": (
+        f"{goal}"
         f"These {shown} image(s){note} were generated from this prompt:\n\n"
         f"{prompt_used}\n\n"
         "Review the batch and give me the revised prompt."
@@ -524,7 +564,13 @@ def llm2img_run(id_task, request, script_runner, *args):
                 written = extract_prompt(reply)
                 if written:
                     prompt = written
-                log_lines[-1] = f"**Prompt**\n\n```\n{prompt}\n```"
+                    log_lines[-1] = f"**Prompt**\n\n```\n{prompt}\n```"
+                else:
+                    _report_unparsed("prompt-writer", reply)
+                    log_lines[-1] = (
+                        "**No prompt found in the reply** — using whatever is in the prompt "
+                        f"box instead. {_TRUNCATION_HINT}"
+                    )
             elif round_no == 1:
                 log_lines.append(
                     "No idea given, so round 1 uses the prompt already in the prompt box."
@@ -586,13 +632,19 @@ def llm2img_run(id_task, request, script_runner, *args):
             log_lines.append(f"**Reviewing {min(len(images), review_limit)} image(s)…**")
             yield from stream_llm(
                 cfg['reviewer_system_prompt'],
-                _build_review_message(prompt, list(images), review_limit),
+                _build_review_message(cfg['idea'], prompt, list(images), review_limit),
             )
 
             log_lines[-1] = f"**Review**\n\n{reply.strip()}"
             revised = extract_prompt(reply)
             if revised:
                 prompt = revised
+            else:
+                _report_unparsed("review", reply)
+                log_lines.append(
+                    "**No revised prompt in that review** — keeping the current prompt for "
+                    f"the next round. {_TRUNCATION_HINT}"
+                )
             yield snapshot()
 
             if not cfg['keep_llm_loaded']:

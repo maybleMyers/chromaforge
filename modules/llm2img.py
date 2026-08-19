@@ -71,6 +71,11 @@ N_LLM_INPUTS = len(LLM_ARG_NAMES)
 #   slider, bounded by this.
 MAX_REVIEW_IMAGES = 100
 
+#   Minimum wall-clock gap between pushes of a partial LLM reply to the browser. The model
+#   produces ~60 tokens/s; a yield per token means a round trip per token, and the browser
+#   cannot render that fast anyway.
+STREAM_PUSH_INTERVAL = 0.15
+
 
 DEFAULT_WRITER_SYSTEM_PROMPT = """You write prompts for a text-to-image diffusion model.
 
@@ -443,6 +448,36 @@ def llm2img_run(id_task, request, script_runner, *args):
         body = "\n\n".join(log_lines + ([extra] if extra else []))
         return gallery, json.dumps(geninfo), infotext_html, html_log, body, prompt
 
+    def streaming_snapshot(extra):
+        """A yield that only advances the round log.
+
+        Everything else is gr.update(), i.e. "leave this component alone". Returning the
+        gallery here instead costs about 100ms per token, because gradio re-encodes every
+        PIL image in it on each yield - enough to turn a 26s review into a 181s one.
+        """
+        keep = gr.update()
+        body = "\n\n".join(log_lines + ([extra] if extra else []))
+        return keep, keep, keep, keep, body, keep
+
+    reply = ""
+
+    def stream_llm(system_prompt, *turns):
+        """Run one LLM turn, pushing the partial reply into the round log as it arrives.
+
+        Leaves the finished text in `reply`. Pushes are rate-limited: the model emits ~60
+        tokens a second and the browser cannot make use of more than a few frames of that.
+        """
+        nonlocal reply
+        reply = ""
+        last_push = 0.0
+        for reply in _run_llm(cfg, _messages(system_prompt, *turns)):
+            now = time.perf_counter()
+            if now - last_push >= STREAM_PUSH_INTERVAL:
+                last_push = now
+                yield streaming_snapshot(_quoted(reply))
+            if _interrupted():
+                break
+
     if not VLM_AVAILABLE:
         log_lines.append(f"**LLM backend unavailable.** `vlm_llamacpp.py` failed to import: `{VLM_IMPORT_ERROR}`")
         yield snapshot()
@@ -465,31 +500,31 @@ def llm2img_run(id_task, request, script_runner, *args):
             log_lines.append(f"### Round {round_no} of {rounds}")
             yield snapshot()
 
-            # -- 1. make room for the LLM, then bring it up -----------------------------
-            if cfg['unload_diffusion']:
-                unload_diffusion_models()
+            # -- 1+2. the prompt for this round -----------------------------------------
+            #   Only round 1 needs the LLM here; later rounds already hold the prompt the
+            #   previous round's review produced, so starting the server would just cost a
+            #   load and an unload for nothing.
+            needs_writer = round_no == 1 and cfg['idea'] and cfg['idea'].strip()
 
-            status = start_server(cfg)
-            if isinstance(status, str) and status.startswith("Error"):
-                log_lines.append(f"**Could not start llama-server:** {status}")
-                yield snapshot()
-                return
+            if needs_writer:
+                if cfg['unload_diffusion']:
+                    unload_diffusion_models()
 
-            # -- 2. the prompt for this round -------------------------------------------
-            if round_no == 1 and cfg['idea'] and cfg['idea'].strip():
+                status = start_server(cfg)
+                if isinstance(status, str) and status.startswith("Error"):
+                    log_lines.append(f"**Could not start llama-server:** {status}")
+                    yield snapshot()
+                    return
+
                 log_lines.append("**Writing the prompt…**")
-                reply = ""
-                for reply in _run_llm(cfg, _messages(
+                yield from stream_llm(
                     cfg['writer_system_prompt'],
                     {"role": "user", "content": cfg['idea'].strip()},
-                )):
-                    yield snapshot(_fenced(reply))
-                    if _interrupted():
-                        break
+                )
                 written = extract_prompt(reply)
                 if written:
                     prompt = written
-                log_lines.append(f"**Prompt**\n\n```\n{prompt}\n```")
+                log_lines[-1] = f"**Prompt**\n\n```\n{prompt}\n```"
             elif round_no == 1:
                 log_lines.append(
                     "No idea given, so round 1 uses the prompt already in the prompt box."
@@ -510,6 +545,7 @@ def llm2img_run(id_task, request, script_runner, *args):
             # -- 3. hand the VRAM back to the diffusion model ---------------------------
             if not cfg['keep_llm_loaded']:
                 stop_server()
+            #   Round 2 onward never started the server above, so nothing to stop.
 
             # -- 4. generate -------------------------------------------------------------
             img_args[arg_index('prompt')] = prompt
@@ -548,14 +584,10 @@ def llm2img_run(id_task, request, script_runner, *args):
                 )
 
             log_lines.append(f"**Reviewing {min(len(images), review_limit)} image(s)…**")
-            reply = ""
-            for reply in _run_llm(cfg, _messages(
+            yield from stream_llm(
                 cfg['reviewer_system_prompt'],
                 _build_review_message(prompt, list(images), review_limit),
-            )):
-                yield snapshot(_fenced(reply))
-                if _interrupted():
-                    break
+            )
 
             log_lines[-1] = f"**Review**\n\n{reply.strip()}"
             revised = extract_prompt(reply)
@@ -581,8 +613,8 @@ def llm2img_run(id_task, request, script_runner, *args):
             stop_server()
 
 
-def _fenced(text):
-    """Render a partial LLM reply as a quoted block in the round log."""
+def _quoted(text):
+    """Render a partial LLM reply as a blockquote in the round log."""
     if not text:
         return ""
     return "\n".join("> " + line for line in text.strip().split("\n"))

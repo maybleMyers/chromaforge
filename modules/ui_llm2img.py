@@ -8,6 +8,7 @@ import os
 
 import gradio as gr
 
+import modules.infotext_utils as parameters_copypaste
 from modules import llm2img, scripts, shared, ui_extra_networks, ui_toprow
 from modules.paths_internal import script_path
 from modules.ui_components import FormRow
@@ -92,10 +93,35 @@ SAVEABLE_IMG_ARGS = [
 ]
 
 
+#   Values a component can round-trip through JSON. Anything else (a PIL image, a file
+#   handle an extension parked in a State) is skipped rather than blowing up the save.
+_JSON_SAFE = (str, int, float, bool, type(None))
+
+
+def _json_safe(value):
+    if isinstance(value, _JSON_SAFE):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_safe(v) for k, v in value.items())
+    return False
+
+
+def script_arg_key(component, index):
+    """A key for a script arg that survives extensions being added or reordered.
+
+    elem_id is stable and unique per tab (see ScriptRunner.initialize_scripts); the
+    positional fallback is only for components that never got one.
+    """
+    return getattr(component, "elem_id", None) or f"#{index}"
+
+
 def load_settings():
-    """Returns (llm settings, image settings), both already merged over the defaults."""
+    """Returns (llm settings, image settings, script args), merged over the defaults."""
     settings = dict(DEFAULTS)
     image = {}
+    script_args = {}
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -105,23 +131,41 @@ def load_settings():
                 stored_image = saved.get("image")
                 if isinstance(stored_image, dict):
                     image = {k: v for k, v in stored_image.items() if k in SAVEABLE_IMG_ARGS}
+                stored_scripts = saved.get("scripts")
+                if isinstance(stored_scripts, dict):
+                    script_args = stored_scripts
             print(f"[llm2img] Settings loaded from {SETTINGS_FILE}")
     except Exception as e:
         print(f"[llm2img] Could not read {SETTINGS_FILE}: {e}; using defaults")
-    return settings, image
+    return settings, image, script_args
 
 
-def save_settings(*values):
-    """Persist the whole page: the LLM args first, then SAVEABLE_IMG_ARGS."""
-    n = len(llm2img.LLM_ARG_NAMES)
-    settings = dict(zip(llm2img.LLM_ARG_NAMES, values[:n]))
-    settings["image"] = dict(zip(SAVEABLE_IMG_ARGS, values[n:]))
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-        return f"Saved {len(values)} settings to {os.path.basename(SETTINGS_FILE)}"
-    except Exception as e:
-        return f"Error saving settings: {e}"
+def make_save_settings(script_arg_keys):
+    """Build the Save handler. Inputs arrive as LLM args, then image args, then script args
+    (sampler, steps, scheduler, seed, and whatever extensions contribute)."""
+
+    def save_settings(*values):
+        n_llm = len(llm2img.LLM_ARG_NAMES)
+        n_img = len(SAVEABLE_IMG_ARGS)
+
+        settings = dict(zip(llm2img.LLM_ARG_NAMES, values[:n_llm]))
+        settings["image"] = dict(zip(SAVEABLE_IMG_ARGS, values[n_llm:n_llm + n_img]))
+        settings["scripts"] = {
+            key: value
+            for key, value in zip(script_arg_keys, values[n_llm + n_img:])
+            if _json_safe(value)
+        }
+
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return f"Error saving settings: {e}"
+
+        total = len(settings) - 2 + len(settings["image"]) + len(settings["scripts"])
+        return f"Saved {total} settings to {os.path.basename(SETTINGS_FILE)}"
+
+    return save_settings
 
 
 def _restorable(component, value):
@@ -151,10 +195,10 @@ def _own_the_value(component):
 def create_llm2img_interface():
     """Build the LLM2img tab. Returns the gr.Blocks for modules.ui to register."""
 
-    saved, saved_image = load_settings()
+    saved, saved_image, saved_scripts = load_settings()
 
     scripts.scripts_current = scripts.scripts_llm2img
-    scripts.scripts_llm2img.initialize_scripts(is_img2img=True)
+    scripts.scripts_llm2img.initialize_scripts(is_img2img=True, tabname="llm2img")
 
     llm_components = {}
 
@@ -399,11 +443,35 @@ def create_llm2img_interface():
         for name in llm2img.LLM_ARG_NAMES:
             _own_the_value(llm_components[name])
 
+        #   Re-register the paste destination with the idea box appended, so an image sent
+        #   from PNG Info (or another gallery) restores the concept it was generated from
+        #   alongside the prompt and the rest of the parameters.
+        parameters_copypaste.add_paste_fields(
+            "llm2img",
+            img_components['init_img'],
+            list(panel.paste_fields) + [
+                parameters_copypaste.PasteField(llm_components['idea'], llm2img.IDEA_INFOTEXT_KEY),
+            ],
+            img_components['override_settings_texts'],
+        )
+
+        #   Sampling steps, sampler, scheduler and seed live in the script accordions, not
+        #   in submit_inputs' named section, so "save everything on the page" has to reach
+        #   them too. ui-config only ever stores their build-time defaults.
+        script_arg_keys = [script_arg_key(c, i) for i, c in enumerate(panel.custom_inputs)]
+        for key, component in zip(script_arg_keys, panel.custom_inputs):
+            if key in saved_scripts:
+                restored = _restorable(component, saved_scripts[key])
+                if restored is not None:
+                    component.value = restored
+                    _own_the_value(component)
+
         llm_components['_save_btn'].click(
-            fn=save_settings,
+            fn=make_save_settings(script_arg_keys),
             inputs=(
                 [llm_components[name] for name in llm2img.LLM_ARG_NAMES]
                 + [img_components[name] for name in SAVEABLE_IMG_ARGS]
+                + list(panel.custom_inputs)
             ),
             outputs=[llm_components['_save_status']],
             show_progress=False,

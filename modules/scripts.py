@@ -339,7 +339,7 @@ class Script:
         """helper function to generate id for a HTML element, constructs final id out of script name, tab and user-supplied item_id"""
 
         need_tabname = self.show(True) == self.show(False)
-        tabkind = 'img2img' if self.is_img2img else 'txt2img'
+        tabkind = self.tabname or ('img2img' if self.is_img2img else 'txt2img')
         tabname = f"{tabkind}_" if need_tabname else ""
         title = re.sub(r'[^a-z_0-9]', '', re.sub(r'\s', '_', self.title().lower()))
 
@@ -359,7 +359,7 @@ class ScriptBuiltinUI(Script):
         """helper function to generate id for a HTML element, constructs final id out of tab and user-supplied item_id"""
 
         need_tabname = self.show(True) == self.show(False)
-        tabname = ('img2img' if self.is_img2img else 'txt2img') + "_" if need_tabname else ""
+        tabname = (self.tabname or ('img2img' if self.is_img2img else 'txt2img')) + "_" if need_tabname else ""
 
         return f'{tabname}{item_id}'
 
@@ -588,7 +588,7 @@ class ScriptRunner:
         self.on_after_component_elem_id = {}
         """dict of callbacks to be called after an element is created; key=elem_id, value=list of callbacks"""
 
-    def initialize_scripts(self, is_img2img):
+    def initialize_scripts(self, is_img2img, tabname=None):
         from modules import scripts_auto_postprocessing
 
         self.scripts.clear()
@@ -607,7 +607,11 @@ class ScriptRunner:
             script.filename = script_data.path
             script.is_txt2img = not is_img2img
             script.is_img2img = is_img2img
-            script.tabname = "img2img" if is_img2img else "txt2img"
+            #   Scripts build their elem_ids from tabname. A second img2img-style panel
+            #   (LLM2img) must not reuse "img2img", or both panels emit the same DOM ids and
+            #   share one set of ui-config keys - and the seed script's reuse button binds
+            #   to the wrong tab's generation_info.
+            script.tabname = tabname or ("img2img" if is_img2img else "txt2img")
 
             visibility = script.show(script.is_img2img)
 

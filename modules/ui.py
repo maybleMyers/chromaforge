@@ -1230,6 +1230,17 @@ def create_ui():
     with gr.Blocks(analytics_enabled=False) as extras_interface:
         ui_postprocessing.create_ui()
 
+    #   Built here rather than down with the interfaces list: the PNG Info tab below offers
+    #   a "Send to llm2img" button only if this tab registered itself as a paste
+    #   destination, so it has to exist first.
+    llm2img_interface = None
+    try:
+        from modules import ui_llm2img
+        llm2img_interface = ui_llm2img.create_llm2img_interface()
+    except Exception:
+        from modules import errors
+        errors.report("Could not load LLM2img tab", exc_info=True)
+
     with gr.Blocks(analytics_enabled=False) as pnginfo_interface:
         with ResizeHandleRow(equal_height=False):
             with gr.Column(variant='panel'):
@@ -1240,7 +1251,13 @@ def create_ui():
                 generation_info = gr.Textbox(visible=False, elem_id="pnginfo_generation_info")
                 html2 = gr.HTML()
                 with gr.Row():
-                    buttons = parameters_copypaste.create_buttons(["txt2img", "img2img", "inpaint", "extras"])
+                    #   "llm2img" only exists if that tab loaded; sending to a destination
+                    #   with no registered paste fields is a KeyError in
+                    #   connect_paste_params_buttons().
+                    pnginfo_targets = ["txt2img", "img2img", "inpaint", "extras"]
+                    if "llm2img" in parameters_copypaste.paste_fields:
+                        pnginfo_targets.insert(2, "llm2img")
+                    buttons = parameters_copypaste.create_buttons(pnginfo_targets)
 
                 for tabname, button in buttons.items():
                     parameters_copypaste.register_paste_params_button(parameters_copypaste.ParamBinding(
@@ -1269,13 +1286,9 @@ def create_ui():
         (modelmerger_ui.blocks, "Checkpoint Merger", "modelmerger"),
     ]
 
-    # Add the LLM2img tab, right after Img2img whose options it clones
-    try:
-        from modules import ui_llm2img
-        interfaces.insert(2, (ui_llm2img.create_llm2img_interface(), "LLM2img", "llm2img"))
-    except Exception:
-        from modules import errors
-        errors.report("Could not load LLM2img tab", exc_info=True)
+    # Place LLM2img right after Img2img, whose options it clones
+    if llm2img_interface is not None:
+        interfaces.insert(2, (llm2img_interface, "LLM2img", "llm2img"))
 
     # Add Z-Image i2L tab if available
     try:

@@ -25,7 +25,7 @@ from contextlib import closing
 
 import gradio as gr
 
-from modules import call_queue, progress, shared
+from modules import call_queue, progress, script_callbacks, shared
 from modules.paths_internal import script_path
 from modules.shared import opts
 from modules.ui_img2img_panel import IMG2IMG_ARG_NAMES, arg_index
@@ -478,6 +478,52 @@ def _txt2img_from_img2img_args(id_task, request, img_args, script_runner):
     )
 
 
+#   Infotext key the idea travels under, so PNG Info can hand it back to the tab.
+IDEA_INFOTEXT_KEY = "LLM2img idea"
+
+#   Set for the duration of a run. The idea is not part of any StableDiffusionProcessing
+#   field, and the img2img path builds its own `p` out of reach, so it is stamped onto the
+#   image on its way to disk instead.
+_active_idea = None
+
+
+def _stamp_idea_into_pnginfo(params):
+    """on_before_image_saved: append the run's idea to the image's parameters block."""
+    if not _active_idea or not params.pnginfo:
+        return
+
+    from modules import infotext_utils
+
+    text = params.pnginfo.get("parameters")
+    if not text or IDEA_INFOTEXT_KEY in text:
+        return
+    params.pnginfo["parameters"] = f"{text}, {IDEA_INFOTEXT_KEY}: {infotext_utils.quote(_active_idea)}"
+
+
+script_callbacks.on_before_image_saved(_stamp_idea_into_pnginfo)
+
+
+def _append_idea_to_infotexts(round_js, idea):
+    """Same idea, added to the in-memory infotexts, so sending straight from the gallery
+    carries it as well as sending from a saved file."""
+    if not idea:
+        return round_js
+
+    from modules import infotext_utils
+
+    data = _round_geninfo(round_js)
+    texts = data.get("infotexts")
+    if not texts:
+        return round_js
+
+    suffix = f", {IDEA_INFOTEXT_KEY}: {infotext_utils.quote(idea)}"
+    data["infotexts"] = [
+        text + suffix if text and IDEA_INFOTEXT_KEY not in text else text
+        for text in texts
+    ]
+    return json.dumps(data)
+
+
 def _round_geninfo(round_js):
     try:
         return json.loads(round_js) if round_js else {}
@@ -576,6 +622,9 @@ def llm2img_run(id_task, request, script_runner, *args):
 
     started = time.perf_counter()
 
+    global _active_idea
+    _active_idea = (cfg['idea'] or "").strip() or None
+
     try:
         for round_no in range(1, rounds + 1):
             if _interrupted():
@@ -647,6 +696,7 @@ def llm2img_run(id_task, request, script_runner, *args):
             images, round_js, infotext_html, html_log = _generate_batch(
                 id_task, request, img_args, script_runner
             )
+            round_js = _append_idea_to_infotexts(round_js, _active_idea)
             geninfo = _merge_generation_info(geninfo, round_js, len(images))
             gallery = gallery + list(images)
             #   With more than one image, processing puts a contact-sheet grid at the front
@@ -723,6 +773,7 @@ def llm2img_run(id_task, request, script_runner, *args):
         yield snapshot()
 
     finally:
+        _active_idea = None
         if not cfg.get('keep_llm_loaded'):
             stop_server()
 

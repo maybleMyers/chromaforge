@@ -2305,6 +2305,7 @@ def save_settings(
     show_thinking: bool,
     reasoning_level: str,
     thinking_mode: bool,
+    keep_reasoning: bool,
     # Batch Caption Settings
     batch_system_prompt: str,
     batch_prompt: str,
@@ -2338,6 +2339,7 @@ def save_settings(
         "show_thinking": show_thinking,
         "reasoning_level": reasoning_level,
         "thinking_mode": thinking_mode,
+        "keep_reasoning": keep_reasoning,
         # Batch Caption Settings
         "batch_system_prompt": batch_system_prompt,
         "batch_prompt": batch_prompt,
@@ -3725,7 +3727,7 @@ def create_ui():
             media state, dropzone and preview all reset in one shot."""
             return msg, list(media or []), "", [], None, vlm_media_preview_html([])
 
-        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode):
+        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason):
             media = list(media or [])
 
             if not msg.strip() and not media:
@@ -3736,7 +3738,7 @@ def create_ui():
             for new_history, _, stats, ctx_info in chat_handler(
                 msg, history, sys_prompt, media,
                 max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
-                think_mode
+                think_mode, keep_reason
             ):
                 yield new_history, stats, ctx_info
 
@@ -3748,7 +3750,7 @@ def create_ui():
             pending_msg, chatbot, system_prompt,
             pending_media,
             max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-            thinking_mode
+            thinking_mode, keep_reasoning
         ]
         send_outputs = [chatbot, stats_display, context_display]
 
@@ -3854,7 +3856,7 @@ def create_ui():
             inputs=[
                 chatbot, system_prompt, max_tokens, temperature, top_p,
                 repeat_penalty, seed, video_max_frames, every_other_frame,
-                show_thinking, reasoning_level, thinking_mode
+                show_thinking, reasoning_level, thinking_mode, keep_reasoning
             ],
             outputs=[chatbot, stats_display, context_display],
         )
@@ -3931,7 +3933,7 @@ def create_ui():
                 # Generation Settings
                 system_prompt, max_tokens, temperature, top_p, repeat_penalty,
                 seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-                thinking_mode,
+                thinking_mode, keep_reasoning,
                 # Batch Caption Settings
                 batch_system_prompt, batch_prompt
             ],

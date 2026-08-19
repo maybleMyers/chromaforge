@@ -11,7 +11,7 @@ import gradio as gr
 from modules import llm2img, scripts, shared, ui_extra_networks, ui_toprow
 from modules.paths_internal import script_path
 from modules.ui_components import FormRow
-from modules.ui_img2img_panel import create_img2img_panel
+from modules.ui_img2img_panel import IMG2IMG_ARG_NAMES, create_img2img_panel
 from modules_forge.forge_canvas.canvas import canvas_head
 
 SETTINGS_FILE = os.path.join(script_path, "llm2img_settings.json")
@@ -66,35 +66,90 @@ PROFILE_KEYS = ['n_gpu_layers', 'n_ctx', 'tensor_split', 'main_gpu', 'kv_cache_t
                 'flash_attn', 'use_mmap', 'use_mlock', 'override_tensor', 'extra_args',
                 'server_port']
 
+#   Image-generation settings the Save button persists, out of IMG2IMG_ARG_NAMES. Left out
+#   on purpose:
+#     - the canvases and file uploads (init_img, sketch, ref_edit_*, batch upload): not
+#       JSON, and re-populating them on startup is not what anyone wants;
+#     - mode and selected_scale_tab: driven by which sub-tab is open, so a restored value
+#       would disagree with what the UI is actually showing;
+#     - checkpoint_name / vae_te_modules / forge_preset_name: these are the global
+#       quicksettings widgets shared with txt2img and img2img, not this tab's to own.
+#   Script/extension args are left to ui-config.json, which already keys them per script.
+SAVEABLE_IMG_ARGS = [
+    'prompt', 'negative_prompt', 'prompt_styles',
+    'ref_edit_lora_strength', 'mask_blur', 'mask_alpha', 'inpainting_fill',
+    'n_iter', 'batch_size', 'cfg_scale', 'distilled_cfg_scale', 'zimage_shift',
+    'sigma_rescale_start', 'sigma_rescale_end',
+    'apg_enabled', 'apg_eta', 'apg_momentum', 'apg_threshold',
+    'image_cfg_scale', 'denoising_strength', 'height', 'width', 'scale_by', 'resize_mode',
+    'fill_left', 'fill_right', 'fill_up', 'fill_down', 'fill_mask_mode',
+    'inpaint_full_res', 'inpaint_full_res_padding', 'inpainting_mask_invert',
+    'img2img_batch_input_dir', 'img2img_batch_output_dir', 'img2img_batch_inpaint_mask_dir',
+    'override_settings_texts', 'img2img_batch_use_png_info', 'img2img_batch_png_info_props',
+    'img2img_batch_png_info_dir',
+]
+
 
 def load_settings():
+    """Returns (llm settings, image settings), both already merged over the defaults."""
     settings = dict(DEFAULTS)
+    image = {}
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
                 settings.update({k: v for k, v in saved.items() if k in DEFAULTS})
+                stored_image = saved.get("image")
+                if isinstance(stored_image, dict):
+                    image = {k: v for k, v in stored_image.items() if k in SAVEABLE_IMG_ARGS}
             print(f"[llm2img] Settings loaded from {SETTINGS_FILE}")
     except Exception as e:
         print(f"[llm2img] Could not read {SETTINGS_FILE}: {e}; using defaults")
-    return settings
+    return settings, image
 
 
 def save_settings(*values):
-    settings = dict(zip(llm2img.LLM_ARG_NAMES, values))
+    """Persist the whole page: the LLM args first, then SAVEABLE_IMG_ARGS."""
+    n = len(llm2img.LLM_ARG_NAMES)
+    settings = dict(zip(llm2img.LLM_ARG_NAMES, values[:n]))
+    settings["image"] = dict(zip(SAVEABLE_IMG_ARGS, values[n:]))
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2, ensure_ascii=False)
-        return f"Saved to {os.path.basename(SETTINGS_FILE)}"
+        return f"Saved {len(values)} settings to {os.path.basename(SETTINGS_FILE)}"
     except Exception as e:
         return f"Error saving settings: {e}"
+
+
+def _restorable(component, value):
+    """Convert a value as a handler received it back into a valid `component.value`.
+
+    Radios and Dropdowns declared with type="index" hand the callback an integer but must
+    be given one of their choices to display, so the integer has to be mapped back.
+    """
+    if getattr(component, "type", "value") == "index":
+        choices = [c[0] if isinstance(c, tuple) else c for c in (component.choices or [])]
+        if isinstance(value, int) and 0 <= value < len(choices):
+            return choices[value]
+        return None
+    return value
+
+
+def _own_the_value(component):
+    """Stop ui-config.json from overwriting this component's value at startup.
+
+    UiLoadsave.add_component() does `setattr(obj, 'value', saved_value)` for every tracked
+    component (modules/ui_loadsave.py:71), which would clobber what we just restored from
+    llm2img_settings.json with whatever ui-config recorded on the very first run.
+    """
+    component.do_not_save_to_config = True
 
 
 def create_llm2img_interface():
     """Build the LLM2img tab. Returns the gr.Blocks for modules.ui to register."""
 
-    saved = load_settings()
+    saved, saved_image = load_settings()
 
     scripts.scripts_current = scripts.scripts_llm2img
     scripts.scripts_llm2img.initialize_scripts(is_img2img=True)
@@ -238,8 +293,12 @@ def create_llm2img_interface():
                                                         elem_id="llm2img_reviewer_system_prompt")
 
                 with FormRow():
-                    save_settings_btn = gr.Button("Save LLM2img Settings")
+                    save_settings_btn = gr.Button("Save LLM2img Settings", variant="secondary")
                     save_status = gr.Textbox(label="", value="", interactive=False, show_label=False, scale=3)
+                    gr.Markdown(
+                        "Saves everything on this tab — LLM settings *and* the image "
+                        "generation settings above — to `llm2img_settings.json`."
+                    )
 
             current_prompt = gr.Textbox(label="Current prompt", lines=3, value="",
                                         elem_id="llm2img_current_prompt",
@@ -282,6 +341,10 @@ def create_llm2img_interface():
             llm_components['_status'] = status_display
             llm_components['_round_log'] = round_log
             llm_components['_current_prompt'] = current_prompt
+            #   Wired after create_img2img_panel() returns: the image settings are part of
+            #   what Save persists, and their components do not exist yet.
+            llm_components['_save_btn'] = save_settings_btn
+            llm_components['_save_status'] = save_status
 
             # ---- LLM model lifecycle -------------------------------------------------
             refresh_models_btn.click(
@@ -302,13 +365,6 @@ def create_llm2img_interface():
             load_btn.click(fn=_load_model, inputs=load_inputs, outputs=[status_display])
             unload_btn.click(fn=_unload_model, outputs=[status_display])
 
-            save_settings_btn.click(
-                fn=save_settings,
-                inputs=[llm_components[name] for name in llm2img.LLM_ARG_NAMES],
-                outputs=[save_status],
-                show_progress=False,
-            )
-
             #   Warn as soon as the two sliders make an over-long review turn likely,
             #   rather than after the model has already been loaded and fed.
             for component in (max_review_images, n_ctx):
@@ -323,6 +379,32 @@ def create_llm2img_interface():
             "llm2img", scripts.scripts_llm2img, toprow, extra_ui=build_llm_ui
         )
         output_panel = panel.output_panel
+
+        #   submit_inputs[0] is the id_task slot; the rest line up with IMG2IMG_ARG_NAMES.
+        img_components = dict(zip(IMG2IMG_ARG_NAMES, panel.submit_inputs[1:]))
+
+        #   Restore the image settings this tab saved last time, and take them out of
+        #   ui-config's hands so they are not reset to the hardcoded defaults on restart.
+        for name in SAVEABLE_IMG_ARGS:
+            component = img_components[name]
+            _own_the_value(component)
+            if name in saved_image:
+                restored = _restorable(component, saved_image[name])
+                if restored is not None:
+                    component.value = restored
+
+        for name in llm2img.LLM_ARG_NAMES:
+            _own_the_value(llm_components[name])
+
+        llm_components['_save_btn'].click(
+            fn=save_settings,
+            inputs=(
+                [llm_components[name] for name in llm2img.LLM_ARG_NAMES]
+                + [img_components[name] for name in SAVEABLE_IMG_ARGS]
+            ),
+            outputs=[llm_components['_save_status']],
+            show_progress=False,
+        )
 
         def run(id_task, request: gr.Request, *args):
             yield from llm2img.run_with_job(id_task, request, scripts.scripts_llm2img, *args)

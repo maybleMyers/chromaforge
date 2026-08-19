@@ -628,6 +628,25 @@ table.popup-table .link{
     height: calc(100% - 60px);  /* to match gradio's height */
 }
 
+/* Host for a live preview that must not sit on top of the gallery (LLM2img, whose task
+   spans several rounds). .livePreview is absolutely positioned, so this needs to be a
+   positioned box with a height - but only while a preview actually exists, or it would
+   leave a tall empty gap for the rest of the run. */
+.output-live-preview{
+    position: relative;
+    display: none;
+}
+
+.output-live-preview:has(.livePreview){
+    display: block;
+    min-height: 320px;
+}
+
+/* No thumbnail strip to leave room for here, unlike inside a gallery. */
+.output-live-preview .livePreview img{
+    height: 100%;
+}
+
 /* fullscreen popup (ie in Lora's (i) button) */
 
 .popup-metadata{

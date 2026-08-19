@@ -626,10 +626,12 @@ def create_img2img_panel(tabname, script_runner, toprow, dummy_component=None, e
             *script_runner.infotext_fields
         ]
         parameters_copypaste.add_paste_fields(tabname, init_img.background, paste_fields, override_settings)
-        if tabname == "img2img":
-            #   "inpaint" is a paste destination name baked into the send-to buttons; only
-            #   the real img2img tab may claim it.
-            parameters_copypaste.add_paste_fields("inpaint", init_img_with_mask.background, paste_fields, override_settings)
+        #   The bare "inpaint" destination is baked into every other tab's send-to buttons,
+        #   so only the real img2img tab may claim it; clones get a tab-scoped name. Both
+        #   must be registered, because connect_paste_params_buttons() indexes paste_fields
+        #   by destination name without a fallback.
+        inpaint_destination = "inpaint" if tabname == "img2img" else f"{tabname}_inpaint"
+        parameters_copypaste.add_paste_fields(inpaint_destination, init_img_with_mask.background, paste_fields, override_settings)
         parameters_copypaste.register_paste_params_button(parameters_copypaste.ParamBinding(
             paste_button=toprow.paste, tabname=tabname, source_text_component=toprow.prompt, source_image_component=None,
         ))

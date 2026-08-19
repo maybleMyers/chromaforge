@@ -71,6 +71,40 @@ function switchToModeTab(modeId, no) {
     return [];
 }
 
+// Select a top-level tab by its interface id. Deliberately not a hardcoded nav index the
+// way switch_to_txt2img/switch_to_img2img are: a tab's position depends on
+// opts.ui_tab_order and opts.hidden_tabs. The nav buttons are in the same order as the tab
+// content divs, which modules/ui.py gives elem_id="tab_<ifid>".
+function switchToTopTab(ifid) {
+    var tabs = gradioApp().querySelector('#tabs');
+    if (!tabs) return;
+    var nav = tabs.querySelector(':scope > div.tab-nav');
+    if (!nav) return;
+    var contents = Array.from(tabs.children).filter(function(el) {
+        return el.id && el.id.indexOf('tab_') === 0;
+    });
+    var idx = contents.findIndex(function(el) {
+        return el.id === 'tab_' + ifid;
+    });
+    if (idx >= 0 && nav.children[idx]) nav.children[idx].click();
+}
+
+// Destinations for the LLM2img gallery's send-to buttons. connect_paste_params_buttons()
+// in modules/infotext_utils.py attaches these by name as switch_to_<destination>, so the
+// names must match the paste destinations registered in modules/ui_img2img_panel.py.
+// Mode indices come from MODE_TAB_INDEX there: img2img 0, inpaint 3.
+function switch_to_llm2img() {
+    switchToTopTab('llm2img');
+    switchToModeTab('mode_llm2img', 0);
+    return Array.from(arguments);
+}
+
+function switch_to_llm2img_inpaint() {
+    switchToTopTab('llm2img');
+    switchToModeTab('mode_llm2img', 3);
+    return Array.from(arguments);
+}
+
 function currentModeSourceResolution(modeId, w, h, r) {
     var img = gradioApp().querySelector('#' + modeId + ' > div[style="display: block;"] :is(img, canvas)');
     return img ? [img.naturalWidth || img.width, img.naturalHeight || img.height, r] : [0, 0, r];
@@ -91,6 +125,16 @@ function getModeTabIndexArgs(modeId) {
     return res;
 }
 
+// Where a tab wants its live preview drawn. Tabs absent from this map get it over their
+// gallery, as upstream does; see modules/ui_common.py for why LLM2img does not.
+var livePreviewHost = {
+    llm2img: 'llm2img_live_preview',
+};
+
+function livePreviewElementFor(tabname) {
+    return gradioApp().getElementById(livePreviewHost[tabname] || (tabname + '_gallery'));
+}
+
 function restoreProgressForTab(tabname) {
     showRestoreProgressButton(tabname, false);
 
@@ -98,7 +142,7 @@ function restoreProgressForTab(tabname) {
 
     if (id) {
         showSubmitInterruptingPlaceholder(tabname);
-        requestProgress(id, gradioApp().getElementById(tabname + '_gallery_container'), gradioApp().getElementById(tabname + '_gallery'), function() {
+        requestProgress(id, gradioApp().getElementById(tabname + '_gallery_container'), livePreviewElementFor(tabname), function() {
             showSubmitButtons(tabname, true);
         }, null, 0);
     }
@@ -252,7 +296,10 @@ function submit_llm2img() {
     var id = randomId();
     localSet("llm2img_task_id", id);
 
-    requestProgress(id, gradioApp().getElementById('llm2img_gallery_container'), gradioApp().getElementById('llm2img_gallery'), function() {
+    // The live preview goes into its own pane, not the gallery: this task spans the whole
+    // multi-round loop, and the .livePreview overlay is only torn down when the task ends,
+    // so over the gallery it would hide every round's results until the run finished.
+    requestProgress(id, gradioApp().getElementById('llm2img_gallery_container'), livePreviewElementFor('llm2img'), function() {
         showSubmitButtons('llm2img', true);
         localRemove("llm2img_task_id");
         showRestoreProgressButton('llm2img', false);

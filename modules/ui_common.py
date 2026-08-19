@@ -156,6 +156,27 @@ class OutputPanel:
     infotext = None
     html_log = None
     button_upscale = None
+    live_preview = None
+
+
+#   Which tab each send-to button targets, per source tab: (destination, icon, tooltip).
+#   The destination name is what connect_paste_params_buttons() looks up in paste_fields,
+#   and it is also what names the switch_to_<destination> javascript function.
+DEFAULT_SEND_TO_TARGETS = [
+    ('img2img', '🖼️', "Send image and generation parameters to img2img tab."),
+    ('inpaint', '🎨️', "Send image and generation parameters to img2img inpaint tab."),
+    ('extras', '📐', "Send image and generation parameters to extras tab."),
+]
+
+#   LLM2img carries its own copy of the img2img canvases, so its buttons stay on the tab
+#   rather than throwing the user over to img2img mid-loop.
+SEND_TO_TARGETS = {
+    'llm2img': [
+        ('llm2img', '🖼️', "Send image and generation parameters to this tab's img2img canvas."),
+        ('llm2img_inpaint', '🎨️', "Send image and generation parameters to this tab's Inpaint canvas."),
+        ('extras', '📐', "Send image and generation parameters to extras tab."),
+    ],
+}
 
 
 def create_output_panel(tabname, outdir, toprow=None):
@@ -180,6 +201,14 @@ def create_output_panel(tabname, outdir, toprow=None):
             toprow.create_inline_toprow_image()
 
         with gr.Column(variant='panel', elem_id=f"{tabname}_results_panel"):
+            if tabname == "llm2img":
+                #   requestProgress() draws the live preview into whatever element it is
+                #   handed, and only clears it when the *task* ends. An LLM2img task spans
+                #   the whole multi-round loop, so pointing it at the gallery would hide
+                #   every round's results until the run finished. Give it its own pane.
+                res.live_preview = gr.HTML("", elem_id=f"{tabname}_live_preview",
+                                           elem_classes=["output-live-preview"])
+
             with gr.Group(elem_id=f"{tabname}_gallery_container"):
                 res.gallery = gr.Gallery(label='Output', show_label=False, elem_id=f"{tabname}_gallery", columns=4, preview=True, height=shared.opts.gallery_height or None, interactive=False, type="pil", object_fit="contain")
 
@@ -191,9 +220,8 @@ def create_output_panel(tabname, outdir, toprow=None):
                     save_zip = ToolButton('🗃️', elem_id=f'save_zip_{tabname}', tooltip=f"Save zip archive with images to a dedicated directory ({shared.opts.outdir_save})")
 
                 buttons = {
-                    'img2img': ToolButton('🖼️', elem_id=f'{tabname}_send_to_img2img', tooltip="Send image and generation parameters to img2img tab."),
-                    'inpaint': ToolButton('🎨️', elem_id=f'{tabname}_send_to_inpaint', tooltip="Send image and generation parameters to img2img inpaint tab."),
-                    'extras': ToolButton('📐', elem_id=f'{tabname}_send_to_extras', tooltip="Send image and generation parameters to extras tab.")
+                    destination: ToolButton(icon, elem_id=f'{tabname}_send_to_{destination}', tooltip=tooltip)
+                    for destination, icon, tooltip in SEND_TO_TARGETS.get(tabname, DEFAULT_SEND_TO_TARGETS)
                 }
 
                 if tabname == 'txt2img':
@@ -268,6 +296,8 @@ def create_output_panel(tabname, outdir, toprow=None):
                 paste_field_names = modules.scripts.scripts_txt2img.paste_field_names
             elif tabname == "img2img":
                 paste_field_names = modules.scripts.scripts_img2img.paste_field_names
+            elif tabname == "llm2img":
+                paste_field_names = modules.scripts.scripts_llm2img.paste_field_names
 
             for paste_tabname, paste_button in buttons.items():
                 parameters_copypaste.register_paste_params_button(parameters_copypaste.ParamBinding(

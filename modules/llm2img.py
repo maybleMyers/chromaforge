@@ -24,6 +24,7 @@ import time
 from contextlib import closing
 
 import gradio as gr
+from PIL import Image
 
 from modules import call_queue, progress, script_callbacks, shared
 from modules.paths_internal import script_path
@@ -408,6 +409,64 @@ def _generate_batch(id_task, request, img_args, script_runner):
     )
 
 
+#   Per img2img mode: which argument holds the starting image, and which companion holds
+#   the mask or scribble layer that must survive untouched. Mirrors the mode dispatch at
+#   the top of modules/img2img.py's img2img_function().
+FEED_FORWARD_SLOTS = {
+    0: ('init_img', None),                                   # img2img
+    1: ('ref_edit_main_img', None),                          # reference edit
+    2: ('sketch', 'sketch_fg'),                              # sketch
+    3: ('init_img_with_mask', 'init_img_with_mask_fg'),      # inpaint
+    4: ('inpaint_color_sketch', 'inpaint_color_sketch_fg'),  # inpaint sketch
+    5: ('init_img_inpaint', 'init_mask_inpaint'),            # inpaint upload
+    #   6 is Batch, which reads a directory rather than a canvas - nothing to feed back.
+}
+
+FEED_FORWARD_LABELS = {
+    0: 'img2img', 1: 'Reference Edit', 2: 'Sketch',
+    3: 'Inpaint', 4: 'Inpaint sketch', 5: 'Inpaint upload',
+}
+
+#   ForgeCanvas hands its values over as RGBA PIL images (canvas.base64_to_image forces
+#   the conversion), and img2img_function alpha_composites two of them for the sketch
+#   modes - an RGB image in one of these slots raises "image mode must be RGBA".
+_RGBA_SLOTS = {'init_img', 'sketch', 'init_img_with_mask', 'inpaint_color_sketch'}
+
+
+def _feed_image_forward(img_args, image):
+    """Put `image` back on whichever canvas the current mode starts from, and return that
+    mode.
+
+    Inpainting is the case that matters. Its mask lives in a separate foreground layer, so
+    replacing only the background carries the result forward with the user's mask still
+    sitting on it. This used to force mode 0 and write to init_img, which silently dropped
+    the mask and put the result on a canvas the user was not even looking at.
+    """
+    mode = int(img_args[arg_index('mode')] or 0)
+    slot, mask_slot = FEED_FORWARD_SLOTS.get(mode, (None, None))
+
+    #   Batch mode has no canvas. Neither does a masked mode whose layer was never painted,
+    #   which happens when round 1 fell back to txt2img: img2img_function would then call
+    #   .getchannel() or alpha_composite() on None. Refine as plain img2img instead.
+    if slot is None or (mask_slot and img_args[arg_index(mask_slot)] is None):
+        mode, slot, mask_slot = 0, 'init_img', None
+        img_args[arg_index('mode')] = 0
+
+    #   Keep the canvas at the size the mask was painted at. processing resizes the image
+    #   and the mask to width/height independently, and "Only masked" crops the image with
+    #   a region measured on the mask, so mismatched sizes misalign the two.
+    mask = img_args[arg_index(mask_slot)] if mask_slot else None
+    target_size = getattr(mask, "size", None)
+    if target_size and target_size != image.size:
+        image = image.resize(target_size, Image.Resampling.LANCZOS)
+
+    if slot in _RGBA_SLOTS and image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    img_args[arg_index(slot)] = image
+    return mode
+
+
 def _source_image_for_mode(img_args, mode):
     """Whichever image the selected img2img mode would start from, or None."""
     by_mode = {
@@ -757,16 +816,14 @@ def llm2img_run(id_task, request, script_runner, *args):
                 #   named. Falling back to the first keeps the loop moving when it did not
                 #   answer, or named an image outside the batch.
                 best = extract_best_index(reply, reviewed)
+                picked = f"image {best + 1}" if best is not None else "image 1 (the review named none)"
                 if best is None:
                     best = 0
-                    log_lines.append(
-                        "_The review named no best image; carrying image 1 forward._"
-                    )
-                else:
-                    log_lines.append(f"_Carrying image {best + 1} forward as the init image._")
 
-                img_args[arg_index('mode')] = 0
-                img_args[arg_index('init_img')] = round_images[best]
+                fed_to = _feed_image_forward(img_args, round_images[best])
+                where = FEED_FORWARD_LABELS.get(fed_to, 'img2img')
+                kept = " with your mask intact" if FEED_FORWARD_SLOTS.get(fed_to, (None, None))[1] else ""
+                log_lines.append(f"_Carrying {picked} forward to the {where} canvas{kept}._")
 
         elapsed = time.perf_counter() - started
         log_lines.append(f"_Finished {rounds} round(s) in {elapsed / 60:.1f} min._")

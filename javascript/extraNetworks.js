@@ -229,8 +229,18 @@ var extraNetworksApplySort = {};
 var activePromptTextarea = {};
 
 function setupExtraNetworks() {
-    setupExtraNetworksForTab('txt2img');
-    setupExtraNetworksForTab('img2img');
+    // Discover the tabs rather than listing them: txt2img, img2img and LLM2img all build
+    // an extra-networks container, and any future tab that does will be picked up too.
+    // Each tab is wrapped so one failure cannot stop the others from registering their
+    // prompt textareas - without that registration, clicking a card does nothing.
+    gradioApp().querySelectorAll("[id$='_extra_tabs']").forEach(function(elem) {
+        var tabname = elem.id.replace(/_extra_tabs$/, '');
+        try {
+            setupExtraNetworksForTab(tabname);
+        } catch (e) {
+            console.error('setupExtraNetworksForTab failed for ' + tabname, e);
+        }
+    });
 }
 
 var re_extranet = /<([^:^>]+:[^:]+):[\d.]+>(.*)/;
@@ -749,7 +759,12 @@ function scheduleAfterScriptsCallbacks() {
 onUiLoaded(function() {
     var mutationObserver = new MutationObserver(function(m) {
         let existingSearchfields = gradioApp().querySelectorAll("[id$='_extra_search']").length;
-        let neededSearchfields = gradioApp().querySelectorAll("[id$='_extra_tabs'] > .tab-nav > button").length - 2;
+        // Every *_extra_tabs container holds one tab that is not an extra-networks page
+        // (Generation) and so has no search field. Subtract one per container instead of a
+        // hardcoded 2, or adding a third tab leaves the target permanently out of reach and
+        // setupExtraNetworks() never runs.
+        let tabContainers = gradioApp().querySelectorAll("[id$='_extra_tabs']").length;
+        let neededSearchfields = gradioApp().querySelectorAll("[id$='_extra_tabs'] > .tab-nav > button").length - tabContainers;
 
         if (!executedAfterScripts && existingSearchfields >= neededSearchfields) {
             mutationObserver.disconnect();

@@ -533,10 +533,13 @@ def load_scripts():
             current_basedir = paths.script_path
             timer.startup_timer.record(scriptfile.filename)
 
-    global scripts_txt2img, scripts_img2img, scripts_postproc
+    global scripts_txt2img, scripts_img2img, scripts_llm2img, scripts_postproc
 
     scripts_txt2img = ScriptRunner()
     scripts_img2img = ScriptRunner()
+    #   LLM2img clones the img2img panel, so it needs its own runner: script instances
+    #   hold per-tab UI components and cannot be shared between two rendered panels.
+    scripts_llm2img = ScriptRunner()
     scripts_postproc = scripts_postprocessing.ScriptPostprocessingRunner()
 
 
@@ -1055,6 +1058,7 @@ class ScriptRunner:
 
 scripts_txt2img: ScriptRunner = None
 scripts_img2img: ScriptRunner = None
+scripts_llm2img: ScriptRunner = None
 scripts_postproc: scripts_postprocessing.ScriptPostprocessingRunner = None
 scripts_current: ScriptRunner = None
 

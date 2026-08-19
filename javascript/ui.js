@@ -61,6 +61,50 @@ function switch_to_img2img_tab(no) {
     gradioApp().querySelector('#tabs').querySelectorAll('button')[1].click();
     gradioApp().getElementById('mode_img2img').querySelectorAll('button')[no].click();
 }
+
+// Tabname-aware variants of the img2img helpers below. The img2img generation panel is
+// built once per tab (Img2img, LLM2img), so anything that reaches into the DOM has to be
+// told which "mode_<tabname>" Tabs group it is looking at.
+function switchToModeTab(modeId, no) {
+    var mode = gradioApp().getElementById(modeId);
+    if (mode) mode.querySelectorAll('button')[no].click();
+    return [];
+}
+
+function currentModeSourceResolution(modeId, w, h, r) {
+    var img = gradioApp().querySelector('#' + modeId + ' > div[style="display: block;"] :is(img, canvas)');
+    return img ? [img.naturalWidth || img.width, img.naturalHeight || img.height, r] : [0, 0, r];
+}
+
+function currentModeExpandResolution(modeId) {
+    var args = Array.from(arguments).slice(1);
+    var img = gradioApp().querySelector('#' + modeId + ' > div[style="display: block;"] :is(img, canvas)');
+    args[0] = img ? (img.naturalWidth || img.width) : 0;
+    args[1] = img ? (img.naturalHeight || img.height) : 0;
+    return args;
+}
+
+function getModeTabIndexArgs(modeId) {
+    let res = Array.from(arguments).slice(1);
+    res.splice(-2);
+    res[0] = get_tab_index(modeId);
+    return res;
+}
+
+function restoreProgressForTab(tabname) {
+    showRestoreProgressButton(tabname, false);
+
+    var id = localGet(tabname + "_task_id");
+
+    if (id) {
+        showSubmitInterruptingPlaceholder(tabname);
+        requestProgress(id, gradioApp().getElementById(tabname + '_gallery_container'), gradioApp().getElementById(tabname + '_gallery'), function() {
+            showSubmitButtons(tabname, true);
+        }, null, 0);
+    }
+
+    return id;
+}
 function switch_to_img2img() {
     switch_to_img2img_tab(0);
     return Array.from(arguments);
@@ -196,6 +240,30 @@ function submit_img2img() {
     });
 
     var res = create_submit_args(arguments);
+
+    res[0] = id;
+
+    return res;
+}
+
+function submit_llm2img() {
+    showSubmitButtons('llm2img', false);
+
+    var id = randomId();
+    localSet("llm2img_task_id", id);
+
+    requestProgress(id, gradioApp().getElementById('llm2img_gallery_container'), gradioApp().getElementById('llm2img_gallery'), function() {
+        showSubmitButtons('llm2img', true);
+        localRemove("llm2img_task_id");
+        showRestoreProgressButton('llm2img', false);
+    });
+
+    // Same trick as create_submit_args(), but this event has six outputs rather than four,
+    // so the echoed gallery sits six from the end instead of four.
+    var res = Array.from(arguments);
+    if (Array.isArray(res[res.length - 6])) {
+        res = res.slice(0, res.length - 6);
+    }
 
     res[0] = id;
 

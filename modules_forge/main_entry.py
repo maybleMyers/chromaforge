@@ -84,6 +84,16 @@ def unload_all_models_clicked():
     except Exception as e:
         print(f'[Unload] Warning: could not clear LLM cache: {e}')
 
+    # LLM2img runs its VLM as a llama-server subprocess, which emergency_memory_cleanup()
+    # cannot see - stop it here or its VRAM stays claimed.
+    try:
+        from modules import llm2img
+        manager = llm2img.get_manager()
+        if manager is not None and manager.server_process is not None:
+            print('[Unload] ' + llm2img.stop_server())
+    except Exception as e:
+        print(f'[Unload] Warning: could not stop llama-server: {e}')
+
     memory_management.emergency_memory_cleanup()
     processing.need_global_unload = True
     gr.Info('All models unloaded')

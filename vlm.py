@@ -14,6 +14,7 @@ Installation with CUDA (Windows prebuilt):
 """
 
 import os
+import sys
 import gc
 import re
 import json
@@ -45,7 +46,10 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: opencv-python not installed. Video support will be limited.")
 
-# Import llama-cpp-python
+# Import llama-cpp-python (installed manually into the local llama.cpp folder)
+_LLAMA_CPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama.cpp")
+if _LLAMA_CPP_DIR not in sys.path:
+    sys.path.insert(0, _LLAMA_CPP_DIR)
 try:
     from llama_cpp import Llama
     from llama_cpp import llama_cpp as llama_cpp_lib

@@ -170,6 +170,13 @@ def clean_muse_glimmer_markers(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
+# How often the streaming loop is allowed to push a frame to the UI, in seconds.
+# Every yield makes Gradio re-serialise the whole chat history and blocks the
+# generator while it does, so yielding per token pins generation to the browser's
+# redraw rate (~26/s on a long message) no matter how fast the server runs.
+# ~15 fps still reads as smooth streaming and costs nothing.
+UI_STREAM_INTERVAL = float(os.environ.get("VLM_UI_STREAM_INTERVAL", "0.066"))
+
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _DISPLAY_THINK_RE = re.compile(r"\*\*\[Thinking\]\*\*.*?\*\*\[Response\]\*\*\s*", re.DOTALL)
 
@@ -1607,6 +1614,15 @@ class LlamaCppVLM:
                 prompt_tokens = 0
                 ctx_info = ""  # Initialize context info for streaming
                 in_reasoning = False  # Tracks whether we've opened a <think> tag we haven't closed yet
+                finish_reason = None
+                # Incremental <think> boundary tracking. The old code re-split the
+                # entire accumulated buffer on every token, which is O(n^2) - by a
+                # few thousand tokens that alone costs more than the generation.
+                think_open = False   # a <think> (synthesised or literal) has been seen
+                think_close = -1     # index in `accumulated` just past </think>, or -1
+                scan_from = 0        # resume point for the </think> search
+                last_yield = 0.0
+                pending = False      # tokens arrived that the UI has not seen yet
                 print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
@@ -1640,6 +1656,7 @@ class LlamaCppVLM:
                                     content = delta.get("content", "")
                                     # GLM-4.7 sends thinking in reasoning_content field
                                     reasoning_content = delta.get("reasoning_content", "")
+                                    finish_reason = choices[0].get("finish_reason") or finish_reason
 
                                     # Handle reasoning_content (GLM-4.7 thinking mode)
                                     if reasoning_content:
@@ -1650,6 +1667,8 @@ class LlamaCppVLM:
                                         if not in_reasoning:
                                             accumulated += "<think>"
                                             in_reasoning = True
+                                            think_open = True
+                                            scan_from = len(accumulated)
                                         accumulated += reasoning_content
                                         token_count += 1
 
@@ -1661,27 +1680,45 @@ class LlamaCppVLM:
                                             in_reasoning = False
                                         accumulated += content
                                         token_count += 1
+                                        if think_close < 0:
+                                            # Models that emit a literal <think> inside content
+                                            # (rather than reasoning_content) open the block here.
+                                            if not think_open and accumulated[:32].lstrip().startswith("<think>"):
+                                                think_open = True
+                                            if think_open:
+                                                hit = accumulated.find("</think>", scan_from)
+                                                if hit >= 0:
+                                                    think_close = hit + len("</think>")
+                                                else:
+                                                    # Only rescan the last few chars, in case the
+                                                    # tag is split across two deltas.
+                                                    scan_from = max(scan_from, len(accumulated) - 8)
 
-                                    # Yield if we got any content (regular or reasoning)
+                                    # Push to the UI at most every UI_STREAM_INTERVAL. Tokens
+                                    # keep accumulating in between, so nothing is dropped - the
+                                    # next frame just carries several tokens instead of one.
                                     if content or reasoning_content:
-                                        elapsed = time.perf_counter() - start_time
-                                        tps = token_count / elapsed if elapsed > 0 else 0
-                                        # Update context info periodically (every 100 tokens)
-                                        # Use calculated values: prompt_tokens + current completion tokens
-                                        if token_count % 100 == 1 or token_count == 1:
+                                        pending = True
+                                        now = time.perf_counter()
+                                        if now - last_yield >= UI_STREAM_INTERVAL:
+                                            last_yield = now
+                                            pending = False
+                                            elapsed = now - start_time
+                                            tps = token_count / elapsed if elapsed > 0 else 0
                                             current_ctx = prompt_tokens + token_count
                                             ctx_total_display = self.n_ctx if self.n_ctx > 0 else 32768
                                             ctx_pct = (current_ctx / ctx_total_display * 100) if ctx_total_display > 0 else 0
                                             ctx_info = f"{current_ctx:,} / {ctx_total_display:,} ({ctx_pct:.0f}%)"
-                                        # Create display_text with thinking stripped (for show_thinking=False)
-                                        display_text = accumulated
-                                        if "</think>" in display_text:
-                                            display_text = display_text.split("</think>")[-1].strip()
-                                        elif in_reasoning or display_text.lstrip().startswith("<think>"):
-                                            # Still inside reasoning - show a placeholder instead of
-                                            # raw <think> text (which Gradio renders as nothing)
-                                            display_text = "*Thinking…*"
-                                        yield display_text, accumulated, f"{tps:.1f} tok/s", ctx_info
+                                            # display_text = response with thinking stripped (for show_thinking=False)
+                                            if think_close >= 0:
+                                                display_text = accumulated[think_close:].lstrip()
+                                            elif think_open or in_reasoning:
+                                                # Still inside reasoning - show a placeholder instead of
+                                                # raw <think> text (which Gradio renders as nothing)
+                                                display_text = "*Thinking…*"
+                                            else:
+                                                display_text = accumulated
+                                            yield display_text, accumulated, f"{tps:.1f} tok/s", ctx_info
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
 
@@ -1703,13 +1740,27 @@ class LlamaCppVLM:
                     accumulated += "</think>"
                     in_reasoning = False
 
+                if finish_reason == "length":
+                    print(
+                        f"[llama-server] TRUNCATED: hit max_tokens ({max_new_tokens}) before the model "
+                        f"finished. Raise Max Tokens, or turn thinking down/off for this turn."
+                    )
+
                 if accumulated:
                     # Create final display_text with thinking stripped
-                    final_display = accumulated
-                    if "</think>" in final_display:
-                        final_display = final_display.split("</think>")[-1].strip()
-                    elif final_display.lstrip().startswith("<think>"):
+                    if think_close < 0 and "</think>" in accumulated:
+                        # Belt and braces: catch a </think> the incremental scan missed
+                        think_close = accumulated.index("</think>") + len("</think>")
+                    if think_close >= 0:
+                        final_display = accumulated[think_close:].strip()
+                    elif think_open or accumulated.lstrip().startswith("<think>"):
                         final_display = "*Thinking…* (no final response - hit max tokens during reasoning)"
+                    else:
+                        final_display = accumulated
+                    if finish_reason == "length":
+                        final_display += (
+                            f"\n\n---\n*⚠ Truncated: hit the {max_new_tokens:,}-token limit.*"
+                        )
                     if self.model_type == "muse-glimmer":
                         final_display = clean_muse_glimmer_markers(final_display)
                         accumulated = clean_muse_glimmer_markers(accumulated)
@@ -2212,6 +2263,10 @@ DEFAULT_SETTINGS = {
     "video_max_frames": 8,
     "every_other_frame": False,
     "show_thinking": True,
+    # Send previous turns' reasoning back to the model. On is the model's native
+    # format and keeps the chain of thought coherent across turns; turn it off to
+    # reclaim the thousands of tokens per turn that reasoning costs when n_ctx is tight.
+    "keep_reasoning": True,
     # "default" = send nothing and let the model's own default stand. Naming a level
     # here would silently downgrade Muse Glimmer from its native "high".
     "reasoning_level": "default",  # Muse Glimmer strength / GPT-OSS effort
@@ -2608,8 +2663,17 @@ def status_handler():
     return status
 
 
-def extract_text_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Extract text-only messages from display history for the model."""
+def extract_text_history(
+    history: List[Dict[str, Any]],
+    keep_reasoning: bool = True,
+) -> List[Dict[str, Any]]:
+    """Extract text-only messages from display history for the model.
+
+    keep_reasoning=False drops each previous assistant turn's <think> block before
+    resending it. Reasoning is thousands of tokens per turn, so on a small n_ctx a
+    few turns fill the window and the final answer gets truncated; on a large
+    window keeping it (the default) preserves the model's native transcript.
+    """
     messages = []
     if history:
         for msg in history:
@@ -2619,15 +2683,23 @@ def extract_text_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if role and content:
                     # Extract text content for the model
                     if isinstance(content, str):
-                        messages.append({"role": role, "content": content})
+                        text = content
                     elif isinstance(content, list):
                         # Extract text from multimodal content
                         text_parts = []
                         for item in content:
                             if isinstance(item, dict) and item.get("type") == "text":
                                 text_parts.append(item.get("text", ""))
-                        if text_parts:
-                            messages.append({"role": role, "content": " ".join(text_parts)})
+                        if not text_parts:
+                            continue
+                        text = " ".join(text_parts)
+                    else:
+                        continue
+                    if role == "assistant" and not keep_reasoning:
+                        text = strip_reasoning_for_context(text)
+                        if not text:
+                            continue
+                    messages.append({"role": role, "content": text})
     return messages
 
 
@@ -2792,6 +2864,7 @@ def chat_handler(
     show_thinking: bool = False,
     reasoning_level: str = "default",
     thinking_mode: bool = True,
+    keep_reasoning: bool = True,
 ):
     """Handle chat messages from UI with streaming support."""
     # Check if any model is loaded (either local or server mode)
@@ -2814,7 +2887,7 @@ def chat_handler(
         messages.append({"role": "system", "content": system_prompt})
 
     # Add chat history (handle None case)
-    messages.extend(extract_text_history(history))
+    messages.extend(extract_text_history(history, keep_reasoning=keep_reasoning))
 
     # Build current message content for model
     model_content = []
@@ -2909,6 +2982,7 @@ def regenerate_handler(
     show_thinking: bool = False,
     reasoning_level: str = "default",
     thinking_mode: bool = True,
+    keep_reasoning: bool = True,
 ):
     """Re-run the last user turn, discarding the previous assistant reply.
 
@@ -2927,7 +3001,7 @@ def regenerate_handler(
     messages = []
     if system_prompt and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
-    messages.extend(extract_text_history(last_turn["history_before"]))
+    messages.extend(extract_text_history(last_turn["history_before"], keep_reasoning=keep_reasoning))
     messages.append({"role": "user", "content": last_turn["model_content"]})
 
     # Rebuild display history without the previous assistant reply
@@ -3552,6 +3626,11 @@ def create_ui():
                 show_thinking = gr.Checkbox(
                     label="Show Thinking",
                     value=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
+                )
+                keep_reasoning = gr.Checkbox(
+                    label="Send Reasoning Back",
+                    value=saved_settings.get("keep_reasoning", DEFAULT_SETTINGS["keep_reasoning"]),
+                    info="Include previous turns' thinking in the prompt. Off reclaims thousands of tokens per turn when n_ctx is tight",
                 )
                 reasoning_level = gr.Dropdown(
                     label="Reasoning Level",

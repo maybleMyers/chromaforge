@@ -105,7 +105,13 @@ went wrong: missing or wrong subject matter, anatomy and structure errors, muddy
 composition, flat or inconsistent lighting, wrong style, artefacts, sameness across the \
 batch.
 
+The images are numbered. Decide which single one follows the prompt best — judge how \
+faithfully it renders what the prompt asked for, not which is prettiest — because that \
+image is the one the next round starts from.
+
 Reply in exactly this shape, and always finish with the fenced block:
+
+BEST: <the number of the strongest image>
 
 CRITIQUE:
 <three to six short bullet points on what this batch got right and wrong>
@@ -294,6 +300,30 @@ def extract_prompt(text):
     return ""
 
 
+#   "BEST: 2", "Best image: 2", "**BEST:** 2" - the model is asked for the first form but
+#   reliably decorates it.
+_BEST_RE = re.compile(r"^[ \t*_#]*best(?:\s+image)?\s*[:#-]?\s*\**\s*(\d+)",
+                      re.IGNORECASE | re.MULTILINE)
+
+
+def extract_best_index(text, count):
+    """0-based index of the image the reviewer picked, or None.
+
+    None means "it did not say", and the caller falls back to the first image rather than
+    guessing - an out-of-range number is treated the same way.
+    """
+    if not text or count <= 0:
+        return None
+
+    text = vlm_llamacpp.strip_reasoning_for_context(text)
+
+    for match in _BEST_RE.finditer(text):
+        number = int(match.group(1))
+        if 1 <= number <= count:
+            return number - 1
+    return None
+
+
 def _report_unparsed(kind, text):
     """Say why a round could not move on, in the console where the reply is visible."""
     tail = (text or "").strip()[-400:]
@@ -308,8 +338,12 @@ def _build_review_message(idea, prompt_used, images, limit):
     batch, so without it each revision is judged against the previous revision and the run
     drifts away from what was actually asked for.
     """
+    #   Label each image so the model can name one in its BEST line. Qwen3-VL reads
+    #   interleaved text and images in order, so a caption immediately before each one is
+    #   enough to number the batch.
     content = []
-    for image in images[:limit]:
+    for i, image in enumerate(images[:limit], start=1):
+        content.append({"type": "text", "text": f"Image {i}:"})
         content.append({"type": "image", "image": image})
 
     shown = min(len(images), limit)
@@ -324,9 +358,9 @@ def _build_review_message(idea, prompt_used, images, limit):
 
     content.append({"type": "text", "text": (
         f"{goal}"
-        f"These {shown} image(s){note} were generated from this prompt:\n\n"
+        f"Images 1-{shown}{note} were generated from this prompt:\n\n"
         f"{prompt_used}\n\n"
-        "Review the batch and give me the revised prompt."
+        f"Name the best of the {shown}, then review the batch and give me the revised prompt."
     )})
     return {"role": "user", "content": content}
 
@@ -444,13 +478,25 @@ def _txt2img_from_img2img_args(id_task, request, img_args, script_runner):
     )
 
 
+def _round_geninfo(round_js):
+    try:
+        return json.loads(round_js) if round_js else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _index_of_first_image(round_js):
+    """Where the real images start in processed.images, past any contact-sheet grid."""
+    try:
+        return max(0, int(_round_geninfo(round_js).get("index_of_first_image", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _merge_generation_info(accumulated, round_js, n_images):
     """Concatenate this round's infotexts onto the running total so gallery index N still
     maps to infotext N when several rounds share one gallery."""
-    try:
-        data = json.loads(round_js) if round_js else {}
-    except (TypeError, ValueError):
-        data = {}
+    data = _round_geninfo(round_js)
 
     infotexts = list(data.get("infotexts") or [])
     #   extra_images are appended to processed.images but carry no infotext of their own.
@@ -603,6 +649,10 @@ def llm2img_run(id_task, request, script_runner, *args):
             )
             geninfo = _merge_generation_info(geninfo, round_js, len(images))
             gallery = gallery + list(images)
+            #   With more than one image, processing puts a contact-sheet grid at the front
+            #   and reports where the real images start. The grid belongs in the gallery but
+            #   not in front of the reviewer, and certainly not as the next init image.
+            round_images = list(images[_index_of_first_image(round_js):]) or list(images)
             log_lines[-1] = f"**Generated {len(images)} image(s).**"
             yield snapshot()
 
@@ -629,10 +679,11 @@ def llm2img_run(id_task, request, script_runner, *args):
                     "`mmproj-*.gguf` next to the weights to let the model actually see the batch."
                 )
 
-            log_lines.append(f"**Reviewing {min(len(images), review_limit)} image(s)…**")
+            reviewed = min(len(round_images), review_limit)
+            log_lines.append(f"**Reviewing {reviewed} image(s)…**")
             yield from stream_llm(
                 cfg['reviewer_system_prompt'],
-                _build_review_message(cfg['idea'], prompt, list(images), review_limit),
+                _build_review_message(cfg['idea'], prompt, round_images, review_limit),
             )
 
             log_lines[-1] = f"**Review**\n\n{reply.strip()}"
@@ -650,11 +701,22 @@ def llm2img_run(id_task, request, script_runner, *args):
             if not cfg['keep_llm_loaded']:
                 stop_server()
 
-            if cfg['feed_forward'] and images:
-                #   Later rounds refine the first image of the batch rather than starting
-                #   over: switch to plain img2img and hand it that image.
+            if cfg['feed_forward'] and round_images:
+                #   Later rounds refine the batch's strongest image rather than starting
+                #   over: switch to plain img2img and hand it whichever one the reviewer
+                #   named. Falling back to the first keeps the loop moving when it did not
+                #   answer, or named an image outside the batch.
+                best = extract_best_index(reply, reviewed)
+                if best is None:
+                    best = 0
+                    log_lines.append(
+                        "_The review named no best image; carrying image 1 forward._"
+                    )
+                else:
+                    log_lines.append(f"_Carrying image {best + 1} forward as the init image._")
+
                 img_args[arg_index('mode')] = 0
-                img_args[arg_index('init_img')] = images[0]
+                img_args[arg_index('init_img')] = round_images[best]
 
         elapsed = time.perf_counter() - started
         log_lines.append(f"_Finished {rounds} round(s) in {elapsed / 60:.1f} min._")

@@ -277,9 +277,9 @@ def create_llm2img_interface():
                                                   label="Max review images", value=saved['max_review_images'],
                                                   elem_id="llm2img_max_review_images",
                                                   info=f"All go to the VLM in one turn (~{TOKENS_PER_IMAGE_ESTIMATE} vision tokens each)")
-                    feed_forward = gr.Checkbox(label="Feed first result forward", value=saved['feed_forward'],
+                    feed_forward = gr.Checkbox(label="Feed best result forward", value=saved['feed_forward'],
                                                elem_id="llm2img_feed_forward",
-                                               info="Rounds after the first run img2img on the previous batch's first image")
+                                               info="Rounds after the first run img2img on whichever image the review judged closest to the prompt")
                     unload_diffusion = gr.Checkbox(label="Unload diffusion before the LLM", value=saved['unload_diffusion'],
                                                    elem_id="llm2img_unload_diffusion",
                                                    info="Leave on unless both models fit in VRAM at once")

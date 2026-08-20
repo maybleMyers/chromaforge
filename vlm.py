@@ -129,16 +129,48 @@ def clean_harmony_tags(content: str) -> str:
     return cleaned.strip()
 
 
+#   Shown when a generation stopped because it hit max_tokens rather than because the model
+#   was finished. Wording follows _TRUNCATION_HINT in modules/llm2img.py, which says the same
+#   thing for the sibling tab - one explanation of the shared budget, not two.
+def truncation_banner(max_new_tokens: int) -> str:
+    return (
+        f"\n\n---\n*⚠ Truncated: hit the {max_new_tokens:,}-token limit. On a thinking model "
+        f"the reasoning eats the same budget as the answer - raise Max Tokens, or turn "
+        f"Reasoning Level down for this turn.*"
+    )
+
+
+def extract_reasoning_for_display(text: str) -> str:
+    """Just the reasoning out of a raw reply, as markdown, for the thinking panel.
+
+    Returns "" when there is none. An unclosed block - the model is still reasoning, or the
+    run was stopped mid-thought - yields everything after the opening tag. Multiple blocks
+    are joined, since a model may reason more than once in a reply.
+
+    The literal tags never survive: they are what the chatbot's sanitizer strips, and the
+    panel is a gr.Markdown for the same reason.
+    """
+    if not text or "<think>" not in text:
+        return ""
+    blocks = []
+    for chunk in text.split("<think>")[1:]:
+        blocks.append(chunk.split("</think>")[0].strip())
+    return "\n\n---\n\n".join(b for b in blocks if b)
+
+
 def format_think_tags_for_display(text: str) -> str:
     """
     Convert <think>...</think> markers into markdown Gradio renders reliably.
     A literal <think> tag is stripped as unknown HTML by the chatbot's
     sanitizer, which can blank the entire message.
+
+    Every pair is converted, not just the first: a model that reasons twice in one
+    reply used to have its second block survive as a raw tag and hit that sanitizer.
     """
     if not text or "<think>" not in text:
         return text
-    formatted = text.replace("<think>", "**[Thinking]**\n\n", 1)
-    formatted = formatted.replace("</think>", "\n\n**[Response]**\n\n", 1)
+    formatted = text.replace("<think>", "**[Thinking]**\n\n")
+    formatted = formatted.replace("</think>", "\n\n**[Response]**\n\n")
     return formatted
 
 
@@ -656,6 +688,14 @@ class LlamaCppVLM:
 
         # Context tracking
         self.n_ctx: int = 0  # Store context size for usage display
+
+        #   Whether the last generation stopped because it hit max_tokens rather than
+        #   because the model was done. Kept here rather than added to the yielded tuple:
+        #   it is only knowable at the end, every caller wants it at the end, and the
+        #   alternative was a fifth element threaded through sixteen yield sites. Safe as
+        #   instance state because generations are serialised - by the webui's queue lock
+        #   when embedded, and by there being one user when standalone.
+        self.last_truncated: bool = False
 
     def get_available_models(self) -> List[Dict[str, str]]:
         """Get list of available GGUF models."""
@@ -1509,11 +1549,9 @@ class LlamaCppVLM:
                             api_messages.append({"role": role, "content": text_only})
 
             elif content:  # Simple string content
-                if role == "assistant":
-                    # Don't resend prior reasoning to the model
-                    content = strip_reasoning_for_context(str(content))
-                    if not content:
-                        continue
+                #   Whether prior reasoning is resent is extract_text_history's decision,
+                #   driven by the Send Reasoning Back checkbox. Stripping again here made
+                #   that checkbox a no-op on this backend for as long as it has existed.
                 api_messages.append({"role": role, "content": str(content)})
 
         if not api_messages:
@@ -1621,7 +1659,6 @@ class LlamaCppVLM:
                 think_close = -1     # index in `accumulated` just past </think>, or -1
                 scan_from = 0        # resume point for the </think> search
                 last_yield = 0.0
-                pending = False      # tokens arrived that the UI has not seen yet
                 print(f"[llama-server] Reading streaming response...")
 
                 for line in response.iter_lines():
@@ -1668,6 +1705,11 @@ class LlamaCppVLM:
                                             in_reasoning = True
                                             think_open = True
                                             scan_from = len(accumulated)
+                                            #   A model can reason more than once in a reply.
+                                            #   Re-arm the scan, or the second block's
+                                            #   </think> is never found and its raw tags reach
+                                            #   the chatbot, whose sanitizer eats them.
+                                            think_close = -1
                                         accumulated += reasoning_content
                                         token_count += 1
 
@@ -1682,8 +1724,14 @@ class LlamaCppVLM:
                                         if think_close < 0:
                                             # Models that emit a literal <think> inside content
                                             # (rather than reasoning_content) open the block here.
-                                            if not think_open and accumulated[:32].lstrip().startswith("<think>"):
+                                            #   Searched anywhere rather than in a fixed prefix
+                                            #   window: a model that writes a preamble, a blank
+                                            #   line or a <|channel|> header before its <think>
+                                            #   used to slip past and send the raw tag to the
+                                            #   chatbot sanitizer, blanking the message.
+                                            if not think_open and "<think>" in accumulated:
                                                 think_open = True
+                                                scan_from = accumulated.index("<think>") + len("<think>")
                                             if think_open:
                                                 hit = accumulated.find("</think>", scan_from)
                                                 if hit >= 0:
@@ -1697,11 +1745,9 @@ class LlamaCppVLM:
                                     # keep accumulating in between, so nothing is dropped - the
                                     # next frame just carries several tokens instead of one.
                                     if content or reasoning_content:
-                                        pending = True
                                         now = time.perf_counter()
                                         if now - last_yield >= UI_STREAM_INTERVAL:
                                             last_yield = now
-                                            pending = False
                                             elapsed = now - start_time
                                             tps = token_count / elapsed if elapsed > 0 else 0
                                             current_ctx = prompt_tokens + token_count
@@ -1739,7 +1785,8 @@ class LlamaCppVLM:
                     accumulated += "</think>"
                     in_reasoning = False
 
-                if finish_reason == "length":
+                self.last_truncated = finish_reason == "length"
+                if self.last_truncated:
                     print(
                         f"[llama-server] TRUNCATED: hit max_tokens ({max_new_tokens}) before the model "
                         f"finished. Raise Max Tokens, or turn thinking down/off for this turn."
@@ -1756,10 +1803,10 @@ class LlamaCppVLM:
                         final_display = "*Thinking…* (no final response - hit max tokens during reasoning)"
                     else:
                         final_display = accumulated
-                    if finish_reason == "length":
-                        final_display += (
-                            f"\n\n---\n*⚠ Truncated: hit the {max_new_tokens:,}-token limit.*"
-                        )
+                    #   The truncation banner is appended by the caller, not here: it has to
+                    #   land on the raw path too (show_thinking on renders `accumulated`, not
+                    #   final_display), and doing it in one place is the only way it cannot
+                    #   go missing on one of them again.
                     if self.model_type == "muse-glimmer":
                         final_display = clean_muse_glimmer_markers(final_display)
                         accumulated = clean_muse_glimmer_markers(accumulated)
@@ -1847,6 +1894,10 @@ class LlamaCppVLM:
         """
         # Debug: show current state
         print(f"[vlm.py] generate() called: use_server_backend={self.use_server_backend}, server_process={self.server_process is not None}, model={self.model is not None}")
+
+        #   Clear before starting so a caller that reads it after an error path cannot see
+        #   the previous generation's verdict.
+        self.last_truncated = False
 
         # Route to API if using server backend
         if self.use_server_backend and self.server_process is not None:
@@ -2098,6 +2149,10 @@ class LlamaCppVLM:
 
                 accumulated = ""
                 token_count = 0
+                #   Bound before the loop: both are read by the post-loop yield below, and a
+                #   stream that produced no content deltas used to reach it undefined.
+                display_text = ""
+                raw_for_thinking = ""
                 for chunk in response_stream:
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content", "")
@@ -2111,8 +2166,11 @@ class LlamaCppVLM:
                         display_text = accumulated
                         raw_for_thinking = accumulated  # Keep a version with thinking preserved
 
+                        #   The FIRST </think> ends the reasoning, matching the llama-server
+                        #   path. Splitting on the last one meant any later literal </think>
+                        #   in the answer silently discarded everything before it.
                         if "</think>" in display_text:
-                            display_text = display_text.split("</think>")[-1].strip()
+                            display_text = display_text.split("</think>", 1)[1].strip()
 
                         # Clean up GPT-OSS Harmony format tags if present
                         if self.model_type == "gpt-oss":
@@ -2687,6 +2745,7 @@ def status_handler():
 def extract_text_history(
     history: List[Dict[str, Any]],
     keep_reasoning: bool = True,
+    raw_texts: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract text-only messages from display history for the model.
 
@@ -2694,8 +2753,14 @@ def extract_text_history(
     resending it. Reasoning is thousands of tokens per turn, so on a small n_ctx a
     few turns fill the window and the final answer gets truncated; on a large
     window keeping it (the default) preserves the model's native transcript.
+
+    raw_texts is the untouched model output for each assistant turn, in order. The chat
+    history only holds the answer now that reasoning lives in its own panel, so this is
+    where keep_reasoning=True gets the reasoning from - and it is the model's own
+    <think> form, not the "**[Thinking]**" display markup the history used to carry back.
     """
     messages = []
+    pending_raw = list(raw_texts or [])
     if history:
         for msg in history:
             if isinstance(msg, dict):
@@ -2716,8 +2781,15 @@ def extract_text_history(
                         text = " ".join(text_parts)
                     else:
                         continue
-                    if role == "assistant" and not keep_reasoning:
-                        text = strip_reasoning_for_context(text)
+                    if role == "assistant":
+                        #   Consume one raw text per assistant turn so the pairing stays in
+                        #   step even when a turn has no raw recorded (an error bubble, or a
+                        #   history restored from before the panel existed).
+                        raw = pending_raw.pop(0) if pending_raw else ""
+                        if keep_reasoning and raw:
+                            text = raw
+                        else:
+                            text = strip_reasoning_for_context(text)
                         if not text:
                             continue
                     messages.append({"role": role, "content": text})
@@ -2740,13 +2812,20 @@ def stream_chat_response(
 ):
     """Stream a generation into the last (assistant) entry of new_history.
 
-    Yields (history, stats, ctx_info) tuples.
+    Yields (history, stats, ctx_info, thinking, raw) tuples.
+
+    The chat entry only ever gets the answer; the reasoning goes out separately as
+    `thinking` for the panel beside the chat, so a long chain of thought cannot bury the
+    reply. `raw` is the untouched model text - the caller keeps it so "Send Reasoning Back"
+    still has something to send, which the history no longer carries.
     """
     global stop_generation
     stop_generation = False
 
     stats = ""
     ctx_info = ""
+    raw_text = ""
+    thinking = ""
     for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
         messages=messages,
         max_new_tokens=max_tokens,
@@ -2760,21 +2839,30 @@ def stream_chat_response(
         reasoning_level=reasoning_level,
         thinking=thinking_mode,
     ):
-        # Check stop flag
+        #   The chat bubble is the answer only. While the model is still reasoning
+        #   display_text is the "*Thinking…*" placeholder, which is what we want there.
+        new_history[-1]["content"] = display_text
+        thinking = extract_reasoning_for_display(raw_text) if show_thinking else ""
+
+        #   Assign first, then check: testing the flag before writing this frame threw away
+        #   up to one UI_STREAM_INTERVAL of tokens every time Stop was pressed.
         if stop_generation:
             new_history[-1]["content"] += "\n\n[Generation stopped]"
             stop_generation = False
-            yield new_history, stats, ctx_info
+            yield new_history, stats, ctx_info, thinking, raw_text
             return
 
-        # Show thinking if enabled, otherwise show cleaned text
-        if show_thinking:
-            # Convert <think> tags to markdown - Gradio strips literal <think>
-            # as unknown HTML, blanking the whole message
-            new_history[-1]["content"] = format_think_tags_for_display(raw_text)
-        else:
-            new_history[-1]["content"] = display_text
-        yield new_history, stats, ctx_info
+        yield new_history, stats, ctx_info, thinking, raw_text
+
+    if vlm_manager is not None and vlm_manager.last_truncated:
+        #   On both paths, which is the whole point - this used to be appended only to the
+        #   answer stream, so with Show Thinking on (the default) it never appeared at all
+        #   and a run that hit the token limit just stopped with no explanation.
+        banner = truncation_banner(max_tokens)
+        new_history[-1]["content"] = (new_history[-1]["content"] or "") + banner
+        if thinking:
+            thinking += banner
+        yield new_history, stats, ctx_info, thinking, raw_text
 
 
 # ===== Chat media gallery =====
@@ -2886,8 +2974,14 @@ def chat_handler(
     reasoning_level: str = "default",
     thinking_mode: bool = True,
     keep_reasoning: bool = True,
+    raw_history: Optional[List[str]] = None,
 ):
-    """Handle chat messages from UI with streaming support."""
+    """Handle chat messages from UI with streaming support.
+
+    Yields (history, "", stats, ctx_info, thinking, raw_history).
+    """
+    raw_history = list(raw_history or [])
+
     # Check if any model is loaded (either local or server mode)
     model_ready = (
         vlm_manager is not None and
@@ -2897,7 +2991,10 @@ def chat_handler(
         error_history = list(history) if history else []
         error_history.append({"role": "user", "content": message})
         error_history.append({"role": "assistant", "content": "Error: No model loaded. Please load a model first."})
-        yield error_history, "", "", ""
+        #   Keep the raw list aligned with the assistant bubble just added, or every later
+        #   turn pairs up with the wrong reasoning.
+        raw_history.append("")
+        yield error_history, "", "", "", "", raw_history
         return
 
     # Build messages list for the model
@@ -2908,7 +3005,7 @@ def chat_handler(
         messages.append({"role": "system", "content": system_prompt})
 
     # Add chat history (handle None case)
-    messages.extend(extract_text_history(history, keep_reasoning=keep_reasoning))
+    messages.extend(extract_text_history(history, keep_reasoning=keep_reasoning, raw_texts=raw_history))
 
     # Build current message content for model
     model_content = []
@@ -2982,12 +3079,16 @@ def chat_handler(
     }
 
     # Stream the response
-    for streamed_history, stats, ctx_info in stream_chat_response(
+    #   One slot for this turn's raw text, rewritten on every frame - the assistant bubble
+    #   is already in new_history, so the lists stay the same length throughout.
+    raw_history.append("")
+    for streamed_history, stats, ctx_info, thinking, raw_text in stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
         thinking_mode,
     ):
-        yield streamed_history, "", stats, ctx_info
+        raw_history[-1] = raw_text
+        yield streamed_history, "", stats, ctx_info, thinking, raw_history
 
 
 def regenerate_handler(
@@ -3004,39 +3105,52 @@ def regenerate_handler(
     reasoning_level: str = "default",
     thinking_mode: bool = True,
     keep_reasoning: bool = True,
+    raw_history: Optional[List[str]] = None,
 ):
     """Re-run the last user turn, discarding the previous assistant reply.
 
     Uses the snapshot saved by chat_handler (which keeps the original images/
     video/audio), but applies the current system prompt and sampling settings.
+
+    Yields (history, stats, ctx_info, thinking, raw_history).
     """
+    raw_history = list(raw_history or [])
+
     model_ready = (
         vlm_manager is not None and
         (vlm_manager.model is not None or vlm_manager.use_server_backend)
     )
     if not model_ready or last_turn is None:
-        yield history, "", ""
+        yield history, "", "", "", raw_history
         return
 
     # Rebuild model messages with the current system prompt
     messages = []
     if system_prompt and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
-    messages.extend(extract_text_history(last_turn["history_before"], keep_reasoning=keep_reasoning))
+    #   The reply being replaced is dropped from the raw list too, so it lines up with
+    #   history_before rather than trailing it by one.
+    prior_raw = raw_history[:-1] if raw_history else []
+    messages.extend(extract_text_history(
+        last_turn["history_before"], keep_reasoning=keep_reasoning, raw_texts=prior_raw,
+    ))
     messages.append({"role": "user", "content": last_turn["model_content"]})
 
     # Rebuild display history without the previous assistant reply
     new_history = list(last_turn["history_before"]) + list(last_turn["display_entries"])
     new_history.append({"role": "assistant", "content": ""})
 
-    yield from stream_chat_response(
+    raw_history = prior_raw + [""]
+    for streamed_history, stats, ctx_info, thinking, raw_text in stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
         thinking_mode,
-    )
+    ):
+        raw_history[-1] = raw_text
+        yield streamed_history, stats, ctx_info, thinking, raw_history
 
 
-def edit_last_handler(history: List[Dict[str, Any]]):
+def edit_last_handler(history: List[Dict[str, Any]], raw_history: Optional[List[str]] = None):
     """Remove the last exchange from the chat and return the user text for editing.
 
     Attached media from that turn is discarded - re-attach before resending.
@@ -3045,12 +3159,16 @@ def edit_last_handler(history: List[Dict[str, Any]]):
     last_turn = None
 
     history = list(history) if history else []
+    raw_history = list(raw_history or [])
     if not history:
-        return history, ""
+        return history, "", "", raw_history
 
     # Drop the trailing assistant reply
     while history and history[-1].get("role") == "assistant":
         history.pop()
+        #   One raw text per assistant bubble, so the two lists shrink together.
+        if raw_history:
+            raw_history.pop()
 
     # Drop the trailing user entries (text + media thumbnails), keeping the text
     text = ""
@@ -3059,14 +3177,15 @@ def edit_last_handler(history: List[Dict[str, Any]]):
         if isinstance(content, str) and not text:
             text = content
 
-    return history, text
+    # The thinking panel belonged to the reply just removed
+    return history, text, "", raw_history
 
 
 def clear_chat_handler():
     """Clear chat history."""
     global last_turn
     last_turn = None
-    return []
+    return [], "", []
 
 
 def stop_generation_handler():
@@ -3225,28 +3344,49 @@ def theme_accent_overrides(theme, selector: str) -> str:
     --primary-N, and re-declare that whole set on `selector`, where it resolves against the
     palette we put there. Derived from the theme rather than hand-listed so a Gradio upgrade
     that adds another accent token cannot quietly leave one behind.
+
+    The closure is a union across :root and .dark, and every token in it is emitted in every
+    block. Taking it per block instead is subtly wrong: --color-accent-soft is var(--primary-50)
+    in light but var(--neutral-700) in dark, so a per-block closure emits it on `selector`
+    (which has no .dark in it, and so applies in dark mode too) and not on `.dark selector`.
+    The chat's user bubble is background-color: var(--color-accent-soft), so it came out
+    near-white against dark mode's near-white text - an invisible prompt.
     """
-    blocks = []
+    parsed = []
     for block_selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", theme._get_theme_css()):
-        decls = []
+        decls = {}
         for declaration in body.split(";"):
             name, sep, value = declaration.partition(":")
             if sep and name.strip().startswith("--"):
-                decls.append((name.strip(), value.strip()))
+                decls[name.strip()] = value.strip()
+        parsed.append((block_selector.strip(), decls))
 
-        keep = {name for name, _ in decls if re.fullmatch(r"--primary-\d+", name)}
+    keep = set()
+    for _, decls in parsed:
+        block_keep = {name for name in decls if re.fullmatch(r"--primary-\d+", name)}
         while True:
             grown = {
-                name for name, value in decls
-                if name not in keep and any(f"var({dep})" in value for dep in keep)
+                name for name, value in decls.items()
+                if name not in block_keep and any(f"var({dep})" in value for dep in block_keep)
             }
             if not grown:
                 break
-            keep |= grown
+            block_keep |= grown
+        keep |= block_keep
 
+    root = dict(next((decls for sel, decls in parsed if sel == ":root"), {}))
+
+    blocks = []
+    for block_selector, decls in parsed:
         # :root -> the tab itself; .dark -> the tab inside a dark page
-        scope = selector if block_selector.strip() == ":root" else f"{block_selector.strip()} {selector}"
-        body_css = "\n".join(f"    {name}: {value};" for name, value in decls if name in keep)
+        scope = selector if block_selector == ":root" else f"{block_selector} {selector}"
+        #   Fall back to the :root value for a token this block does not restate - which is
+        #   what the token would have inherited anyway.
+        body_css = "\n".join(
+            f"    {name}: {decls.get(name, root[name])};"
+            for name in sorted(keep)
+            if name in decls or name in root
+        )
         if body_css:
             blocks.append(f"{scope} {{\n{body_css}\n}}")
 
@@ -3383,6 +3523,15 @@ def create_ui(nested: bool = False):
         overflow: hidden;
         text-overflow: ellipsis;
     }
+    /* Reasoning panel: capped and scrolling so a long chain of thought cannot push the
+       answer off the screen. Same resize/overflow idea as .resizable-chatbot above. */
+    .vlm-thinking {
+        resize: vertical;
+        overflow-y: auto;
+        max-height: 200px;
+        opacity: 0.85;
+        font-size: 0.9em;
+    }
     """
 
     if nested:
@@ -3435,6 +3584,22 @@ def create_ui(nested: bool = False):
                     type="messages",
                     elem_classes=["resizable-chatbot"],
                 )
+
+                #   Reasoning lives here rather than in the chat bubble, so the answer is
+                #   not buried under it. gr.Markdown, not gr.HTML: the chatbot's sanitizer
+                #   is exactly what we are getting out of the way of, and the reasoning is
+                #   already markdown by the time it arrives.
+                thinking_display = gr.Markdown(
+                    value="",
+                    label="Thinking",
+                    visible=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
+                    elem_id="vlm_thinking",
+                    elem_classes=["vlm-thinking"],
+                )
+                #   The raw model text for each assistant turn, parallel to the chat
+                #   history. Send Reasoning Back reads it: the bubbles hold only answers now,
+                #   so the history alone no longer has any reasoning to resend.
+                chat_raw_state = gr.State(value=[])
 
                 # Media gallery - one multi-upload dropzone feeding a card grid
                 gr.Markdown(
@@ -3896,25 +4061,25 @@ def create_ui(nested: bool = False):
             media state, dropzone and preview all reset in one shot."""
             return msg, list(media or []), "", [], None, vlm_media_preview_html([])
 
-        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason, dynamic, *model_cfg):
+        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason, raw_hist, dynamic, *model_cfg):
             media = list(media or [])
 
             if not msg.strip() and not media:
-                yield history, "", "", gr.update()
+                yield history, "", "", gr.update(), gr.update(), raw_hist
                 return
 
             def work():
                 # Stream responses from chat_handler generator
-                for new_history, _, stats, ctx_info in chat_handler(
+                for new_history, _, stats, ctx_info, think_text, raw_hist_out in chat_handler(
                     msg, history, sys_prompt, media,
                     max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
-                    think_mode, keep_reason
+                    think_mode, keep_reason, raw_hist
                 ):
-                    yield new_history, stats, ctx_info, gr.update()
+                    yield new_history, stats, ctx_info, gr.update(), think_text, raw_hist_out
 
             yield from run_managed(
                 dynamic, model_cfg, work,
-                lambda status: (history, "", "", status),
+                lambda status: (history, "", "", status, gr.update(), raw_hist),
             )
 
         chat_media_outputs = [chat_media_state, chat_media_files, chat_media_preview]
@@ -3925,10 +4090,10 @@ def create_ui(nested: bool = False):
             pending_msg, chatbot, system_prompt,
             pending_media,
             max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-            thinking_mode, keep_reasoning,
+            thinking_mode, keep_reasoning, chat_raw_state,
             dynamic_loading, *MODEL_CFG
         ]
-        send_outputs = [chatbot, stats_display, context_display, status_display]
+        send_outputs = [chatbot, stats_display, context_display, status_display, thinking_display, chat_raw_state]
 
         for send_trigger in (send_btn.click, msg_input.submit):
             send_trigger(
@@ -4012,15 +4177,16 @@ def create_ui(nested: bool = False):
         def regenerate_message(history, *rest):
             #   Same shape as send_message: the handler's own outputs, plus the status box
             #   that Dynamic loading writes a failed load into.
-            handler_args, (dynamic, *model_cfg) = rest[:12], rest[12:]
+            handler_args, (dynamic, *model_cfg) = rest[:13], rest[13:]
+            raw_hist = handler_args[-1]
 
             def work():
-                for chat, stats, ctx_info in regenerate_handler(history, *handler_args):
-                    yield chat, stats, ctx_info, gr.update()
+                for chat, stats, ctx_info, think_text, raw_hist_out in regenerate_handler(history, *handler_args):
+                    yield chat, stats, ctx_info, gr.update(), think_text, raw_hist_out
 
             yield from run_managed(
                 dynamic, model_cfg, work,
-                lambda status: (history, "", "", status),
+                lambda status: (history, "", "", status, gr.update(), raw_hist),
             )
 
         regen_btn.click(
@@ -4028,7 +4194,7 @@ def create_ui(nested: bool = False):
             inputs=[
                 chatbot, system_prompt, max_tokens, temperature, top_p,
                 repeat_penalty, seed, video_max_frames, every_other_frame,
-                show_thinking, reasoning_level, thinking_mode, keep_reasoning,
+                show_thinking, reasoning_level, thinking_mode, keep_reasoning, chat_raw_state,
                 dynamic_loading, *MODEL_CFG
             ],
             outputs=send_outputs,
@@ -4036,13 +4202,21 @@ def create_ui(nested: bool = False):
 
         edit_last_btn.click(
             fn=edit_last_handler,
-            inputs=[chatbot],
-            outputs=[chatbot, msg_input],
+            inputs=[chatbot, chat_raw_state],
+            outputs=[chatbot, msg_input, thinking_display, chat_raw_state],
         )
 
         clear_btn.click(
             fn=clear_chat_handler,
-            outputs=[chatbot],
+            outputs=[chatbot, thinking_display, chat_raw_state],
+        )
+
+        #   Show Thinking now decides whether the panel is on screen, rather than whether
+        #   the reasoning is mixed into the chat bubble.
+        show_thinking.change(
+            fn=lambda on: gr.update(visible=bool(on)),
+            inputs=[show_thinking],
+            outputs=[thinking_display],
         )
 
         # System prompt preset handlers

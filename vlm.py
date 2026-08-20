@@ -14,7 +14,6 @@ Installation with CUDA (Windows prebuilt):
 """
 
 import os
-import sys
 import gc
 import re
 import json
@@ -46,10 +45,7 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: opencv-python not installed. Video support will be limited.")
 
-# Import llama-cpp-python (installed manually into the local llama.cpp folder)
-_LLAMA_CPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama.cpp")
-if _LLAMA_CPP_DIR not in sys.path:
-    sys.path.insert(0, _LLAMA_CPP_DIR)
+# Import llama-cpp-python (optional; we normally use the native llama-server backend)
 try:
     from llama_cpp import Llama
     from llama_cpp import llama_cpp as llama_cpp_lib
@@ -98,8 +94,7 @@ except ImportError:
     Llama = None
     Qwen25VLChatHandler = None
     Qwen3VLChatHandler = None
-    print("Error: llama-cpp-python not installed.")
-    print("Install with CUDA: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
+    print("Note: llama-cpp-python not installed; in-process backend disabled (using llama-server).")
 
 
 def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
@@ -2233,12 +2228,22 @@ stop_generation: bool = False
 # Snapshot of the last chat turn (model content + display history) for Regenerate
 last_turn: Optional[Dict[str, Any]] = None
 
+#   Set by modules.ui_vlm when this file is rendered as a webui tab; None when vlm.py runs
+#   standalone. Every piece of forge-specific behaviour - the generation queue, freeing the
+#   diffusion model's VRAM - goes through it, so nothing here ever imports modules.* and
+#   `python vlm.py` keeps working on its own.
+FORGE = None
+
+#   Anchored to this file rather than the process CWD: embedded in the webui the CWD happens
+#   to be the repo root too, but nothing guarantees it.
+_VLM_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Default settings file path
-SETTINGS_FILE = "vlm_settings.json"
+SETTINGS_FILE = os.path.join(_VLM_DIR, "vlm_settings.json")
 # System prompt presets file path
-PROMPTS_FILE = "vlm_prompts.json"
+PROMPTS_FILE = os.path.join(_VLM_DIR, "vlm_prompts.json")
 # Per-model settings profiles file path
-PROFILES_FILE = "vlm_model_profiles.json"
+PROFILES_FILE = os.path.join(_VLM_DIR, "vlm_model_profiles.json")
 
 # Default settings values
 DEFAULT_SETTINGS = {
@@ -2246,7 +2251,7 @@ DEFAULT_SETTINGS = {
     "model_name": None,  # Will use first available if None
     "n_gpu_layers": -1,
     "n_ctx": 32768,
-    "backend_type": "llama-cpp-python",
+    "backend_type": "llama-server",
     "tensor_split": "",
     "main_gpu": 0,
     "kv_cache_type": "f16",
@@ -2257,6 +2262,11 @@ DEFAULT_SETTINGS = {
     "extra_args": "",
     "server_port": 8080,
     "llama_server_path": "llama.cpp/build/bin/llama-server",
+    #   Load the LLM for the duration of one request and drop it again afterwards, handing
+    #   the VRAM back to the diffusion model. Only does anything inside the webui; standalone
+    #   there is no diffusion model to make room for, so the manual Load/Unload buttons are
+    #   the whole story.
+    "dynamic_loading": False,
     # Generation Settings
     "system_prompt": "You are a helpful AI assistant that can understand and describe images and videos in detail.",
     "max_tokens": 8096,
@@ -2297,6 +2307,7 @@ def save_settings(
     extra_args: str,
     server_port: int,
     llama_server_path: str,
+    dynamic_loading: bool,
     # Generation Settings
     system_prompt: str,
     max_tokens: int,
@@ -2331,6 +2342,7 @@ def save_settings(
         "extra_args": extra_args,
         "server_port": server_port,
         "llama_server_path": llama_server_path,
+        "dynamic_loading": dynamic_loading,
         # Generation Settings
         "system_prompt": system_prompt,
         "max_tokens": max_tokens,
@@ -2452,8 +2464,12 @@ def apply_batch_prompt_preset(name: str):
 
 
 # Per-model settings saved/restored when the model selection changes
+#   Deliberately no "backend_type": profiles are written on every successful load, so
+#   including it meant an old profile silently reapplied its backend over whatever Save
+#   Settings had just written - the settings looked like they were not saving at all.
+#   There is only one backend now anyway.
 PROFILE_KEYS = [
-    "n_gpu_layers", "n_ctx", "backend_type", "tensor_split", "main_gpu",
+    "n_gpu_layers", "n_ctx", "tensor_split", "main_gpu",
     "kv_cache_type", "flash_attn", "use_mmap", "use_mlock",
     "override_tensor", "extra_args", "server_port",
 ]
@@ -2531,8 +2547,8 @@ def save_model_profile(model_name: str, profile: Dict[str, Any]) -> None:
 def apply_model_profile(model_name: str):
     """Restore saved settings for the selected model, if a profile exists.
 
-    Returns updates for the PROFILE_KEYS components plus the server options
-    row visibility.
+    Returns one update per PROFILE_KEYS component. The backend is not among them - see the
+    note on PROFILE_KEYS.
     """
     profiles = load_model_profiles()
     profile = profiles.get(model_name)
@@ -2541,13 +2557,12 @@ def apply_model_profile(model_name: str):
         profile = get_recommended_profile(model_name)
         source = "Applied recommended"
     if not profile:
-        return [gr.update()] * (len(PROFILE_KEYS) + 1)
+        return [gr.update()] * len(PROFILE_KEYS)
 
     updates = [
         gr.update(value=profile[key]) if key in profile else gr.update()
         for key in PROFILE_KEYS
     ]
-    updates.append(gr.update(visible=(profile.get("backend_type") == "llama-server")))
     print(f"[vlm.py] {source} settings for '{model_name}'")
     return updates
 
@@ -3168,29 +3183,104 @@ def batch_caption_handler(
     return f"Processed {total} files:\n\n" + "\n".join(results)
 
 
-def create_ui():
-    """Create the Gradio interface."""
+#   Runs once per page: swallow stray file drops so the browser does not navigate away from
+#   the page, and expose the callback the per-card remove buttons in the media preview call.
+#   Standalone only - embedded, the webui serves the same code from javascript/vlm.js, which
+#   modules/ui_gradio_extensions.py injects into the real <head>. Keep the two in step.
+VLM_PAGE_JS = r"""
+    () => {
+        // A file dropped outside an upload zone would otherwise navigate the
+        // browser to the file, wiping out the page. Swallow stray drops at the
+        // window level; Gradio's own dropzones handle their drops first.
+        window.addEventListener('dragover', (e) => { e.preventDefault(); }, false);
+        window.addEventListener('drop', (e) => { e.preventDefault(); }, false);
+
+        // Per-card remove buttons in the media preview: write the 1-based index
+        // into the hidden textbox, then click the hidden button.
+        window.vlmRemoveMedia = (idx) => {
+            const box = document.querySelector('#vlm_media_remove_idx textarea, #vlm_media_remove_idx input');
+            if (!box) return;
+            box.value = String(idx);
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+            setTimeout(() => {
+                const btn = document.querySelector('#vlm_media_remove_btn button, button#vlm_media_remove_btn, #vlm_media_remove_btn');
+                if (btn) btn.click();
+            }, 60);
+        };
+    }
+"""
+
+
+def theme_accent_overrides(theme, selector: str) -> str:
+    """CSS restating every accent-derived token of `theme`, scoped to `selector`.
+
+    Needed because Gradio ignores theme= on a child Blocks, so the VLM tab inherits the
+    webui's hue. Restating just --primary-N is not enough: a custom property is substituted
+    where it is *declared*, so `--color-accent: var(--primary-500)` sitting on :root has
+    already resolved to the webui's orange by the time the tab sees it, and every token
+    downstream of it - --loader-color and so the progress bar, the primary button fills -
+    carries that orange down as an inherited literal.
+
+    So walk the theme's own CSS, take the transitive closure of everything that reads
+    --primary-N, and re-declare that whole set on `selector`, where it resolves against the
+    palette we put there. Derived from the theme rather than hand-listed so a Gradio upgrade
+    that adds another accent token cannot quietly leave one behind.
+    """
+    blocks = []
+    for block_selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", theme._get_theme_css()):
+        decls = []
+        for declaration in body.split(";"):
+            name, sep, value = declaration.partition(":")
+            if sep and name.strip().startswith("--"):
+                decls.append((name.strip(), value.strip()))
+
+        keep = {name for name, _ in decls if re.fullmatch(r"--primary-\d+", name)}
+        while True:
+            grown = {
+                name for name, value in decls
+                if name not in keep and any(f"var({dep})" in value for dep in keep)
+            }
+            if not grown:
+                break
+            keep |= grown
+
+        # :root -> the tab itself; .dark -> the tab inside a dark page
+        scope = selector if block_selector.strip() == ":root" else f"{block_selector.strip()} {selector}"
+        body_css = "\n".join(f"    {name}: {value};" for name, value in decls if name in keep)
+        if body_css:
+            blocks.append(f"{scope} {{\n{body_css}\n}}")
+
+    return "\n".join(blocks)
+
+
+def create_ui(nested: bool = False):
+    """Create the Gradio interface.
+
+    nested=True builds the tab that modules.ui renders into the webui: no title, theme or
+    css kwargs, because Gradio drops all three on a child Blocks. The stylesheet and the
+    page script travel through head= instead, the way modules/ui.py carries canvas_head.
+    """
     # Load saved settings
     saved_settings = load_settings()
     preset_choices = sorted(load_prompt_presets())
 
     # Theme
-    vlm_theme = themes.Default(
-        primary_hue=colors.Color(
-            name="custom",
-            c50="#E6F0FF",
-            c100="#CCE0FF",
-            c200="#99C1FF",
-            c300="#66A3FF",
-            c400="#3384FF",
-            c500="#0060df",
-            c600="#0052C2",
-            c700="#003D91",
-            c800="#002961",
-            c900="#001430",
-            c950="#000A18"
-        )
+    vlm_primary = colors.Color(
+        name="custom",
+        c50="#E6F0FF",
+        c100="#CCE0FF",
+        c200="#99C1FF",
+        c300="#66A3FF",
+        c400="#3384FF",
+        c500="#0060df",
+        c600="#0052C2",
+        c700="#003D91",
+        c800="#002961",
+        c900="#001430",
+        c950="#000A18"
     )
+    vlm_theme = themes.Default(primary_hue=vlm_primary)
+
 
     vlm_css = """
     .green-btn {
@@ -3295,10 +3385,45 @@ def create_ui():
     }
     """
 
+    if nested:
+        #   Appended rather than interpolated: vlm_css is full of CSS braces, so making it
+        #   an f-string would mean doubling every one of them. #tab_vlm is the elem_id
+        #   modules/ui.py gives the TabItem, so none of this exists standalone.
+        vlm_css += theme_accent_overrides(vlm_theme, "#tab_vlm")
+
+        #   Gradio's light-mode recipe for a primary button is a pale primary-100 fill with
+        #   primary-600 text, which leaves Send and Load Model washed out and hard to pick
+        #   out. Use the solid fill and white text it reserves for dark mode in both, so
+        #   they read the same as the Generate button on the other tabs. Listed after
+        #   theme_accent_overrides, and naming .dark explicitly, so it outranks the .dark
+        #   block that emits.
+        vlm_css += f"""
+#tab_vlm, .dark #tab_vlm {{
+    --slider-color: {vlm_primary.c500};
+    --button-primary-background-fill: linear-gradient(to bottom right, var(--primary-500), var(--primary-600));
+    --button-primary-background-fill-hover: linear-gradient(to bottom right, var(--primary-600), var(--primary-700));
+    --button-primary-border-color: var(--primary-600);
+    --button-primary-border-color-hover: var(--primary-700);
+    --button-primary-text-color: white;
+    --button-primary-text-color-hover: white;
+}}
+"""
+
     # Get initial model list
     initial_models = vlm_manager.get_model_names() if vlm_manager else ["Initialize manager first"]
 
-    with gr.Blocks(title="Chromaforge VLM (llama.cpp)", theme=vlm_theme, css=vlm_css) as demo:
+    if nested:
+        blocks = gr.Blocks(analytics_enabled=False)
+    else:
+        blocks = gr.Blocks(title="Chromaforge VLM (llama.cpp)", theme=vlm_theme, css=vlm_css)
+
+    with blocks as demo:
+        if nested:
+            #   Gradio 4 drops css=, theme= and head= on a child Blocks that a parent
+            #   renders, so the stylesheet has to ride in as markup. A <style> tag inserted
+            #   this way does apply (unlike <script>, which is why VLM_PAGE_JS lives in
+            #   javascript/vlm.js for the embedded case).
+            gr.HTML(f"<style>{vlm_css}</style>")
 
         with gr.Tabs():
             # Chat Tab
@@ -3414,9 +3539,12 @@ def create_ui():
         else:
             initial_model_value = initial_models[0] if initial_models else None
 
-        # Determine if server options should be visible based on saved backend
-        saved_backend = saved_settings.get("backend_type", DEFAULT_SETTINGS["backend_type"])
-        server_options_visible = saved_backend == "llama-server"
+        #   llama-server is the only backend we run: it is the one that keeps up with new
+        #   architectures, and stopping a subprocess is the only reliable way to get the
+        #   VRAM back for the diffusion model. modules/ui_llm2img.py made the same call.
+        #   The component stays so every settings/profile list keeps its shape, but it is
+        #   fixed and hidden, and the server options are therefore always relevant.
+        server_options_visible = True
 
         with gr.Accordion("Model Settings", open=True):
             with gr.Row():
@@ -3452,14 +3580,14 @@ def create_ui():
                         label="Context Length",
                     )
 
+            backend_type = gr.Dropdown(
+                label="Backend",
+                choices=["llama-server"],
+                value="llama-server",
+                visible=False,
+            )
+
             with gr.Row():
-                with gr.Column(scale=1):
-                    backend_type = gr.Dropdown(
-                        label="Backend",
-                        choices=["llama-cpp-python", "llama-server"],
-                        value=saved_settings.get("backend_type", DEFAULT_SETTINGS["backend_type"]),
-                        info="llama-server enables MoE --override-tensor",
-                    )
                 with gr.Column(scale=2):
                     tensor_split = gr.Textbox(
                         label="Tensor Split (Multi-GPU)",
@@ -3543,14 +3671,15 @@ def create_ui():
                     scale=3,
                 )
 
-            # Toggle server options visibility based on backend selection
-            def toggle_server_options(backend):
-                return gr.update(visible=(backend == "llama-server"))
-
-            backend_type.change(
-                fn=toggle_server_options,
-                inputs=[backend_type],
-                outputs=[server_options_row],
+            dynamic_loading = gr.Checkbox(
+                label="Dynamic loading",
+                value=saved_settings.get("dynamic_loading", DEFAULT_SETTINGS["dynamic_loading"]),
+                info=(
+                    "Webui only: free the diffusion model's VRAM and load the LLM for each "
+                    "request, then unload it again so the next generation gets the VRAM back. "
+                    "Leave off to drive the Load/Unload buttons yourself."
+                ),
+                visible=FORGE is not None,
             )
 
         with gr.Accordion("Generation Settings", open=False):
@@ -3704,18 +3833,54 @@ def create_ui():
 
             return status
 
+        #   Exactly load_model_dispatcher's parameter list, in order. Both generation entry
+        #   points carry it so they can start the server themselves under Dynamic loading.
+        MODEL_CFG = [
+            backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
+            flash_attn, main_gpu, kv_cache_type, use_mmap, use_mlock, override_tensor, extra_args, server_port,
+            llama_server_path
+        ]
+
+        def run_managed(dynamic, model_cfg, work, on_load_error):
+            """Run the generator `work` under the webui's generation queue.
+
+            With Dynamic loading on, the diffusion model's VRAM is freed and the LLM loaded
+            first, then dropped again on the way out - all inside one queue slot, so no
+            diffusion job can start while the LLM owns the card. Standalone (FORGE is None)
+            this is a plain pass-through.
+
+            on_load_error(status) shapes a failed load into whatever tuple the calling
+            event's outputs expect, since the two entry points do not share an output list.
+            """
+            if FORGE is None:
+                yield from work()
+                return
+
+            with FORGE.job():
+                if dynamic:
+                    FORGE.unload_diffusion()
+                    status = load_model_dispatcher(*model_cfg)
+                    if isinstance(status, str) and status.startswith("Error"):
+                        yield on_load_error(status)
+                        return
+                try:
+                    yield from work()
+                finally:
+                    if dynamic:
+                        unload_model_handler()
+
+        def queued(fn):
+            """Serialise a plain (non-streaming) handler against the generation queue."""
+            return fn if FORGE is None else FORGE.queued(fn)
+
         load_model_btn.click(
-            fn=load_model_dispatcher,
-            inputs=[
-                backend_type, model_dropdown, n_gpu_layers, n_ctx, tensor_split,
-                flash_attn, main_gpu, kv_cache_type, use_mmap, use_mlock, override_tensor, extra_args, server_port,
-                llama_server_path
-            ],
+            fn=queued(load_model_dispatcher),
+            inputs=MODEL_CFG,
             outputs=[status_display],
         )
 
         unload_model_btn.click(
-            fn=unload_model_handler,
+            fn=queued(unload_model_handler),
             outputs=[status_display],
         )
 
@@ -3731,20 +3896,26 @@ def create_ui():
             media state, dropzone and preview all reset in one shot."""
             return msg, list(media or []), "", [], None, vlm_media_preview_html([])
 
-        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason):
+        def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason, dynamic, *model_cfg):
             media = list(media or [])
 
             if not msg.strip() and not media:
-                yield history, "", ""
+                yield history, "", "", gr.update()
                 return
 
-            # Stream responses from chat_handler generator
-            for new_history, _, stats, ctx_info in chat_handler(
-                msg, history, sys_prompt, media,
-                max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
-                think_mode, keep_reason
-            ):
-                yield new_history, stats, ctx_info
+            def work():
+                # Stream responses from chat_handler generator
+                for new_history, _, stats, ctx_info in chat_handler(
+                    msg, history, sys_prompt, media,
+                    max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
+                    think_mode, keep_reason
+                ):
+                    yield new_history, stats, ctx_info, gr.update()
+
+            yield from run_managed(
+                dynamic, model_cfg, work,
+                lambda status: (history, "", "", status),
+            )
 
         chat_media_outputs = [chat_media_state, chat_media_files, chat_media_preview]
 
@@ -3754,9 +3925,10 @@ def create_ui():
             pending_msg, chatbot, system_prompt,
             pending_media,
             max_tokens, temperature, top_p, repeat_penalty, seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
-            thinking_mode, keep_reasoning
+            thinking_mode, keep_reasoning,
+            dynamic_loading, *MODEL_CFG
         ]
-        send_outputs = [chatbot, stats_display, context_display]
+        send_outputs = [chatbot, stats_display, context_display, status_display]
 
         for send_trigger in (send_btn.click, msg_input.submit):
             send_trigger(
@@ -3832,37 +4004,34 @@ def create_ui():
             outputs=chat_media_outputs,
         )
 
-        demo.load(None, None, None, js=r"""
-            () => {
-                // A file dropped outside an upload zone would otherwise navigate the
-                // browser to the file, wiping out the page. Swallow stray drops at the
-                // window level; Gradio's own dropzones handle their drops first.
-                window.addEventListener('dragover', (e) => { e.preventDefault(); }, false);
-                window.addEventListener('drop', (e) => { e.preventDefault(); }, false);
+        if not nested:
+            #   Embedded, the same script is already in the tab's <head>; running it a second
+            #   time would double up the window listeners.
+            demo.load(None, None, None, js=VLM_PAGE_JS)
 
-                // Per-card remove buttons in the media preview: write the 1-based index
-                // into the hidden textbox, then click the hidden button.
-                window.vlmRemoveMedia = (idx) => {
-                    const box = document.querySelector('#vlm_media_remove_idx textarea, #vlm_media_remove_idx input');
-                    if (!box) return;
-                    box.value = String(idx);
-                    box.dispatchEvent(new Event('input', { bubbles: true }));
-                    setTimeout(() => {
-                        const btn = document.querySelector('#vlm_media_remove_btn button, button#vlm_media_remove_btn, #vlm_media_remove_btn');
-                        if (btn) btn.click();
-                    }, 60);
-                };
-            }
-        """)
+        def regenerate_message(history, *rest):
+            #   Same shape as send_message: the handler's own outputs, plus the status box
+            #   that Dynamic loading writes a failed load into.
+            handler_args, (dynamic, *model_cfg) = rest[:12], rest[12:]
+
+            def work():
+                for chat, stats, ctx_info in regenerate_handler(history, *handler_args):
+                    yield chat, stats, ctx_info, gr.update()
+
+            yield from run_managed(
+                dynamic, model_cfg, work,
+                lambda status: (history, "", "", status),
+            )
 
         regen_btn.click(
-            fn=regenerate_handler,
+            fn=regenerate_message,
             inputs=[
                 chatbot, system_prompt, max_tokens, temperature, top_p,
                 repeat_penalty, seed, video_max_frames, every_other_frame,
-                show_thinking, reasoning_level, thinking_mode, keep_reasoning
+                show_thinking, reasoning_level, thinking_mode, keep_reasoning,
+                dynamic_loading, *MODEL_CFG
             ],
-            outputs=[chatbot, stats_display, context_display],
+            outputs=send_outputs,
         )
 
         edit_last_btn.click(
@@ -3905,10 +4074,11 @@ def create_ui():
         model_dropdown.change(
             fn=apply_model_profile,
             inputs=[model_dropdown],
+            # Same order as PROFILE_KEYS
             outputs=[
-                n_gpu_layers, n_ctx, backend_type, tensor_split, main_gpu,
+                n_gpu_layers, n_ctx, tensor_split, main_gpu,
                 kv_cache_type, flash_attn, use_mmap, use_mlock,
-                override_tensor, extra_args, server_port, server_options_row
+                override_tensor, extra_args, server_port
             ],
         )
 
@@ -3916,13 +4086,42 @@ def create_ui():
             fn=stop_generation_handler,
         )
 
+        def batch_caption_managed(
+            folder, b_prompt, b_system_prompt,
+            max_tok, temp, rep_pen, seed_val, vid_frames, every_other,
+            dynamic,
+            #   MODEL_CFG spelled out rather than *args: Gradio only injects the progress
+            #   tracker into a *positional* parameter whose default is a gr.Progress, and a
+            #   *args would push it into keyword-only territory - costing the batch its
+            #   progress bar, which is the one place a long run really needs it.
+            backend, model_name, ngl, nctx, tsplit, fattn, mgpu, kvt,
+            mmap_val, mlock_val, otensor, xargs, sport, spath,
+            progress=gr.Progress(),
+        ):
+            model_cfg = (
+                backend, model_name, ngl, nctx, tsplit, fattn, mgpu, kvt,
+                mmap_val, mlock_val, otensor, xargs, sport, spath,
+            )
+
+            def work():
+                yield batch_caption_handler(
+                    folder, b_prompt, b_system_prompt,
+                    max_tok, temp, rep_pen, seed_val, vid_frames, every_other, progress,
+                ), gr.update()
+
+            yield from run_managed(
+                dynamic, model_cfg, work,
+                lambda status: ("", status),
+            )
+
         batch_start_btn.click(
-            fn=batch_caption_handler,
+            fn=batch_caption_managed,
             inputs=[
                 batch_folder, batch_prompt, batch_system_prompt,
-                max_tokens, temperature, repeat_penalty, seed, video_max_frames, every_other_frame
+                max_tokens, temperature, repeat_penalty, seed, video_max_frames, every_other_frame,
+                dynamic_loading, *MODEL_CFG
             ],
-            outputs=[batch_output],
+            outputs=[batch_output, status_display],
         )
 
         # Save settings handler
@@ -3933,7 +4132,7 @@ def create_ui():
                 model_dropdown, n_gpu_layers, n_ctx, backend_type,
                 tensor_split, main_gpu, kv_cache_type, flash_attn,
                 use_mmap, use_mlock, override_tensor, extra_args,
-                server_port, llama_server_path,
+                server_port, llama_server_path, dynamic_loading,
                 # Generation Settings
                 system_prompt, max_tokens, temperature, top_p, repeat_penalty,
                 seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
@@ -3986,19 +4185,12 @@ def main():
     print("=" * 60)
     print("Chromaforge VLM Chat Interface (llama.cpp Backend)")
     print("=" * 60)
-    print(f"llama-cpp-python: {'available' if LLAMA_CPP_AVAILABLE else 'NOT INSTALLED'}")
+    print(f"llama-cpp-python: {'available' if LLAMA_CPP_AVAILABLE else 'not installed (using llama-server)'}")
     print(f"Models directory: {args.models_dir}")
     print(f"Server: http://{host}:{args.port}")
     if args.listen:
         print("LAN access: enabled (listening on 0.0.0.0)")
     print("=" * 60)
-
-    if not LLAMA_CPP_AVAILABLE:
-        print("\nERROR: llama-cpp-python not installed!")
-        print("\nInstall with CUDA support:")
-        print("  Linux: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python")
-        print("  Windows: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121")
-        return
 
     # Initialize the manager
     initialize_manager(args.models_dir)

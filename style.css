@@ -315,6 +315,17 @@ input[type="checkbox"].input-accordion-checkbox{
     min-height: 3em;
 }
 
+/* Generate buttons in the theme's blue rather than its orange. Matched on the id suffix
+   ui_toprow.py gives every one of them, so txt2img, img2img and LLM2img all pick it up. */
+button[id$="_generate"] {
+    background: linear-gradient(to bottom right, #0060df, #0052C2) !important;
+    border-color: #0052C2 !important;
+    color: white !important;
+}
+button[id$="_generate"]:hover {
+    background: linear-gradient(to bottom right, #0052C2, #003D91) !important;
+}
+
 @media screen and (min-width: 2500px) {
     #txt2img_gallery, #img2img_gallery {
         min-height: 768px;

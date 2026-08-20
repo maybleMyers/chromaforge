@@ -1241,6 +1241,14 @@ def create_ui():
         from modules import errors
         errors.report("Could not load LLM2img tab", exc_info=True)
 
+    vlm_interface = None
+    try:
+        from modules import ui_vlm
+        vlm_interface = ui_vlm.create_vlm_interface()
+    except Exception:
+        from modules import errors
+        errors.report("Could not load VLM tab", exc_info=True)
+
     with gr.Blocks(analytics_enabled=False) as pnginfo_interface:
         with ResizeHandleRow(equal_height=False):
             with gr.Column(variant='panel'):
@@ -1287,8 +1295,15 @@ def create_ui():
     ]
 
     # Place LLM2img right after Img2img, whose options it clones
+    next_index = 2
     if llm2img_interface is not None:
-        interfaces.insert(2, (llm2img_interface, "LLM2img", "llm2img"))
+        interfaces.insert(next_index, (llm2img_interface, "LLM2img", "llm2img"))
+        next_index += 1
+
+    #   Right after LLM2img, which drives the same llama.cpp backend. Indexed off whether
+    #   that tab loaded so a broken LLM2img does not push VLM past Spaces.
+    if vlm_interface is not None:
+        interfaces.insert(next_index, (vlm_interface, "VLM", "vlm"))
 
     # Add Z-Image i2L tab if available
     try:

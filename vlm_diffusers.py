@@ -1,11 +1,12 @@
 """
 VLM Backend using Diffusers/Transformers for Vision Language Models
-Supports Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL) and GLM-4V models.
+Supports Qwen-VL (Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.8-Flash-Next) and GLM-4V models.
 Supports loading unquantized models across multiple GPUs.
 
 Requirements:
-- pip install transformers>=4.51.0 accelerate qwen-vl-utils torch torchvision
-- For multi-GPU: pip install accelerate
+- pip install transformers>=5.16.0 accelerate>=1.2.0 qwen-vl-utils torch torchvision
+- For multi-GPU / CPU offload: pip install accelerate>=1.2.0
+  (transformers ignores device_map and max_memory entirely below accelerate 1.1.0)
 
 Usage:
     python vlm_diffusers.py --models-dir models/LLM --port 7863
@@ -435,6 +436,15 @@ try:
         QWEN3_VL_AVAILABLE = False
         print("Note: Qwen3VLMoeForConditionalGeneration not available, will use fallback classes")
 
+    # Qwen3.8-Flash-Next (model_type "qwen4_exp") requires transformers >= 5.16.0 (PR #48337)
+    try:
+        from transformers import Qwen4ExpForConditionalGeneration  # noqa: F401
+        QWEN4_EXP_AVAILABLE = True
+        print("Qwen4-Exp (Qwen3.8-Flash-Next) support: available (native transformers)")
+    except ImportError:
+        QWEN4_EXP_AVAILABLE = False
+        print("Note: Qwen4-Exp not available (requires transformers >= 5.16.0)")
+
     # Use native transformers GLM4V classes
     # GLM-4.1V uses Glm4v* classes, GLM-4.6V uses Glm46V* classes
     try:
@@ -474,6 +484,7 @@ try:
 except ImportError as e:
     TRANSFORMERS_AVAILABLE = False
     QWEN3_VL_AVAILABLE = False
+    QWEN4_EXP_AVAILABLE = False
     GLM4V_AVAILABLE = False
     GLM46V_AVAILABLE = False
     DEEPSEEK_V4_AVAILABLE = False
@@ -783,6 +794,9 @@ def find_vlm_models(models_dir: str) -> List[Dict[str, str]]:
                 elif "deepseek" in arch or model_type_str.startswith("deepseek"):
                     model_type = "deepseek"
                 # Detect Qwen models
+                # Note: Qwen3.8-Flash-Next (arch "Qwen4ExpForConditionalGeneration",
+                # model_type "qwen4_exp") matches on "qwen" and is promoted to qwen-vl by its
+                # vision_config, so it needs no special case here.
                 elif "qwen" in arch or "qwen" in model_type_str:
                     if "vl" in arch or "vision" in model_type_str or config.get("vision_config"):
                         model_type = "qwen-vl"
@@ -1213,12 +1227,25 @@ class Qwen3VLMBackend:
             print(f"Loading model from: {model_path}")
             print(f"Dtype: {torch_dtype if torch_dtype else 'native (for FP8)'}, Device map: {device_map}")
 
+            # Read the checkpoint's own model_type once - both the attention decision below and
+            # the class-dispatch ladder further down need it
+            config_path = os.path.join(model_path, "config.json")
+            model_type_from_config = None
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    model_type_from_config = json.load(f).get("model_type", "")
+            is_qwen4_exp = model_type_from_config == "qwen4_exp"
+
             # Load the model
             # Determine attention implementation
             attn_impl = "sdpa"  # Default to PyTorch's scaled dot product attention
             if model_type == "deepseek" and self.use_flash_attention:
                 # DeepSeek V4's hybrid CSA/HCA attention is untested with flash_attention_2
                 print("[DeepSeek] Flash Attention untested with DeepSeek V4 hybrid attention; using SDPA")
+            elif is_qwen4_exp and self.use_flash_attention:
+                # Qwen4ExpPreTrainedModel sets _supports_flash_attn = False (the flash-mla kernels
+                # aren't wired up upstream yet); only SDPA and eager are accepted
+                print("[Qwen4-Exp] Flash Attention 2 unsupported by this architecture; using SDPA")
             elif self.use_flash_attention:
                 try:
                     import flash_attn
@@ -1368,14 +1395,8 @@ class Qwen3VLMBackend:
 
             # Use appropriate model class based on type
             if model_type in ["qwen-vl", "glm-vl", "internvl", "step3-vl"]:
-                # Detect model architecture from config to choose the right class
-                config_path = os.path.join(model_path, "config.json")
-                model_type_from_config = None
-                if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
-                        config_data = json.load(f)
-                        model_type_from_config = config_data.get("model_type", "")
-                        print(f"Detected model_type from config: {model_type_from_config}")
+                # model_type_from_config was read above (shared with the attention decision)
+                print(f"Detected model_type from config: {model_type_from_config}")
 
                 loaded = False
 
@@ -1454,6 +1475,28 @@ class Qwen3VLMBackend:
                     model_kwargs["config"] = glm_config
                     self.model = Glm4vForConditionalGeneration.from_pretrained(**model_kwargs)
                     print(f"Loaded as GLM-{glm_version} model")
+                    loaded = True
+
+                # Qwen3.8-Flash-Next (model_type "qwen4_exp"): 180B bf16 (~360GB) hybrid
+                # Gated-DeltaNet/QSA MoE VLM. Handled before the Qwen3 branch because it needs a
+                # version gate and an upstream _no_split_modules fixup.
+                if not loaded and is_qwen4_exp:
+                    if not QWEN4_EXP_AVAILABLE:
+                        return ("Error: Qwen3.8-Flash-Next (qwen4_exp) requires transformers >= 5.16.0. "
+                                "Upgrade with: pip install -U 'transformers>=5.16.0' 'accelerate>=1.2.0'")
+
+                    # transformers 5.16.x sets Qwen4ExpModel._no_split_modules to
+                    # "Qwen4ExpDecoderLayer", but the class is actually Qwen4ExpTextDecoderLayer.
+                    # accelerate then fails to treat decoder layers as atomic and can split one
+                    # across GPU/CPU. Correct it before loading.
+                    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
+                    if "Qwen4ExpTextDecoderLayer" not in (Qwen4ExpModel._no_split_modules or []):
+                        Qwen4ExpModel._no_split_modules = ["Qwen4ExpTextDecoderLayer", "Qwen4ExpVisionBlock"]
+                        print("[Qwen4-Exp] Patched _no_split_modules -> Qwen4ExpTextDecoderLayer")
+
+                    print("Loading as Qwen4-Exp model (Qwen3.8-Flash-Next) using AutoModelForVision2Seq...")
+                    self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
+                    print("Loaded as Qwen4-Exp model (Qwen3.8-Flash-Next)")
                     loaded = True
 
                 # For Qwen3-VL and Qwen3.5 MoE models, use AutoModelForVision2Seq
@@ -3873,12 +3916,14 @@ def create_ui():
                     if VLLM_AVAILABLE:
                         backend_choices.append("vllm")
 
-                    # Determine default backend (prefer vllm > lmdeploy > transformers)
-                    default_backend = "transformers"
-                    if VLLM_AVAILABLE:
-                        default_backend = "vllm"
-                    elif LMDEPLOY_AVAILABLE:
-                        default_backend = "lmdeploy"
+                    # Honor the saved backend; only fall back to vllm > lmdeploy > transformers
+                    # when the saved choice isn't installed. Large CPU-offloaded models
+                    # (e.g. Qwen3.8-Flash-Next) need transformers and must not be forced to vLLM.
+                    default_backend = saved_settings.get("backend", "transformers")
+                    if default_backend not in backend_choices:
+                        default_backend = "vllm" if VLLM_AVAILABLE else (
+                            "lmdeploy" if LMDEPLOY_AVAILABLE else "transformers"
+                        )
 
                     backend_info = "vLLM: PagedAttention, lmdeploy: AWQ/GPTQ" if VLLM_AVAILABLE else (
                         "lmdeploy: optimized AWQ/GPTQ" if LMDEPLOY_AVAILABLE else "Install vllm or lmdeploy for optimized inference"
@@ -4138,7 +4183,7 @@ def main():
 
     print("=" * 60)
     print("Chromaforge VLM Chat (Diffusers/Transformers Backend)")
-    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, GLM-4.6V, InternVL")
+    print("Supported: Qwen-VL, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.8-Flash-Next, GLM-4.6V, InternVL")
     print("=" * 60)
     print(f"Transformers: {'available' if TRANSFORMERS_AVAILABLE else 'NOT INSTALLED'}")
     print(f"Accelerate: {'available' if ACCELERATE_AVAILABLE else 'NOT INSTALLED'}")
@@ -4153,7 +4198,7 @@ def main():
     if not TRANSFORMERS_AVAILABLE:
         print("\nERROR: transformers not installed!")
         print("\nInstall with:")
-        print("  pip install transformers>=4.51.0 accelerate qwen-vl-utils")
+        print("  pip install 'transformers>=5.16.0' 'accelerate>=1.2.0' qwen-vl-utils")
         return
 
     # Initialize the backend

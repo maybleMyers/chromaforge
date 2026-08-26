@@ -10,7 +10,45 @@
 git clone https://github.com/Disty0/sdnq
   
 pip install -e ./sdnq
-  
+
+## Running Qwen3.8-Flash-Next in vlm_diffusers.py
+
+Qwen3.8-Flash-Next (`model_type: qwen4_exp`) is a 180B-parameter VLM — a 125B MoE language model
+(512 experts, 10 routed + 1 shared active) plus a 51B n-gram embedding table and a 4B MTP head —
+about 360 GB of bf16 weights across 131 shards. It runs through the transformers backend with CPU
+offload; **vLLM will not work here**, it has no CPU-offload path and tries to fit the whole model
+into VRAM first.
+
+Native support landed in transformers 5.16.0, so upgrade before trying:
+
+```
+pip install -U "transformers>=5.16.0" "accelerate>=1.2.0"
+```
+
+Old accelerate is not merely slow — transformers requires >= 1.1.0 before it will honour
+`device_map`/`max_memory` at all, so CPU offload silently does nothing below that version.
+
+Download into models/LLM (~360 GB):
+
+```
+huggingface-cli download Qwen/Qwen3.8-Flash-Next --local-dir models/LLM/Qwen3.8-Flash-Next
+```
+
+Then in the vlm_diffusers UI (`python vlm_diffusers.py --models-dir models/LLM --port 7863`):
+
+- Backend: `transformers`
+- dtype: `bfloat16`
+- CPU offload: on, CPU offload RAM: `460` (GB) on a 512 GB machine
+- Max memory per GPU: `44` (GB) on a 48 GB card
+- Flash Attention 2: **off** — this architecture supports SDPA only
+
+Expect a slow first load; 360 GB has to come off disk. Only ~6B params are active per token, but
+the router touches experts spread across CPU memory, so throughput is offload-bound.
+
+Sampling settings recommended by the Qwen model card: thinking mode `temperature=1.0, top_p=0.95,
+top_k=20`; instruct mode `temperature=0.7, top_p=0.80, top_k=20`. Thinking is on by default and
+the model emits a `<think>...</think>` block before its answer.
+
 ## Building / updating llama-server (CUDA)
 
 vlm.py runs GGUF models through a native llama-server subprocess. The path is set in the UI (and saved to vlm_settings.json) and defaults to `llama.cpp/build/bin/llama-server`, relative to the chromaforge root. Update it whenever you need support for a newly released model family, a new mmproj/vision projector, or an upstream speed fix.

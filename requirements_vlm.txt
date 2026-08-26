@@ -30,10 +30,13 @@ qwen-vl-utils>=0.0.14
 # Transformers backend
 # GLM-4.6V-Flash requires transformers v5.0.0rc0+ (PR #42122 added GLM-4.6V support)
 # DeepSeek V4 (deepseek_v4, FP8/FP4 checkpoints) requires transformers >= 5.8.0
+# Qwen3.8-Flash-Next (qwen4_exp) requires transformers >= 5.16.0 (PR #48337) - NOT in 5.15.x
 # NOT available in v4.57.x stable releases!
-transformers>=5.8.0
+transformers>=5.16.0
 # accelerate must be recent for float8 tensor dispatch/offload (DeepSeek V4 FP8);
-# versions older than ~1.0 cannot dispatch float8 weights
+# versions older than ~1.0 cannot dispatch float8 weights.
+# transformers sets ACCELERATE_MIN_VERSION = 1.1.0 and silently ignores device_map/max_memory
+# below it, so CPU offload does nothing at all with an older accelerate.
 accelerate>=1.2.0
 safetensors
 

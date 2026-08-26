@@ -516,9 +516,16 @@ try:
     # Temporarily remove local packages_3rdparty from path to avoid gguf conflict
     _original_path = sys.path.copy()
     sys.path = [p for p in sys.path if 'packages_3rdparty' not in p]
+    # Remove the script directory while importing vllm: a local vllm/ source
+    # checkout in it would shadow the installed package as a namespace package
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _script_dir]
     # Also remove any cached gguf module to ensure fresh import
     _gguf_modules = [k for k in sys.modules.keys() if k.startswith('gguf')]
     for k in _gguf_modules:
+        del sys.modules[k]
+    _vllm_modules = [k for k in sys.modules.keys() if k == 'vllm' or k.startswith('vllm.')]
+    for k in _vllm_modules:
         del sys.modules[k]
     from vllm import LLM as VllmLLM, SamplingParams as VllmSamplingParams
     sys.path = _original_path  # Restore path
@@ -906,7 +913,8 @@ class Qwen3VLMBackend:
             if not VLLM_AVAILABLE:
                 return "Error: vLLM not installed. Install with: pip install vllm"
             return self._load_model_vllm(
-                model_name, dtype, num_gpus, max_memory_per_gpu, context_len, progress
+                model_name, dtype, num_gpus, max_memory_per_gpu, context_len, progress,
+                cpu_offload=cpu_offload, cpu_offload_ram=cpu_offload_ram,
             )
 
         if not TRANSFORMERS_AVAILABLE:
@@ -1858,6 +1866,8 @@ class Qwen3VLMBackend:
         max_memory_per_gpu: int,
         context_len: int,
         progress,
+        cpu_offload: bool = False,
+        cpu_offload_ram: Optional[int] = None,
     ) -> str:
         """Load model using vLLM backend for high-performance inference."""
         # Find the model
@@ -1914,6 +1924,17 @@ class Qwen3VLMBackend:
             # Enable flash attention if available and requested
             if self.use_flash_attention:
                 engine_kwargs["enable_prefix_caching"] = True
+
+            # CPU offloading: offload model weights to CPU RAM
+            if cpu_offload:
+                if cpu_offload_ram and cpu_offload_ram > 0:
+                    engine_kwargs["cpu_offload_gb"] = cpu_offload_ram
+                else:
+                    # Default: use ~80% of available RAM
+                    import psutil
+                    avail_ram_gb = psutil.virtual_memory().available / (1024**3)
+                    offload_gb = max(1, int(avail_ram_gb * 0.8))
+                    engine_kwargs["cpu_offload_gb"] = offload_gb
 
             progress(0.4, desc="Initializing vLLM LLM...")
 
@@ -3912,7 +3933,7 @@ def create_ui():
                     )
                     cpu_ram_slider = gr.Slider(
                         minimum=0,
-                        maximum=256,
+                        maximum=512,
                         value=64,
                         step=8,
                         label="CPU RAM (GB)",

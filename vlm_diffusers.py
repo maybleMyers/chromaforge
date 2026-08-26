@@ -681,6 +681,141 @@ def create_vlm_moe_device_map(num_layers: int = 60, num_experts: int = 512):
     return device_map, gpu_memory_gb
 
 
+def build_moe_expert_device_map(
+    model_path: str,
+    gpu_budget_gb: float,
+    model_class,
+    dtype=torch.bfloat16,
+    gpu_index: int = 0,
+    reserve_gb: float = 3.0,
+):
+    """
+    Build an explicit device_map for a MoE VLM that keeps the dense "hot path" resident
+    in VRAM and spends whatever VRAM is left on actual experts.
+
+    device_map="auto" is the wrong tool for these checkpoints: accelerate treats a decoder
+    layer as an atomic unit (_no_split_modules), so it fills the GPU with the first N whole
+    layers and drops every remaining layer - attention, router, shared expert and all - onto
+    CPU. Every token then runs most of the network on CPU, which reads as a hang.
+
+    This map instead:
+      1. pins vision tower, embeddings, all attention/linear-attention blocks, layernorms,
+         MoE routers, shared experts and lm_head on the GPU (small, run for every token), and
+      2. greedily fills the remaining VRAM with individual experts, layer-contiguously so a
+         token crosses the GPU/CPU boundary as few times as possible, leaving the rest on CPU.
+
+    Module names are derived from a meta-device skeleton of the real checkpoint, so nothing
+    here depends on hard-coded architecture naming.
+
+    Returns (device_map, stats_dict) on success, or (None, reason_string) on failure.
+    """
+    try:
+        from accelerate import init_empty_weights
+        from accelerate.utils import compute_module_sizes
+        from transformers import AutoConfig
+    except Exception as e:
+        return None, f"accelerate/transformers import failed: {e}"
+
+    try:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        with init_empty_weights():
+            skeleton = model_class.from_config(config, trust_remote_code=True)
+        skeleton.tie_weights()
+        sizes = compute_module_sizes(skeleton, dtype=dtype)
+    except Exception as e:
+        return None, f"could not build meta skeleton: {e}"
+
+    # Locate expert containers. Two shapes exist in the wild:
+    #   - ModuleList of per-expert submodules (Qwen3-Next style) -> each child is a unit
+    #   - a single fused module holding 3D stacked weights   -> the container is the unit
+    expert_units = []  # (module_name, size_bytes), in model order
+    for name, module in skeleton.named_modules():
+        if not name.endswith(".experts"):
+            continue
+        children = list(module.named_children())
+        if isinstance(module, torch.nn.ModuleList) and len(children) >= 8:
+            for child_name, _ in children:
+                full = f"{name}.{child_name}"
+                expert_units.append((full, sizes.get(full, 0)))
+        else:
+            expert_units.append((name, sizes.get(name, 0)))
+
+    total_bytes = sizes.get("", 0)
+    expert_bytes = sum(sz for _, sz in expert_units)
+    dense_bytes = total_bytes - expert_bytes
+
+    del skeleton
+    gc.collect()
+
+    if not expert_units:
+        return None, "no MoE expert modules found in this checkpoint"
+
+    budget = int((gpu_budget_gb - reserve_gb) * (1024 ** 3))
+    if budget <= 0:
+        return None, f"gpu budget {gpu_budget_gb}GB is below the {reserve_gb}GB reserve"
+    if dense_bytes > budget:
+        return None, (
+            f"dense path alone needs {dense_bytes / 1024**3:.1f}GB but only "
+            f"{budget / 1024**3:.1f}GB of VRAM is available"
+        )
+
+    # Greedy layer-contiguous fill of the leftover VRAM with real experts.
+    remaining = budget - dense_bytes
+    experts_on_cpu = []
+    resident = 0
+    for name, size in expert_units:
+        if size <= remaining:
+            remaining -= size
+            resident += 1
+        else:
+            experts_on_cpu.append(name)
+
+    # "" is accelerate's catch-all; longest-prefix wins, so the overrides below only
+    # peel the listed experts off the GPU.
+    device_map = {"": gpu_index}
+    for name in experts_on_cpu:
+        device_map[name] = "cpu"
+
+    stats = {
+        "total_gb": total_bytes / 1024 ** 3,
+        "dense_gb": dense_bytes / 1024 ** 3,
+        "expert_gb": expert_bytes / 1024 ** 3,
+        "experts_total": len(expert_units),
+        "experts_on_gpu": resident,
+        "experts_on_cpu": len(experts_on_cpu),
+        "gpu_gb": (budget - remaining) / 1024 ** 3,
+    }
+    return device_map, stats
+
+
+def report_model_placement(model) -> None:
+    """Print where the weights actually ended up, by device. Cheap and always accurate."""
+    try:
+        by_device = {}
+        for _, param in model.named_parameters():
+            key = str(param.device)
+            by_device[key] = by_device.get(key, 0) + param.numel() * param.element_size()
+        for _, buf in model.named_buffers():
+            key = str(buf.device)
+            by_device[key] = by_device.get(key, 0) + buf.numel() * buf.element_size()
+        if not by_device:
+            return
+        total = sum(by_device.values()) or 1
+        print("Weight placement:")
+        for device, nbytes in sorted(by_device.items(), key=lambda kv: -kv[1]):
+            print(f"  {device:<10} {nbytes / 1024**3:7.2f} GB  ({100 * nbytes / total:5.1f}%)")
+        hf_map = getattr(model, "hf_device_map", None)
+        if hf_map:
+            counts = {}
+            for device in hf_map.values():
+                counts[str(device)] = counts.get(str(device), 0) + 1
+            print(f"  hf_device_map: {counts}")
+        else:
+            print("  hf_device_map: <absent> - accelerate did not dispatch this model")
+    except Exception as e:
+        print(f"Weight placement: unavailable ({e})")
+
+
 def get_gpu_info() -> List[Dict[str, Any]]:
     """Get information about available GPUs."""
     gpus = []
@@ -1489,10 +1624,55 @@ class Qwen3VLMBackend:
                     # "Qwen4ExpDecoderLayer", but the class is actually Qwen4ExpTextDecoderLayer.
                     # accelerate then fails to treat decoder layers as atomic and can split one
                     # across GPU/CPU. Correct it before loading.
-                    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
-                    if "Qwen4ExpTextDecoderLayer" not in (Qwen4ExpModel._no_split_modules or []):
-                        Qwen4ExpModel._no_split_modules = ["Qwen4ExpTextDecoderLayer", "Qwen4ExpVisionBlock"]
-                        print("[Qwen4-Exp] Patched _no_split_modules -> Qwen4ExpTextDecoderLayer")
+                    #
+                    # Patch every class in the module, not just Qwen4ExpModel: accelerate reads
+                    # _no_split_modules off the top-level class that from_pretrained instantiates
+                    # (Qwen4ExpForConditionalGeneration), which carries its own stale copy.
+                    from transformers.models.qwen4_exp import modeling_qwen4_exp as _qwen4_exp_mod
+
+                    _fixed_classes = []
+                    for _cls_name in dir(_qwen4_exp_mod):
+                        _cls = getattr(_qwen4_exp_mod, _cls_name)
+                        if not isinstance(_cls, type):
+                            continue
+                        _nsm = getattr(_cls, "_no_split_modules", None)
+                        if not _nsm or "Qwen4ExpTextDecoderLayer" in _nsm:
+                            continue
+                        _cls._no_split_modules = ["Qwen4ExpTextDecoderLayer", "Qwen4ExpVisionBlock"]
+                        _fixed_classes.append(_cls_name)
+                    if _fixed_classes:
+                        print(f"[Qwen4-Exp] Patched _no_split_modules -> Qwen4ExpTextDecoderLayer "
+                              f"on {', '.join(_fixed_classes)}")
+
+                    # device_map="auto" places whole decoder layers, so on a single GPU it fills
+                    # VRAM with the first few layers and leaves every other layer - attention,
+                    # router, shared expert included - executing on CPU. Replace it with an
+                    # explicit map: dense path pinned to VRAM, leftover VRAM filled with experts.
+                    if cpu_offload and model_kwargs.get("device_map") == "auto" and self.num_gpus > 0:
+                        gpu_budget = None
+                        if max_memory and 0 in max_memory:
+                            gpu_budget = float(str(max_memory[0]).rstrip("GiB") or 0)
+                        if gpu_budget:
+                            moe_map, moe_info = build_moe_expert_device_map(
+                                model_path,
+                                gpu_budget_gb=gpu_budget,
+                                model_class=AutoModelForVision2Seq,
+                                dtype=torch_dtype or torch.bfloat16,
+                            )
+                            if moe_map is not None:
+                                model_kwargs["device_map"] = moe_map
+                                model_kwargs.pop("max_memory", None)
+                                model_kwargs["offload_buffers"] = True
+                                print(
+                                    f"[Qwen4-Exp] MoE device map: {moe_info['total_gb']:.1f}GB total, "
+                                    f"dense path {moe_info['dense_gb']:.1f}GB pinned to GPU, "
+                                    f"{moe_info['experts_on_gpu']}/{moe_info['experts_total']} experts "
+                                    f"resident in VRAM ({moe_info['gpu_gb']:.1f}GB used), "
+                                    f"{moe_info['experts_on_cpu']} experts on CPU"
+                                )
+                            else:
+                                print(f"[Qwen4-Exp] Explicit MoE device map unavailable ({moe_info}); "
+                                      f"falling back to device_map='auto'")
 
                     print("Loading as Qwen4-Exp model (Qwen3.8-Flash-Next) using AutoModelForVision2Seq...")
                     self.model = AutoModelForVision2Seq.from_pretrained(**model_kwargs)
@@ -1764,10 +1944,10 @@ class Qwen3VLMBackend:
 
             progress(1.0, desc="Model loaded!")
 
-            # Print device distribution
-            if hasattr(self.model, "hf_device_map"):
-                unique_devices = set(self.model.hf_device_map.values())
-                print(f"Model distributed across devices: {unique_devices}")
+            # Print device distribution. Report actual parameter placement rather than trusting
+            # hf_device_map - it is absent whenever accelerate never dispatched the model, which
+            # is exactly the case worth catching.
+            report_model_placement(self.model)
 
             print_gpu_status()
 

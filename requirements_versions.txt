@@ -7,8 +7,9 @@ clean-fid==0.1.35
 diskcache==5.6.3
 einops==0.4.1
 facexlib==0.3.0
-fastapi==0.104.1
-gradio==4.40.0
+fastapi==0.115.12
+gradio==5.23.1
+gradio_client==1.8.0
 httpcore==0.15
 inflection==0.5.1
 jsonmerge==1.8.0
@@ -35,7 +36,10 @@ diffusers @ git+https://github.com/huggingface/diffusers@f6b6a7181eb44f0120b29cd
 httpx==0.24.1
 pillow-avif-plugin==1.4.3
 
-gradio_rangeslider==0.0.6
+gradio_rangeslider==0.0.8
+# Gradio 4 era and never rebuilt for 5.x. Only imported when the GeoWizard space is
+# launched (modules_forge/forge_space.py loads forge_app.py lazily), so it does not affect
+# startup - that one space is broken until the component is rebuilt.
 gradio_imageslider==0.0.20
 loadimg==0.1.2
 tqdm==4.66.1

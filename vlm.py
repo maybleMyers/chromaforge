@@ -202,11 +202,37 @@ def clean_muse_glimmer_markers(text: str) -> str:
 
 
 # How often the streaming loop is allowed to push a frame to the UI, in seconds.
-# Every yield makes Gradio re-serialise the whole chat history and blocks the
-# generator while it does, so yielding per token pins generation to the browser's
-# redraw rate (~26/s on a long message) no matter how fast the server runs.
-# ~15 fps still reads as smooth streaming and costs nothing.
-UI_STREAM_INTERVAL = float(os.environ.get("VLM_UI_STREAM_INTERVAL", "0.066"))
+# A frame carries only the characters that arrived since the last one, so its cost no
+# longer grows with the reply. This is here to bound the number of round trips, not the
+# work per round trip: the generator is suspended for the whole of each one, and while it
+# is suspended nothing is draining the socket, which backs pressure up into llama-server.
+# ~30 fps reads as continuous text.
+UI_STREAM_INTERVAL = float(os.environ.get("VLM_UI_STREAM_INTERVAL", "0.033"))
+
+
+def delta_html(seq: int, text: str, reset: bool = False) -> str:
+    """One frame's new characters, wrapped for the page script.
+
+    seq is what makes the update observable: two frames carrying identical text would
+    otherwise produce identical innerHTML, fire no mutation, and silently drop a chunk.
+    reset tells the page to replace rather than append - used to clear the surface between
+    turns, and to recover on the rare frame where the source text stops being append-only.
+    """
+    flag = ' data-reset="1"' if reset else ""
+    return f'<span data-seq="{seq}"{flag}>{html.escape(text)}</span>'
+
+
+def stream_delta(full: str, sent: str) -> Tuple[str, bool]:
+    """New text in `full` since `sent`, and whether to replace rather than append.
+
+    Sending deltas is only valid while the text grows by appending, which is almost always
+    true and occasionally not: the answer's lstrip() shifts everything once, when the first
+    non-space character lands, and truncation_banner() is appended to an already-finished
+    string. Resend in full on those frames rather than corrupting the panel.
+    """
+    if full.startswith(sent):
+        return full[len(sent):], False
+    return full, True
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _DISPLAY_THINK_RE = re.compile(r"\*\*\[Thinking\]\*\*.*?\*\*\[Response\]\*\*\s*", re.DOTALL)
@@ -1747,23 +1773,31 @@ class LlamaCppVLM:
                                     if content or reasoning_content:
                                         now = time.perf_counter()
                                         if now - last_yield >= UI_STREAM_INTERVAL:
-                                            last_yield = now
                                             elapsed = now - start_time
                                             tps = token_count / elapsed if elapsed > 0 else 0
                                             current_ctx = prompt_tokens + token_count
                                             ctx_total_display = self.n_ctx if self.n_ctx > 0 else 32768
                                             ctx_pct = (current_ctx / ctx_total_display * 100) if ctx_total_display > 0 else 0
                                             ctx_info = f"{current_ctx:,} / {ctx_total_display:,} ({ctx_pct:.0f}%)"
-                                            # display_text = response with thinking stripped (for show_thinking=False)
+                                            #   The answer only. Empty until the model stops
+                                            #   reasoning, rather than a placeholder: the caller
+                                            #   sends this as a delta, so it has to grow by
+                                            #   appending, and the reasoning has its own panel.
                                             if think_close >= 0:
                                                 display_text = accumulated[think_close:].lstrip()
                                             elif think_open or in_reasoning:
-                                                # Still inside reasoning - show a placeholder instead of
-                                                # raw <think> text (which Gradio renders as nothing)
-                                                display_text = "*Thinking…*"
+                                                display_text = ""
                                             else:
                                                 display_text = accumulated
                                             yield display_text, accumulated, f"{tps:.1f} tok/s", ctx_info
+                                            #   Stamped after the yield, not before. The
+                                            #   generator is suspended here for the whole
+                                            #   round trip, so timing from before it measures
+                                            #   that round trip: once one costs more than the
+                                            #   interval the check always passes and the limit
+                                            #   stops limiting - the slower the UI, the less
+                                            #   throttling, which is exactly backwards.
+                                            last_yield = time.perf_counter()
                             except json.JSONDecodeError as e:
                                 print(f"[llama-server] JSON decode error: {e} for: {data_str[:100]}")
 
@@ -2149,49 +2183,69 @@ class LlamaCppVLM:
 
                 accumulated = ""
                 token_count = 0
+                last_yield = 0.0
                 #   Bound before the loop: both are read by the post-loop yield below, and a
                 #   stream that produced no content deltas used to reach it undefined.
                 display_text = ""
                 raw_for_thinking = ""
+
+                def formatted(text: str) -> Tuple[str, str]:
+                    """(answer, reasoning) for the buffer so far.
+
+                    Every pass in here walks the whole buffer, so this runs once per UI
+                    frame rather than once per token - per token it is quadratic in the
+                    length of the reply.
+                    """
+                    answer = text
+                    reasoning = text  # keep a version with thinking preserved
+
+                    #   The FIRST </think> ends the reasoning, matching the llama-server
+                    #   path. Splitting on the last one meant any later literal </think>
+                    #   in the answer silently discarded everything before it.
+                    if "</think>" in answer:
+                        answer = answer.split("</think>", 1)[1].strip()
+                    elif "<think>" in answer:
+                        #   Still reasoning: the answer stays empty rather than carrying the
+                        #   raw tags, again matching the llama-server path. The reasoning is
+                        #   on its own panel, and the caller sends this as a delta, so it
+                        #   wants text that only ever grows by appending.
+                        answer = ""
+
+                    # Clean up GPT-OSS Harmony format tags if present
+                    if self.model_type == "gpt-oss":
+                        # For the answer: extract only the final channel content
+                        final_match = re.search(r'<\|channel\|>final<\|message\|>(.*?)(?:<\|(?:end|return)\|>|$)', answer, re.DOTALL)
+                        if final_match:
+                            answer = final_match.group(1).strip()
+                        else:
+                            # If no final channel yet, just clean up any tags
+                            answer = re.sub(r'<\|channel\|>(analysis|commentary|final)<\|message\|>', '', answer)
+                            answer = re.sub(r'<\|(start|end|return|call)\|>', '', answer)
+                            answer = answer.strip()
+
+                        # For the reasoning: make the analysis channel readable
+                        reasoning = re.sub(r'<\|channel\|>analysis<\|message\|>', '\n[Thinking]\n', reasoning)
+                        reasoning = re.sub(r'<\|channel\|>final<\|message\|>', '\n[Response]\n', reasoning)
+                        reasoning = re.sub(r'<\|channel\|>commentary<\|message\|>', '\n[Commentary]\n', reasoning)
+                        reasoning = re.sub(r'<\|(start|end|return|call)\|>', '', reasoning)
+                        reasoning = reasoning.strip()
+
+                    return answer, reasoning
+
                 for chunk in response_stream:
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content", "")
                     if content:
                         accumulated += content
                         token_count += 1
-                        # Calculate current speed
-                        elapsed = time.perf_counter() - start_time
+                        # Push to the UI at most every UI_STREAM_INTERVAL; tokens keep
+                        # accumulating in between, so the next frame just carries more.
+                        now = time.perf_counter()
+                        if now - last_yield < UI_STREAM_INTERVAL:
+                            continue
+                        elapsed = now - start_time
                         tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-                        # Clean up thinking tags and GPT-OSS Harmony format tags for display
-                        display_text = accumulated
-                        raw_for_thinking = accumulated  # Keep a version with thinking preserved
-
-                        #   The FIRST </think> ends the reasoning, matching the llama-server
-                        #   path. Splitting on the last one meant any later literal </think>
-                        #   in the answer silently discarded everything before it.
-                        if "</think>" in display_text:
-                            display_text = display_text.split("</think>", 1)[1].strip()
-
-                        # Clean up GPT-OSS Harmony format tags if present
-                        if self.model_type == "gpt-oss":
-                            # For display_text (no thinking): extract only the final channel content
-                            # First, try to get just the final channel
-                            final_match = re.search(r'<\|channel\|>final<\|message\|>(.*?)(?:<\|(?:end|return)\|>|$)', display_text, re.DOTALL)
-                            if final_match:
-                                display_text = final_match.group(1).strip()
-                            else:
-                                # If no final channel yet, just clean up any tags
-                                display_text = re.sub(r'<\|channel\|>(analysis|commentary|final)<\|message\|>', '', display_text)
-                                display_text = re.sub(r'<\|(start|end|return|call)\|>', '', display_text)
-                                display_text = display_text.strip()
-
-                            # For raw_for_thinking (with thinking): make the analysis channel readable
-                            # Convert channel markers to readable labels
-                            raw_for_thinking = re.sub(r'<\|channel\|>analysis<\|message\|>', '\n[Thinking]\n', raw_for_thinking)
-                            raw_for_thinking = re.sub(r'<\|channel\|>final<\|message\|>', '\n[Response]\n', raw_for_thinking)
-                            raw_for_thinking = re.sub(r'<\|channel\|>commentary<\|message\|>', '\n[Commentary]\n', raw_for_thinking)
-                            raw_for_thinking = re.sub(r'<\|(start|end|return|call)\|>', '', raw_for_thinking)
-                            raw_for_thinking = raw_for_thinking.strip()
+                        display_text, raw_for_thinking = formatted(accumulated)
 
                         # Build context info for local llama-cpp-python (estimate)
                         # For local backend, we estimate based on completion tokens
@@ -2201,6 +2255,13 @@ class LlamaCppVLM:
                             ctx_info = f"~{token_count:,} tokens"
                         # Yield display_text, raw_text (with thinking formatted), speed, and context
                         yield display_text, raw_for_thinking, f"{tokens_per_sec:.1f} tok/s", ctx_info
+                        #   Stamped after the yield, for the reason given in generate_via_api.
+                        last_yield = time.perf_counter()
+
+                #   Recomputed rather than reused: the last token almost never lands on a
+                #   frame boundary, so whatever the loop left behind is short of the full
+                #   reply.
+                display_text, raw_for_thinking = formatted(accumulated)
 
                 end_time = time.perf_counter()
                 generation_time = end_time - start_time
@@ -2812,12 +2873,18 @@ def stream_chat_response(
 ):
     """Stream a generation into the last (assistant) entry of new_history.
 
-    Yields (history, stats, ctx_info, thinking, raw) tuples.
+    Yields (history, stats, ctx_info, thinking, raw, think_delta, answer_delta) tuples.
 
     The chat entry only ever gets the answer; the reasoning goes out separately as
     `thinking` for the panel beside the chat, so a long chain of thought cannot bury the
     reply. `raw` is the untouched model text - the caller keeps it so "Send Reasoning Back"
     still has something to send, which the history no longer carries.
+
+    While the turn is in flight the text goes out as deltas, and `history` and `thinking`
+    are gr.skip(): updating a Chatbot re-serialises and re-renders every message in the
+    conversation, so doing that per frame costs O(reply) each time and is quadratic over a
+    run. Both are written once, on the final frame, when there is a finished reply to put
+    there.
     """
     global stop_generation
     stop_generation = False
@@ -2826,6 +2893,34 @@ def stream_chat_response(
     ctx_info = ""
     raw_text = ""
     thinking = ""
+    #   What the live surfaces already hold. Each frame carries only the difference.
+    sent_answer = ""
+    sent_think = ""
+    seq = 0
+
+    def frame(answer: str, think: str) -> Tuple[str, str]:
+        """The new characters for each live surface since the last frame."""
+        nonlocal sent_answer, sent_think, seq
+        seq += 1
+        d_answer, reset_answer = stream_delta(answer, sent_answer)
+        d_think, reset_think = stream_delta(think, sent_think)
+        sent_answer, sent_think = answer, think
+        return delta_html(seq, d_think, reset_think), delta_html(seq, d_answer, reset_answer)
+
+    def commit(think: str) -> Tuple:
+        """The turn's last frame: hand the finished text to the chatbot and the reasoning
+        panel, which have been left alone until now, and clear the live surfaces."""
+        return (
+            new_history, stats, ctx_info, think, raw_text,
+            delta_html(0, "", reset=True), delta_html(0, "", reset=True),
+        )
+
+    #   Clear whatever the last turn left on the live surfaces before anything streams in.
+    yield (
+        gr.skip(), stats, ctx_info, gr.skip(), raw_text,
+        delta_html(0, "", reset=True), delta_html(0, "", reset=True),
+    )
+
     for display_text, raw_text, stats, ctx_info in vlm_manager.generate(
         messages=messages,
         max_new_tokens=max_tokens,
@@ -2839,30 +2934,33 @@ def stream_chat_response(
         reasoning_level=reasoning_level,
         thinking=thinking_mode,
     ):
-        #   The chat bubble is the answer only. While the model is still reasoning
-        #   display_text is the "*Thinking…*" placeholder, which is what we want there.
-        new_history[-1]["content"] = display_text
         thinking = extract_reasoning_for_display(raw_text) if show_thinking else ""
+        #   Bank this frame's text first, then check: testing the flag before recording it
+        #   threw away up to one UI_STREAM_INTERVAL of tokens every time Stop was pressed.
+        d_think, d_answer = frame(display_text, thinking)
 
-        #   Assign first, then check: testing the flag before writing this frame threw away
-        #   up to one UI_STREAM_INTERVAL of tokens every time Stop was pressed.
         if stop_generation:
-            new_history[-1]["content"] += "\n\n[Generation stopped]"
             stop_generation = False
-            yield new_history, stats, ctx_info, thinking, raw_text
+            new_history[-1]["content"] = display_text + "\n\n[Generation stopped]"
+            yield commit(thinking)
             return
 
-        yield new_history, stats, ctx_info, thinking, raw_text
+        yield gr.skip(), stats, ctx_info, gr.skip(), raw_text, d_think, d_answer
 
+    final_answer = sent_answer
     if vlm_manager is not None and vlm_manager.last_truncated:
         #   On both paths, which is the whole point - this used to be appended only to the
         #   answer stream, so with Show Thinking on (the default) it never appeared at all
         #   and a run that hit the token limit just stopped with no explanation.
         banner = truncation_banner(max_tokens)
-        new_history[-1]["content"] = (new_history[-1]["content"] or "") + banner
+        final_answer += banner
         if thinking:
             thinking += banner
-        yield new_history, stats, ctx_info, thinking, raw_text
+
+    #   Always emitted, not just on truncation: the chatbot has been skipped for the whole
+    #   run, so this is the only frame that puts the reply into the conversation.
+    new_history[-1]["content"] = final_answer
+    yield commit(thinking)
 
 
 # ===== Chat media gallery =====
@@ -2978,7 +3076,7 @@ def chat_handler(
 ):
     """Handle chat messages from UI with streaming support.
 
-    Yields (history, "", stats, ctx_info, thinking, raw_history).
+    Yields (history, "", stats, ctx_info, thinking, raw_history, think_delta, answer_delta).
     """
     raw_history = list(raw_history or [])
 
@@ -2994,7 +3092,8 @@ def chat_handler(
         #   Keep the raw list aligned with the assistant bubble just added, or every later
         #   turn pairs up with the wrong reasoning.
         raw_history.append("")
-        yield error_history, "", "", "", "", raw_history
+        yield (error_history, "", "", "", "", raw_history,
+               delta_html(0, "", reset=True), delta_html(0, "", reset=True))
         return
 
     # Build messages list for the model
@@ -3082,13 +3181,13 @@ def chat_handler(
     #   One slot for this turn's raw text, rewritten on every frame - the assistant bubble
     #   is already in new_history, so the lists stay the same length throughout.
     raw_history.append("")
-    for streamed_history, stats, ctx_info, thinking, raw_text in stream_chat_response(
+    for streamed_history, stats, ctx_info, thinking, raw_text, d_think, d_answer in stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
         thinking_mode,
     ):
         raw_history[-1] = raw_text
-        yield streamed_history, "", stats, ctx_info, thinking, raw_history
+        yield streamed_history, "", stats, ctx_info, thinking, raw_history, d_think, d_answer
 
 
 def regenerate_handler(
@@ -3112,7 +3211,7 @@ def regenerate_handler(
     Uses the snapshot saved by chat_handler (which keeps the original images/
     video/audio), but applies the current system prompt and sampling settings.
 
-    Yields (history, stats, ctx_info, thinking, raw_history).
+    Yields (history, stats, ctx_info, thinking, raw_history, think_delta, answer_delta).
     """
     raw_history = list(raw_history or [])
 
@@ -3121,7 +3220,8 @@ def regenerate_handler(
         (vlm_manager.model is not None or vlm_manager.use_server_backend)
     )
     if not model_ready or last_turn is None:
-        yield history, "", "", "", raw_history
+        yield (history, "", "", "", raw_history,
+               delta_html(0, "", reset=True), delta_html(0, "", reset=True))
         return
 
     # Rebuild model messages with the current system prompt
@@ -3141,13 +3241,13 @@ def regenerate_handler(
     new_history.append({"role": "assistant", "content": ""})
 
     raw_history = prior_raw + [""]
-    for streamed_history, stats, ctx_info, thinking, raw_text in stream_chat_response(
+    for streamed_history, stats, ctx_info, thinking, raw_text, d_think, d_answer in stream_chat_response(
         messages, new_history, max_tokens, temperature, top_p, repeat_penalty,
         seed, video_max_frames, every_other_frame, show_thinking, reasoning_level,
         thinking_mode,
     ):
         raw_history[-1] = raw_text
-        yield streamed_history, stats, ctx_info, thinking, raw_history
+        yield streamed_history, stats, ctx_info, thinking, raw_history, d_think, d_answer
 
 
 def edit_last_handler(history: List[Dict[str, Any]], raw_history: Optional[List[str]] = None):
@@ -3303,7 +3403,8 @@ def batch_caption_handler(
 
 
 #   Runs once per page: swallow stray file drops so the browser does not navigate away from
-#   the page, and expose the callback the per-card remove buttons in the media preview call.
+#   the page, expose the callback the per-card remove buttons in the media preview call, and
+#   wire the streaming surfaces to their delta carriers.
 #   Standalone only - embedded, the webui serves the same code from javascript/vlm.js, which
 #   modules/ui_gradio_extensions.py injects into the real <head>. Keep the two in step.
 VLM_PAGE_JS = r"""
@@ -3326,6 +3427,32 @@ VLM_PAGE_JS = r"""
                 if (btn) btn.click();
             }, 60);
         };
+
+        window.vlmPipeDelta = (srcId, dstId) => {
+            const src = document.querySelector('#' + srcId);
+            const dst = document.querySelector('#' + dstId);
+            if (!src || !dst) return false;
+            if (src.dataset.vlmPiped) return true;
+            src.dataset.vlmPiped = '1';
+            dst.textContent = '';   // take the element off Gradio and own its contents
+            new MutationObserver(() => {
+                const span = src.querySelector('span[data-seq]');
+                if (!span || span.dataset.seq === src.dataset.lastSeq) return;
+                src.dataset.lastSeq = span.dataset.seq;
+                if (span.dataset.reset) dst.textContent = span.textContent;
+                else dst.appendChild(document.createTextNode(span.textContent));
+                dst.scrollTop = dst.scrollHeight;
+            }).observe(src, { childList: true, subtree: true, characterData: true });
+            return true;
+        };
+
+        // Gradio may not have painted the tab yet, so keep trying for a few seconds.
+        (function bootstrap(tries) {
+            const think = window.vlmPipeDelta('vlm_delta_think', 'vlm_live_think');
+            const answer = window.vlmPipeDelta('vlm_delta_answer', 'vlm_live_answer');
+            if (think && answer) return;
+            if (tries > 0) setTimeout(() => bootstrap(tries - 1), 250);
+        })(40);
     }
 """
 
@@ -3532,6 +3659,22 @@ def create_ui(nested: bool = False):
         opacity: 0.85;
         font-size: 0.9em;
     }
+    /* Delta carriers. Hidden with CSS rather than visible=False because the node has to
+       stay in the DOM for the page script's MutationObserver to see it change. */
+    .vlm-hidden { display: none; }
+    /* Live streaming surface: plain text, appended one delta at a time, so it costs
+       O(new characters) per frame instead of re-parsing the whole reply as markdown.
+       The finished turn is committed to the chatbot and the reasoning panel at the end. */
+    .vlm-live {
+        white-space: pre-wrap;
+        overflow-y: auto;
+        resize: vertical;
+        font-family: var(--font-mono, monospace);
+        font-size: 0.9em;
+    }
+    .vlm-live:empty { display: none; }
+    #vlm_live_think { max-height: 200px; opacity: 0.85; }
+    #vlm_live_answer { max-height: 400px; }
     """
 
     if nested:
@@ -3578,11 +3721,32 @@ def create_ui(nested: bool = False):
             # Chat Tab
             with gr.TabItem("Chat"):
                 # Chat interface at top - full width, user-resizable
+                #   History only. Written twice a turn - the user message on the way in and
+                #   the finished reply on the way out - never per token: a Chatbot update
+                #   re-serialises and re-renders every message in the conversation, so doing
+                #   it per token is quadratic in the length of the reply. The text in flight
+                #   streams into vlm_live_answer below instead.
                 chatbot = gr.Chatbot(
                     label="Conversation",
                     height=500,
                     type="messages",
                     elem_classes=["resizable-chatbot"],
+                )
+
+                show_thinking_default = saved_settings.get(
+                    "show_thinking", DEFAULT_SETTINGS["show_thinking"]
+                )
+
+                #   The turn in flight. The page script appends each frame's new characters
+                #   as a text node, so a frame costs O(new characters) rather than a full
+                #   markdown re-parse of everything so far. Plain text while streaming; the
+                #   rendered markdown arrives when the turn is committed above.
+                live_answer = gr.HTML(
+                    value="", elem_id="vlm_live_answer", elem_classes=["vlm-live"],
+                )
+                live_think = gr.HTML(
+                    value="", visible=show_thinking_default,
+                    elem_id="vlm_live_think", elem_classes=["vlm-live"],
                 )
 
                 #   Reasoning lives here rather than in the chat bubble, so the answer is
@@ -3592,9 +3756,19 @@ def create_ui(nested: bool = False):
                 thinking_display = gr.Markdown(
                     value="",
                     label="Thinking",
-                    visible=saved_settings.get("show_thinking", DEFAULT_SETTINGS["show_thinking"]),
+                    visible=show_thinking_default,
                     elem_id="vlm_thinking",
                     elem_classes=["vlm-thinking"],
+                )
+
+                #   Delta carriers: each frame's new characters, which the page script moves
+                #   into the live surfaces above. Hidden with CSS rather than visible=False
+                #   so the nodes stay in the DOM for the MutationObserver to watch.
+                delta_answer = gr.HTML(
+                    value="", elem_id="vlm_delta_answer", elem_classes=["vlm-hidden"],
+                )
+                delta_think = gr.HTML(
+                    value="", elem_id="vlm_delta_think", elem_classes=["vlm-hidden"],
                 )
                 #   The raw model text for each assistant turn, parallel to the chat
                 #   history. Send Reasoning Back reads it: the bubbles hold only answers now,
@@ -4064,22 +4238,24 @@ def create_ui(nested: bool = False):
         def send_message(msg, history, sys_prompt, media, max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning, think_mode, keep_reason, raw_hist, dynamic, *model_cfg):
             media = list(media or [])
 
+            blank = delta_html(0, "", reset=True)
+
             if not msg.strip() and not media:
-                yield history, "", "", gr.update(), gr.update(), raw_hist
+                yield history, "", "", gr.skip(), gr.skip(), raw_hist, blank, blank
                 return
 
             def work():
                 # Stream responses from chat_handler generator
-                for new_history, _, stats, ctx_info, think_text, raw_hist_out in chat_handler(
+                for new_history, _, stats, ctx_info, think_text, raw_hist_out, d_think, d_answer in chat_handler(
                     msg, history, sys_prompt, media,
                     max_tok, temp, top_p_val, rep_pen, seed_val, vid_frames, every_other, thinking, reasoning,
                     think_mode, keep_reason, raw_hist
                 ):
-                    yield new_history, stats, ctx_info, gr.update(), think_text, raw_hist_out
+                    yield new_history, stats, ctx_info, gr.skip(), think_text, raw_hist_out, d_think, d_answer
 
             yield from run_managed(
                 dynamic, model_cfg, work,
-                lambda status: (history, "", "", status, gr.update(), raw_hist),
+                lambda status: (history, "", "", status, gr.skip(), raw_hist, blank, blank),
             )
 
         chat_media_outputs = [chat_media_state, chat_media_files, chat_media_preview]
@@ -4093,7 +4269,10 @@ def create_ui(nested: bool = False):
             thinking_mode, keep_reasoning, chat_raw_state,
             dynamic_loading, *MODEL_CFG
         ]
-        send_outputs = [chatbot, stats_display, context_display, status_display, thinking_display, chat_raw_state]
+        send_outputs = [
+            chatbot, stats_display, context_display, status_display, thinking_display,
+            chat_raw_state, delta_think, delta_answer,
+        ]
 
         for send_trigger in (send_btn.click, msg_input.submit):
             send_trigger(
@@ -4180,13 +4359,15 @@ def create_ui(nested: bool = False):
             handler_args, (dynamic, *model_cfg) = rest[:13], rest[13:]
             raw_hist = handler_args[-1]
 
+            blank = delta_html(0, "", reset=True)
+
             def work():
-                for chat, stats, ctx_info, think_text, raw_hist_out in regenerate_handler(history, *handler_args):
-                    yield chat, stats, ctx_info, gr.update(), think_text, raw_hist_out
+                for chat, stats, ctx_info, think_text, raw_hist_out, d_think, d_answer in regenerate_handler(history, *handler_args):
+                    yield chat, stats, ctx_info, gr.skip(), think_text, raw_hist_out, d_think, d_answer
 
             yield from run_managed(
                 dynamic, model_cfg, work,
-                lambda status: (history, "", "", status, gr.update(), raw_hist),
+                lambda status: (history, "", "", status, gr.skip(), raw_hist, blank, blank),
             )
 
         regen_btn.click(
@@ -4200,23 +4381,32 @@ def create_ui(nested: bool = False):
             outputs=send_outputs,
         )
 
+        #   Both also wipe the live surfaces: they hold whatever the last turn streamed,
+        #   and the page only clears them when a reset delta says to.
         edit_last_btn.click(
             fn=edit_last_handler,
             inputs=[chatbot, chat_raw_state],
             outputs=[chatbot, msg_input, thinking_display, chat_raw_state],
+        ).then(
+            fn=lambda: (delta_html(0, "", reset=True), delta_html(0, "", reset=True)),
+            outputs=[delta_think, delta_answer],
         )
 
         clear_btn.click(
             fn=clear_chat_handler,
             outputs=[chatbot, thinking_display, chat_raw_state],
+        ).then(
+            fn=lambda: (delta_html(0, "", reset=True), delta_html(0, "", reset=True)),
+            outputs=[delta_think, delta_answer],
         )
 
         #   Show Thinking now decides whether the panel is on screen, rather than whether
-        #   the reasoning is mixed into the chat bubble.
+        #   the reasoning is mixed into the chat bubble. The live surface follows it, or
+        #   turning it off would still leave the reasoning streaming on screen.
         show_thinking.change(
-            fn=lambda on: gr.update(visible=bool(on)),
+            fn=lambda on: (gr.update(visible=bool(on)), gr.update(visible=bool(on))),
             inputs=[show_thinking],
-            outputs=[thinking_display],
+            outputs=[thinking_display, live_think],
         )
 
         # System prompt preset handlers

@@ -85,7 +85,11 @@ def webui_worker():
         startup_timer.record("create ui")
 
         if not cmd_opts.no_gradio_queue:
-            shared.demo.queue(64)
+            #   Keyword, not positional: this read `queue(64)` since the Gradio 3 days,
+            #   where the first argument was concurrency_count. It has been status_update_rate
+            #   since Gradio 4, so that was quietly asking for a status ping every 64 seconds
+            #   and leaving the queue size unbounded - the opposite of the intent.
+            shared.demo.queue(max_size=64)
 
         gradio_auth_creds = list(initialize_util.get_gradio_auth_creds()) or None
 

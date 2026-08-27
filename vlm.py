@@ -318,11 +318,12 @@ def is_muse_glimmer_model(*values: Optional[str]) -> bool:
                for v in values if v)
 
 
-# The chat template Qwen ships for Qwen3.8-Flash-Next, copied verbatim from
-# huggingface.co/Qwen/Qwen3.8-Flash-Next. The day-one GGUF conversions carry an
-# older template, which is what makes a Flash-Next transcript come out wrong:
-# see is_qwen_flash_next_model below for what this one expects that the stale
-# one does not.
+# The chat template Qwen ships for Qwen3.8-Flash-Next, copied from
+# huggingface.co/Qwen/Qwen3.8-Flash-Next (chat_template.jinja). Handed to
+# llama-server explicitly so the rendered prompt is pinned to what Qwen published
+# rather than to whatever a given quant happened to bake in - third-party GGUFs
+# convert the template at their own pace, and a stale one silently changes the
+# format out from under everything below.
 QWEN_FLASH_NEXT_TEMPLATE = os.path.join(_CHAT_TEMPLATE_DIR, "qwen3.8-flash-next.jinja")
 
 # The template validates reasoning_effort itself and raise_exception()s on anything
@@ -349,8 +350,8 @@ def is_qwen_flash_next_model(*values: Optional[str]) -> bool:
 
       - prior assistant turns are rendered as '<think>\\n' + message.reasoning_content
         + '\\n</think>\\n\\n' + content, so reasoning has to travel in its own field.
-        Leaving it inline in content produces an empty <think></think> wrapped around
-        a second, literal one - the mangled transcript this whole path exists to fix.
+        Left inline in content it produces an empty <think></think> wrapped around a
+        second, literal one - the mangled transcript this whole path exists to fix.
       - reasoning depth is chat_template_kwargs["reasoning_effort"], one of
         xhigh/medium/low, not Muse Glimmer's reasoning_strength.
       - preserve_thinking chooses whether prior turns keep their <think> block at all.
@@ -1278,11 +1279,11 @@ class LlamaCppVLM:
             if "--jinja" not in extra_args_str:
                 cmd.append("--jinja")
 
-        # Flash-Next: hand llama-server Qwen's own template rather than the one baked
-        # into the quant. The day-one conversions predate the reasoning_effort /
-        # preserve_thinking / reasoning_content contract the model was trained on, so
-        # the embedded one renders prior assistant turns wrong. An explicit
-        # --chat-template(-file) in Extra Args wins, so this is still overridable.
+        # Flash-Next: hand llama-server Qwen's own template rather than trusting the one
+        # baked into the quant, so the reasoning_effort / preserve_thinking /
+        # reasoning_content contract generate_via_api relies on is guaranteed to be the
+        # one being rendered. An explicit --chat-template(-file) in Extra Args wins, so
+        # this is still overridable.
         if is_qwen_flash_next:
             print("[llama-server] Qwen3.8-Flash-Next detected (qwen4_exp architecture)")
             if any(f in extra_args_str for f in ("--chat-template-file", "--chat-template")):
@@ -1290,11 +1291,10 @@ class LlamaCppVLM:
             elif os.path.exists(QWEN_FLASH_NEXT_TEMPLATE):
                 cmd.extend(["--chat-template-file", QWEN_FLASH_NEXT_TEMPLATE])
                 print(f"[llama-server] Chat template: {QWEN_FLASH_NEXT_TEMPLATE}")
-                print("[llama-server]   (overrides the GGUF's embedded template, which on the")
-                print("[llama-server]    day-one conversions renders prior turns' reasoning wrong)")
+                print("[llama-server]   (Qwen's own, overriding whatever the GGUF embedded)")
             else:
                 print(f"[llama-server] WARNING: {QWEN_FLASH_NEXT_TEMPLATE} is missing - falling")
-                print("[llama-server]   back to the template embedded in the GGUF, which may be stale")
+                print("[llama-server]   back to the template embedded in the GGUF")
             print("[llama-server] Reasoning Level maps to reasoning_effort: low / medium /")
             print("[llama-server]   xhigh (the model's own default; 'high' is sent as xhigh)")
             if not (mmproj_path and os.path.exists(mmproj_path)):

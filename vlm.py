@@ -97,6 +97,16 @@ except ImportError:
     print("Note: llama-cpp-python not installed; in-process backend disabled (using llama-server).")
 
 
+#   Anchored to this file rather than the process CWD: embedded in the webui the CWD happens
+#   to be the repo root too, but nothing guarantees it.
+_VLM_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Chat templates we ship ourselves, for models whose GGUF carries a template that
+# predates the contract the model was trained on. Handed to llama-server with
+# --chat-template-file, which overrides the embedded one.
+_CHAT_TEMPLATE_DIR = os.path.join(_VLM_DIR, "chat_templates")
+
+
 def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     """Convert PIL Image to base64 data URL."""
     buffer = BytesIO()
@@ -306,6 +316,55 @@ def is_muse_glimmer_model(*values: Optional[str]) -> bool:
     """
     return any("muse" in str(v).lower() and "glimmer" in str(v).lower()
                for v in values if v)
+
+
+# The chat template Qwen ships for Qwen3.8-Flash-Next, copied verbatim from
+# huggingface.co/Qwen/Qwen3.8-Flash-Next. The day-one GGUF conversions carry an
+# older template, which is what makes a Flash-Next transcript come out wrong:
+# see is_qwen_flash_next_model below for what this one expects that the stale
+# one does not.
+QWEN_FLASH_NEXT_TEMPLATE = os.path.join(_CHAT_TEMPLATE_DIR, "qwen3.8-flash-next.jinja")
+
+# The template validates reasoning_effort itself and raise_exception()s on anything
+# it does not know - a 500 out of /v1/chat/completions, not a quiet fallback - so the
+# UI's levels are mapped onto the three it accepts. "high" is Flash-Next's "xhigh";
+# "default" is absent here on purpose, so the template's own xhigh default stands.
+QWEN_FLASH_NEXT_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+}
+
+_ALNUM_RE = re.compile(r"[^a-z0-9]")
+
+
+def is_qwen_flash_next_model(*values: Optional[str]) -> bool:
+    """
+    Detect Qwen/Qwen3.8-Flash-Next from a model name or path.
+
+    It is its own architecture (general.architecture "qwen4_exp", HF model_type
+    "qwen4_exp" / Qwen4ExpForConditionalGeneration) rather than another Qwen3-VL, and
+    its chat template differs from every earlier Qwen in three ways that matter here:
+
+      - prior assistant turns are rendered as '<think>\\n' + message.reasoning_content
+        + '\\n</think>\\n\\n' + content, so reasoning has to travel in its own field.
+        Leaving it inline in content produces an empty <think></think> wrapped around
+        a second, literal one - the mangled transcript this whole path exists to fix.
+      - reasoning depth is chat_template_kwargs["reasoning_effort"], one of
+        xhigh/medium/low, not Muse Glimmer's reasoning_strength.
+      - preserve_thinking chooses whether prior turns keep their <think> block at all.
+
+    Matched on the flattened name so Qwen3.8-Flash-Next, qwen3.8_flash_next and
+    Qwen3.8FlashNext all land here, while a plain Qwen3-VL does not.
+    """
+    for v in values:
+        if not v:
+            continue
+        flat = _ALNUM_RE.sub("", str(v).lower())
+        if "qwen" in flat and "flashnext" in flat:
+            return True
+    return False
 
 
 # Folder names that identify a quantization variant rather than a model. The unsloth
@@ -799,6 +858,11 @@ class LlamaCppVLM:
             # literal "assistant to=self" in the transcript.
             is_muse_glimmer = is_muse_glimmer_model(model_name, model_path)
 
+            # Detect Qwen3.8-Flash-Next before the generic Qwen matches above take
+            # effect: its name contains "qwen3", which would otherwise pick the
+            # Qwen3-VL chat handler for an architecture that is not Qwen3-VL.
+            is_qwen_flash_next = is_qwen_flash_next_model(model_name, model_path)
+
             # Detect GPT-OSS models (text-only with Harmony format)
             is_gpt_oss = not is_muse_glimmer and any(x in model_name_lower or x in model_path_lower for x in ["gpt-oss", "gptoss", "gpt_oss", "huihui-gpt-oss"])
 
@@ -813,7 +877,7 @@ class LlamaCppVLM:
             is_qwen3_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen3"])
             is_qwen25_specific = any(x in model_name_lower or x in model_path_lower for x in ["qwen2.5", "qwen25"])
 
-            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Kimi={is_kimi}, MuseGlimmer={is_muse_glimmer}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
+            print(f"[llama.cpp] Model type detection: GPT-OSS={is_gpt_oss}, DeepSeek={is_deepseek}, Kimi={is_kimi}, MuseGlimmer={is_muse_glimmer}, FlashNext={is_qwen_flash_next}, Qwen-VL={is_qwen_vl}, Qwen3={is_qwen3_specific}, Qwen2.5={is_qwen25_specific}, LLaVA={is_llava}")
 
             # Muse Glimmer cannot run in-process at all. llama-cpp-python vendors its
             # own llama.cpp build, so rebuilding ./llama.cpp does not reach it, and
@@ -825,6 +889,20 @@ class LlamaCppVLM:
                 return ("Error: Muse Glimmer requires the llama-server backend. "
                         "llama-cpp-python vendors its own llama.cpp build, which almost "
                         "certainly predates LLM_ARCH_MUSE_GLIMMER (needs b10353+). "
+                        "Set Backend to 'llama-server' and load again.")
+
+            # Same story for Flash-Next, plus one of its own: its chat template is
+            # driven by chat_template_kwargs and a separate reasoning_content field on
+            # each assistant turn, and llama-cpp-python supports neither - even on a
+            # build new enough to know the qwen4_exp architecture the transcript would
+            # come out wrong.
+            if is_qwen_flash_next:
+                self.model_type = "qwen-flash-next"
+                return ("Error: Qwen3.8-Flash-Next requires the llama-server backend. "
+                        "llama-cpp-python vendors its own llama.cpp build, which almost "
+                        "certainly has no qwen4_exp architecture, and it cannot send the "
+                        "chat_template_kwargs (reasoning_effort, preserve_thinking) or the "
+                        "per-turn reasoning_content this model's template needs. "
                         "Set Backend to 'llama-server' and load again.")
 
             # Set model type tracking. Kimi is text-only here because llama-cpp-python
@@ -1187,15 +1265,41 @@ class LlamaCppVLM:
         # Kimi is tested first - K2/K2.6 are built on deepseek2 but are their own family.
         is_kimi = is_kimi_model(model_name, model_path)
         is_muse_glimmer = is_muse_glimmer_model(model_name, model_path)
+        is_qwen_flash_next = is_qwen_flash_next_model(model_name, model_path)
         is_deepseek = not is_kimi and not is_muse_glimmer and ("deepseek" in model_name.lower() or "deepseek" in model_path.lower())
         extra_args_str = extra_args or ""
 
         # --jinja is mandatory for every family whose chat handler llama.cpp only
-        # reaches through the GGUF's embedded template. chat_template_kwargs
-        # (Kimi's instant mode, Muse Glimmer's reasoning_strength) are inert without it.
-        if is_deepseek or is_kimi or is_muse_glimmer:
+        # reaches through a jinja chat template. chat_template_kwargs (Kimi's instant
+        # mode, Muse Glimmer's reasoning_strength, Flash-Next's reasoning_effort and
+        # preserve_thinking) are inert without it, and --chat-template-file below is
+        # only honoured for a jinja template.
+        if is_deepseek or is_kimi or is_muse_glimmer or is_qwen_flash_next:
             if "--jinja" not in extra_args_str:
                 cmd.append("--jinja")
+
+        # Flash-Next: hand llama-server Qwen's own template rather than the one baked
+        # into the quant. The day-one conversions predate the reasoning_effort /
+        # preserve_thinking / reasoning_content contract the model was trained on, so
+        # the embedded one renders prior assistant turns wrong. An explicit
+        # --chat-template(-file) in Extra Args wins, so this is still overridable.
+        if is_qwen_flash_next:
+            print("[llama-server] Qwen3.8-Flash-Next detected (qwen4_exp architecture)")
+            if any(f in extra_args_str for f in ("--chat-template-file", "--chat-template")):
+                print("[llama-server] Chat template supplied in Extra Args - using yours")
+            elif os.path.exists(QWEN_FLASH_NEXT_TEMPLATE):
+                cmd.extend(["--chat-template-file", QWEN_FLASH_NEXT_TEMPLATE])
+                print(f"[llama-server] Chat template: {QWEN_FLASH_NEXT_TEMPLATE}")
+                print("[llama-server]   (overrides the GGUF's embedded template, which on the")
+                print("[llama-server]    day-one conversions renders prior turns' reasoning wrong)")
+            else:
+                print(f"[llama-server] WARNING: {QWEN_FLASH_NEXT_TEMPLATE} is missing - falling")
+                print("[llama-server]   back to the template embedded in the GGUF, which may be stale")
+            print("[llama-server] Reasoning Level maps to reasoning_effort: low / medium /")
+            print("[llama-server]   xhigh (the model's own default; 'high' is sent as xhigh)")
+            if not (mmproj_path and os.path.exists(mmproj_path)):
+                print("[llama-server] No mmproj found - text only. Flash-Next is multimodal;")
+                print("[llama-server]   vision needs the mmproj-*.gguf from the same GGUF repo")
 
         # Only the <think>-emitting families need the deepseek reasoning parser.
         # Muse Glimmer is deliberately excluded: llama.cpp's default
@@ -1371,6 +1475,10 @@ class LlamaCppVLM:
                 self.model_type = "muse-glimmer"
             elif is_kimi:
                 self.model_type = "kimi"
+            elif is_qwen_flash_next:
+                # generate_via_api keys the reasoning_content split and the
+                # reasoning_effort / preserve_thinking kwargs off this
+                self.model_type = "qwen-flash-next"
             elif is_deepseek:
                 self.model_type = "deepseek"
             else:
@@ -1442,6 +1550,10 @@ class LlamaCppVLM:
 
         # Convert messages to OpenAI-compatible format (with multimodal support)
         api_messages = []
+        #   Whether any prior assistant turn ended up carrying reasoning back to the
+        #   model. Flash-Next's preserve_thinking is set from this below. Only assistant
+        #   turns are ever plain strings here, so the split lives in that branch alone.
+        sent_reasoning = False
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -1578,7 +1690,22 @@ class LlamaCppVLM:
                 #   Whether prior reasoning is resent is extract_text_history's decision,
                 #   driven by the Send Reasoning Back checkbox. Stripping again here made
                 #   that checkbox a no-op on this backend for as long as it has existed.
-                api_messages.append({"role": role, "content": str(content)})
+                if role == "assistant" and self.model_type == "qwen-flash-next":
+                    #   Flash-Next's template builds the <think> block itself, out of
+                    #   message.reasoning_content. Reasoning left inline in content would
+                    #   be wrapped in a second, empty one - so split it out here rather
+                    #   than resending the model's own tags. Nothing is dropped: with
+                    #   Send Reasoning Back off there is no <think> block to find and the
+                    #   answer arrives unchanged.
+                    answer = strip_reasoning_for_context(str(content))
+                    reasoning = extract_reasoning_for_display(str(content))
+                    assistant_msg: Dict[str, Any] = {"role": role, "content": answer}
+                    if reasoning:
+                        assistant_msg["reasoning_content"] = reasoning
+                        sent_reasoning = True
+                    api_messages.append(assistant_msg)
+                else:
+                    api_messages.append({"role": role, "content": str(content)})
 
         if not api_messages:
             yield "Error: No message content", "Error: No message content", "0 tok/s", ""
@@ -1643,6 +1770,22 @@ class LlamaCppVLM:
             if strength in ("low", "medium", "high", "xhigh"):
                 chat_template_kwargs["reasoning_strength"] = strength
                 print(f"[llama-server] Muse Glimmer reasoning_strength={strength}")
+
+        if self.model_type == "qwen-flash-next":
+            # Flash-Next spells reasoning depth reasoning_effort, and only knows
+            # xhigh/medium/low - it raise_exception()s on anything else, which comes
+            # back as a 500, so unmapped levels (including "default") are omitted and
+            # the template's own xhigh default stands.
+            effort = QWEN_FLASH_NEXT_EFFORT.get((reasoning_level or "").strip().lower())
+            if effort:
+                chat_template_kwargs["reasoning_effort"] = effort
+                print(f"[llama-server] Qwen3.8-Flash-Next reasoning_effort={effort}")
+            # Sent either way rather than left undefined: the template defaults
+            # preserve_thinking to true, which wraps every reasoning-free prior turn in
+            # an empty <think></think>. With Send Reasoning Back off there is nothing to
+            # preserve, so say so.
+            chat_template_kwargs["preserve_thinking"] = sent_reasoning
+            print(f"[llama-server] Qwen3.8-Flash-Next preserve_thinking={sent_reasoning}")
 
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
@@ -1919,7 +2062,8 @@ class LlamaCppVLM:
             every_other_frame: If True, use every other frame from videos
             stream: If True, yields partial responses as a generator
             reasoning_level: Muse Glimmer reasoning_strength (low, medium, high,
-                xhigh) / GPT-OSS reasoning level. "default" leaves it to the model.
+                xhigh) / Qwen3.8-Flash-Next reasoning_effort (high maps to its xhigh)
+                / GPT-OSS reasoning level. "default" leaves it to the model.
             thinking: If False, ask the server to skip reasoning (Kimi K2.6 instant mode).
                 Only honoured by the llama-server backend.
 
@@ -2353,10 +2497,6 @@ last_turn: Optional[Dict[str, Any]] = None
 #   `python vlm.py` keeps working on its own.
 FORGE = None
 
-#   Anchored to this file rather than the process CWD: embedded in the webui the CWD happens
-#   to be the repo root too, but nothing guarantees it.
-_VLM_DIR = os.path.dirname(os.path.abspath(__file__))
-
 # Default settings file path
 SETTINGS_FILE = os.path.join(_VLM_DIR, "vlm_settings.json")
 # System prompt presets file path
@@ -2402,7 +2542,7 @@ DEFAULT_SETTINGS = {
     "keep_reasoning": True,
     # "default" = send nothing and let the model's own default stand. Naming a level
     # here would silently downgrade Muse Glimmer from its native "high".
-    "reasoning_level": "default",  # Muse Glimmer strength / GPT-OSS effort
+    "reasoning_level": "default",  # Muse Glimmer strength / Flash-Next effort / GPT-OSS effort
     "thinking_mode": True,  # Kimi K2.6: off = instant mode (llama-server backend only)
     # Batch Caption Settings
     "batch_system_prompt": "You are an image captioning assistant. Provide detailed, accurate descriptions suitable for training image generation models.",
@@ -4110,7 +4250,7 @@ def create_ui(nested: bool = False):
                     label="Reasoning Level",
                     choices=["default", "low", "medium", "high", "xhigh"],
                     value=saved_settings.get("reasoning_level", DEFAULT_SETTINGS["reasoning_level"]),
-                    info="Muse Glimmer reasoning strength (xhigh included) / GPT-OSS effort. default = model's own",
+                    info="Muse Glimmer reasoning strength / Qwen3.8-Flash-Next reasoning effort (high is sent as xhigh) / GPT-OSS effort. default = model's own",
                 )
                 thinking_mode = gr.Checkbox(
                     label="Thinking Mode",

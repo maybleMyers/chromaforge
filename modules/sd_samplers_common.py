@@ -36,8 +36,21 @@ def setup_img2img_steps(p, steps=None):
 approximation_indexes = {"Full": 0, "Approx NN": 1, "Approx cheap": 2, "TAESD": 3}
 
 
+def legacy_sd_latents(model):
+    """True when the model's latents are SD-VAE compatible (4 channels), so the
+    sd_vae_approx/TAESD preview networks can decode them. Flow models (MOSS 128ch,
+    Flux/Z-Image/Krea2 16ch) need full VAE decode for previews."""
+    try:
+        vae = model.forge_objects.vae
+        if vae is None:
+            return True
+        return int(getattr(vae, 'latent_channels', 4)) == 4
+    except Exception:
+        return True
+
+
 def samples_to_images_tensor(sample, approximation=None, model=None):
-    """Transforms latent/pixel space tensors into RGB image tensors, with values in range [-1, 1]."""
+    """Transforms latent/pixel space tensors into RGB image tensors with values in range [-1, 1]."""
 
     if model is None:
         model = shared.sd_model
@@ -51,6 +64,9 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
         approximation = approximation_indexes.get(opts.show_progress_type, 0)
         if approximation == 0:
             approximation = 1
+
+    if not legacy_sd_latents(model) and approximation in (1, 2, 3):
+        approximation = 0
 
     if approximation == 2:
         x_sample = sd_vae_approx.cheap_approximation(sample)
@@ -103,6 +119,9 @@ def images_tensor_to_samples(image, approximation=None, model=None):
     '''image[0, 1] -> latent'''
     if approximation is None:
         approximation = approximation_indexes.get(opts.sd_vae_encode_method, 0)
+
+    if approximation == 3 and model is not None and not legacy_sd_latents(model):
+        approximation = 0
 
     if approximation == 3:
         image = image.to(devices.device, devices.dtype)

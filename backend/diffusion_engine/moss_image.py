@@ -281,7 +281,9 @@ class MossImage(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
-        memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+        # Quantizing/loading the text encoder needs a large transient; demand
+        # enough memory that other resident models (the DiT) get evicted first.
+        memory_management.load_models_gpu([self.forge_objects.clip.patcher], memory_required=int(8 * 1024 ** 3))
 
         model = self.forge_objects.clip.cond_stage_model.moss
         tokenizer = self.forge_objects.clip.tokenizer.moss

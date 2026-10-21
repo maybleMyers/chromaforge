@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import time
 
+import modules.hf_hub_compat  # noqa: F401  huggingface_hub>=1.0 shim; must run before gradio import
+
 from fastapi import Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse

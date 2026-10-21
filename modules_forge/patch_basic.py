@@ -80,10 +80,10 @@ def patch_all_basics():
 
     from huggingface_hub.file_download import _download_to_tmp_and_move as original_download_to_tmp_and_move
 
-    def patched_download_to_tmp_and_move(incomplete_path, destination_path, url_to_download, proxies, headers, expected_size, filename, force_download):
-        incomplete_path = long_path_prefix(incomplete_path)
-        destination_path = long_path_prefix(destination_path)
-        return original_download_to_tmp_and_move(incomplete_path, destination_path, url_to_download, proxies, headers, expected_size, filename, force_download)
+    def patched_download_to_tmp_and_move(*args, **kwargs):
+        args = [long_path_prefix(a) if isinstance(a, Path) else a for a in args]
+        kwargs = {k: long_path_prefix(v) if isinstance(v, Path) else v for k, v in kwargs.items()}
+        return original_download_to_tmp_and_move(*args, **kwargs)
 
     file_download._download_to_tmp_and_move = patched_download_to_tmp_and_move
 

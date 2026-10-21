@@ -43,6 +43,17 @@ opt_C = 4
 opt_f = 8
 
 
+def latent_downscale_factor():
+    """Downscale factor of the loaded model's latent space (8 for most models, 16 for MOSS)."""
+    try:
+        vae = shared.sd_model.forge_objects.vae
+        if vae is not None and getattr(vae, 'downscale_ratio', None):
+            return int(vae.downscale_ratio)
+    except Exception:
+        pass
+    return opt_f
+
+
 def setup_color_correction(image):
     logging.info("Calibrating color correction.")
     correction_target = cv2.cvtColor(np.asarray(image.copy()), cv2.COLOR_RGB2LAB)
@@ -931,8 +942,8 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         if 'forge_preset' not in p.override_settings and p.preset_override is not None and p.preset_override != shared.opts.forge_preset:
             shared.opts.set('forge_preset', p.preset_override)
 
-        # Krea2 patchifies latents 2x2, so pixel dimensions must be multiples of 16
-        if shared.opts.forge_preset == 'krea2':
+        # Krea2/MOSS patchify latents 2x2, so pixel dimensions must be multiples of 16
+        if shared.opts.forge_preset in ('krea2', 'moss'):
             for dim_attr in ('width', 'height'):
                 v = getattr(p, dim_attr, 0)
                 if v:
@@ -1191,6 +1202,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             else:
                 # Regular models with VAE - use latent space
                 latent_channels = shared.sd_model.forge_objects.vae.latent_channels
+                opt_f = latent_downscale_factor()
                 p.rng = rng.ImageRNG((latent_channels, p.height // opt_f, p.width // opt_f), p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
 
             if p.scripts is not None:
@@ -1522,6 +1534,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.cached_hr_c = StableDiffusionProcessingTxt2Img.cached_hr_c
 
     def calculate_target_resolution(self):
+        opt_f = latent_downscale_factor()
         if opts.use_old_hires_fix_width_height and self.applied_old_hires_behavior_to != (self.width, self.height):
             self.hr_resize_x = self.width
             self.hr_resize_y = self.height
@@ -1560,8 +1573,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                 self.truncate_x = (self.hr_upscale_to_x - target_w) // opt_f
                 self.truncate_y = (self.hr_upscale_to_y - target_h) // opt_f
 
-        if shared.opts.forge_preset == 'krea2':
-            # Krea2 patchifies latents 2x2: the sampled hires resolution (after truncation) must be a multiple of 16
+        if shared.opts.forge_preset in ('krea2', 'moss'):
+            # Krea2/MOSS patchify latents 2x2: the sampled hires resolution (after truncation) must be a multiple of 16
             target_x = max(64, (self.hr_upscale_to_x - self.truncate_x * opt_f) // 16 * 16)
             target_y = max(64, (self.hr_upscale_to_y - self.truncate_y * opt_f) // 16 * 16)
             self.truncate_x = (self.hr_upscale_to_x - target_x) // opt_f
@@ -1787,7 +1800,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             for i in range(samples.shape[0]):
                 save_intermediate(samples, i)
 
-            samples = torch.nn.functional.interpolate(samples, size=(target_height // opt_f, target_width // opt_f), mode=self.latent_scale_mode["mode"], antialias=self.latent_scale_mode["antialias"])
+            samples = torch.nn.functional.interpolate(samples, size=(target_height // latent_downscale_factor(), target_width // latent_downscale_factor()), mode=self.latent_scale_mode["mode"], antialias=self.latent_scale_mode["antialias"])
 
             # Avoid making the inpainting conditioning unless necessary as
             # this does need some extra compute to decode / encode the image again.
@@ -2149,7 +2162,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
         devices.torch_gc()
 
         if self.resize_mode == 3:
-            self.init_latent = torch.nn.functional.interpolate(self.init_latent, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+            self.init_latent = torch.nn.functional.interpolate(self.init_latent, size=(self.height // latent_downscale_factor(), self.width // latent_downscale_factor()), mode="bilinear")
 
         if image_mask is not None:
             init_mask = latent_mask

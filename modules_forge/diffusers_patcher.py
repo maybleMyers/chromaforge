@@ -2,7 +2,7 @@ import torch
 from backend import operations, memory_management
 from backend.patcher.base import ModelPatcher
 
-from transformers import modeling_utils
+from transformers.initialization import no_init_weights
 
 
 class DiffusersModelPatcher:
@@ -16,7 +16,7 @@ class DiffusersModelPatcher:
         self.dtype = dtype
 
         with operations.using_forge_operations():
-            with modeling_utils.no_init_weights():
+            with no_init_weights():
                 self.pipeline = pipeline_class.from_pretrained(*args, **kwargs)
 
         if hasattr(self.pipeline, 'unet'):

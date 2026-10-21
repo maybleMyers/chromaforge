@@ -378,6 +378,53 @@ def list_models():
         checkpoint_info = CheckpointInfo(filename)
         checkpoint_info.register()
 
+    register_moss_bundles()
+
+
+class MossBundleInfo(CheckpointInfo):
+    """Virtual checkpoint entry for a MOSS-Image model directory (diffusers
+    bundle: transformer/ + text_encoder/ + vae/ + tokenizer/)."""
+
+    def __init__(self, path):
+        self.filename = path
+        name = os.path.basename(path)
+        self.is_safetensors = False
+        self.metadata = {}
+        self.modelspec_thumbnail = None
+        self.name = name
+        self.name_for_extra = name
+        self.model_name = name
+        self.hash = 0
+        self.sha256 = None
+        self.shorthash = None
+        self.title = name
+        self.short_title = name
+        self.ids = [name, self.title, self.model_name, self.name_for_extra]
+        self._architecture = 'MOSS'
+
+    def register(self):
+        checkpoints_list[self.title] = self
+        for id in self.ids:
+            checkpoint_aliases[id] = self
+
+    def calculate_shorthash(self):
+        self.sha256 = None
+        return None
+
+
+def register_moss_bundles():
+    try:
+        from backend.nn.moss_image import scan_bundles
+        paths = scan_bundles()
+    except Exception as e:
+        print(f'[MOSS] Could not scan model bundles: {e}')
+        return
+
+    known = {info.filename for info in checkpoints_list.values()}
+    for path in paths:
+        if path not in known:
+            MossBundleInfo(path).register()
+
 
 re_strip_checksum = re.compile(r"\s*\[[^]]+]\s*$")
 

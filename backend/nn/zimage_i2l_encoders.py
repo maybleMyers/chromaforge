@@ -18,7 +18,11 @@ import os
 
 # Import from transformers
 try:
-    from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer, SiglipVisionConfig
+    from transformers.models.siglip.modeling_siglip import SiglipVisionConfig
+    try:
+        from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer
+    except ImportError:  # transformers >= 5.0 merged SiglipVisionTransformer into SiglipVisionModel
+        from transformers.models.siglip.modeling_siglip import SiglipVisionModel as SiglipVisionTransformer
     from transformers import SiglipImageProcessor
     SIGLIP_AVAILABLE = True
 except ImportError:

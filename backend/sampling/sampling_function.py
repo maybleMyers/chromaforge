@@ -504,6 +504,15 @@ def sampling_prepare(unet, x, p=None):
             )
             print(f"Krea2: Auto mu for {H}x{W} latents (seq_len={image_seq_len}, mu={real_model.predictor.mu:.4f})")
 
+    is_moss = getattr(getattr(real_model, 'config', None), 'is_moss', False)
+
+    if is_moss and hasattr(real_model, 'predictor') and hasattr(real_model.predictor, 'set_shift'):
+        moss_shift = getattr(p, 'moss_shift', 0.0) if p is not None else 0.0
+        if not moss_shift:
+            moss_shift = getattr(opts, 'moss_shift_override', 5.0)
+        if moss_shift > 0:
+            real_model.predictor.set_shift(moss_shift)
+
     # Set up APG (Adaptive Projected Guidance) if enabled
     # Read from p first, fall back to opts
     apg_enabled = getattr(p, 'apg_enabled', None) if p else None

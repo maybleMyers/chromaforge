@@ -166,7 +166,7 @@ class ForgeOperations:
                     return self._conv_forward(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
-                return super()._conv_forward(input, weight, bias)
+                return super()._conv_forward(x, weight, bias)
 
     class Conv1d(torch.nn.Conv1d):
 
@@ -186,7 +186,7 @@ class ForgeOperations:
                     return self._conv_forward(x, weight, bias)
             else:
                 weight, bias = get_weight_and_bias(self)
-                return super()._conv_forward(input, weight, bias)
+                return super()._conv_forward(x, weight, bias)
 
     class ConvTranspose2d(torch.nn.ConvTranspose2d):
 

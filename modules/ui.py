@@ -467,10 +467,10 @@ def expand_prompt_standalone(prompt: str, model_path: str, system_prompt: str = 
                         max_memory=max_memory,
                     )
                 except ImportError:
-                    # Fall back to AutoModelForVision2Seq if specific class not available
-                    log_step("  Qwen3VLMoeForConditionalGeneration not available, using AutoModelForVision2Seq")
-                    from transformers import AutoModelForVision2Seq
-                    _expansion_model_cache['model'] = AutoModelForVision2Seq.from_pretrained(
+                    # Fall back to AutoModelForImageTextToText if specific class not available
+                    log_step("  Qwen3VLMoeForConditionalGeneration not available, using AutoModelForImageTextToText")
+                    from transformers import AutoModelForImageTextToText
+                    _expansion_model_cache['model'] = AutoModelForImageTextToText.from_pretrained(
                         model_path,
                         torch_dtype=torch.bfloat16,
                         device_map="auto",

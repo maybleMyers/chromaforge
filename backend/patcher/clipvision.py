@@ -4,7 +4,8 @@ from backend.utils import load_torch_file
 from backend.state_dict import transformers_convert, state_dict_prefix_replace
 from backend import operations, memory_management
 from backend.patcher.base import ModelPatcher
-from transformers import modeling_utils, CLIPVisionConfig, CLIPVisionModelWithProjection
+from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
+from transformers.initialization import no_init_weights
 
 
 CLIP_VISION_G = {
@@ -101,7 +102,7 @@ class ClipVisionModel:
             self.dtype = torch.float32
 
         with operations.using_forge_operations():
-            with modeling_utils.no_init_weights():
+            with no_init_weights():
                 self.model = CLIPVisionModelWithProjection(config)
 
         self.model.to(self.dtype)

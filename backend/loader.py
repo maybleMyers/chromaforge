@@ -224,7 +224,7 @@ def convert_comfy_zimage_state_dict(state_dict):
     return new_state_dict
 
 from diffusers import DiffusionPipeline
-from transformers import modeling_utils
+from transformers.initialization import no_init_weights
 
 from backend import memory_management
 from backend.utils import read_arbitrary_config, load_torch_file, beautiful_print_gguf_state_dict_statics
@@ -322,7 +322,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             to_args = dict(device=memory_management.cpu, dtype=memory_management.text_encoder_dtype())
 
-            with modeling_utils.no_init_weights():
+            with no_init_weights():
                 with using_forge_operations(**to_args, manual_cast_enabled=True):
                     model = IntegratedCLIP(CLIPTextModel, config, add_text_projection=True).to(**to_args)
 
@@ -353,11 +353,11 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 print(f'Using Default T5 Data Type: {storage_dtype}')
 
             if storage_dtype in ['nf4', 'fp4', 'gguf']:
-                with modeling_utils.no_init_weights():
+                with no_init_weights():
                     with using_forge_operations(device=memory_management.cpu, dtype=memory_management.text_encoder_dtype(), manual_cast_enabled=False, bnb_dtype=storage_dtype):
                         model = IntegratedT5(config)
             else:
-                with modeling_utils.no_init_weights():
+                with no_init_weights():
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
                         model = IntegratedT5(config)
 
@@ -406,11 +406,11 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             cls = getattr(importlib.import_module('transformers'), cls_name)
 
             if storage_dtype in ['nf4', 'fp4', 'gguf']:
-                with modeling_utils.no_init_weights():
+                with no_init_weights():
                     with using_forge_operations(device=memory_management.cpu, dtype=text_encoder_dtype, manual_cast_enabled=False, bnb_dtype=storage_dtype):
                         model = cls(config)
             else:
-                with modeling_utils.no_init_weights():
+                with no_init_weights():
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
                         model = cls(config)
 
@@ -1121,6 +1121,15 @@ def forge_loader(sd, additional_state_dicts=None, preset=None):
 
         print("DEBUG: Loaded Krea2 components:", list(state_dicts.keys()))
         return Krea2(state_dicts=state_dicts)
+
+    if preset == 'moss':
+        from backend.diffusion_engine.moss_image import MossImage
+
+        bundle_path = sd if isinstance(sd, str) else getattr(sd, 'filename', None)
+        assert bundle_path is not None and os.path.isdir(bundle_path), (
+            f'MOSS preset needs a model directory (transformer/text_encoder/vae/tokenizer), got: {sd}. '
+            'Select a "MOSS-Image" entry in the checkpoint dropdown.')
+        return MossImage(bundle_path=bundle_path)
 
     try:
         state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)

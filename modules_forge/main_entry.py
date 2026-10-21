@@ -96,7 +96,7 @@ def make_checkpoint_selection_components():
     They are rendered into the quicksettings row by make_checkpoint_manager_ui()."""
     global ui_checkpoint, ui_vae, ui_forge_preset
 
-    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'chroma2', 'z', 'krea2', 'all'], elem_id="forge_ui_preset", render=False)
+    ui_forge_preset = gr.Radio(label="UI", value=lambda: shared.opts.forge_preset, choices=['sd', 'xl', 'flux', 'chroma', 'chroma2', 'z', 'krea2', 'moss', 'all'], elem_id="forge_ui_preset", render=False)
 
     if shared.opts.sd_model_checkpoint in [None, 'None', 'none', '']:
         if len(sd_models.checkpoints_list) == 0:
@@ -725,6 +725,43 @@ def preset_updates(preset=None):
             gr.update(visible=False),                                                    # ui_img2img_zimage_shift
         ]
 
+    if shared.opts.forge_preset == 'moss':
+        ckpt_list, _ = refresh_models()
+        ui_checkpoint.choices = ckpt_list
+        model_mem = getattr(shared.opts, "moss_GPU_MB", total_vram - 1024)
+        if model_mem < 0 or model_mem > total_vram:
+            model_mem = total_vram - 1024
+        snap16 = lambda v: max(64, round(v / 16) * 16)
+        return [
+            gr.update(visible=False),  # ui_vae (MOSS bundles its own VAE + text encoder)
+            gr.update(visible=False, value=1),  # ui_clip_skip
+            gr.update(visible=True, value='Automatic'),  # ui_forge_unet_storage_dtype_options
+            gr.update(visible=True, value=shared.opts.forge_async_loading),  # ui_forge_async_loading
+            gr.update(visible=True, value='CPU'),  # ui_forge_pin_shared_memory
+            gr.update(visible=True, value=model_mem),  # ui_forge_inference_memory
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "moss_t2i_width", 1024))),  # ui_txt2img_width (MOSS patchifies latents 2x2: multiples of 16 only)
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "moss_i2i_width", 1024))),  # ui_img2img_width
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "moss_t2i_height", 1024))),  # ui_txt2img_height
+            gr.update(maximum=3072, step=16, value=snap16(getattr(shared.opts, "moss_i2i_height", 1024))),  # ui_img2img_height
+            gr.update(value=getattr(shared.opts, "moss_t2i_cfg", 3.0)),  # ui_txt2img_cfg
+            gr.update(value=getattr(shared.opts, "moss_i2i_cfg", 3.0)),  # ui_img2img_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_distilled_cfg
+            gr.update(visible=False, value=0),  # ui_img2img_distilled_cfg
+            gr.update(value=getattr(shared.opts, "moss_t2i_sampler", 'Euler')),  # ui_txt2img_sampler
+            gr.update(value=getattr(shared.opts, "moss_i2i_sampler", 'Euler')),  # ui_img2img_sampler
+            gr.update(value=getattr(shared.opts, "moss_t2i_scheduler", 'Simple')),  # ui_txt2img_scheduler
+            gr.update(value=getattr(shared.opts, "moss_i2i_scheduler", 'Simple')),  # ui_img2img_scheduler
+            gr.update(visible=True, value=getattr(shared.opts, "moss_t2i_hr_cfg", 3.0)),  # ui_txt2img_hr_cfg
+            gr.update(visible=False, value=0),  # ui_txt2img_hr_distilled_cfg
+            gr.update(value=getattr(shared.opts, "moss_t2i_steps", 50)),  # ui_txt2img_steps
+            gr.update(value=getattr(shared.opts, "moss_i2i_steps", 30)),  # ui_img2img_steps
+            gr.update(visible=False),  # ui_z_transformer_dtype
+            gr.update(visible=False),  # ui_z_vae_dtype
+            gr.update(visible=False),  # ui_z_text_encoder_dtype
+            gr.update(visible=False),  # ui_txt2img_zimage_shift
+            gr.update(visible=False),  # ui_img2img_zimage_shift
+        ]
+
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
     ui_settings_from_file = loadsave.ui_settings.copy()
 
@@ -842,6 +879,25 @@ shared.options_templates.update(shared.options_section(('ui_krea2', "UI defaults
     "krea2_i2i_cfg":      shared.OptionInfo(1,    "img2img CFG",                  gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
     "krea2_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)",gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
     "krea2_shift_override": shared.OptionInfo(1.15, "Timestep shift mu (1.15 for Turbo; 0 = derive from resolution, for Raw)", gr.Slider, {"minimum": 0, "maximum": 5, "step": 0.01}),
+}))
+shared.options_templates.update(shared.options_section(('ui_moss', "UI defaults 'moss' (MOSS-Image)", "ui"), {
+    "moss_t2i_width":    shared.OptionInfo(1024, "txt2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "moss_t2i_height":   shared.OptionInfo(1024, "txt2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "moss_t2i_steps":    shared.OptionInfo(50, "txt2img steps",                  gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
+    "moss_t2i_sampler":  shared.OptionInfo('Euler', "txt2img sampler"),
+    "moss_t2i_scheduler": shared.OptionInfo('Simple', "txt2img scheduler"),
+    "moss_t2i_cfg":      shared.OptionInfo(3.0, "txt2img CFG",                   gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
+    "moss_t2i_hr_cfg":   shared.OptionInfo(3.0, "txt2img HiRes CFG",             gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
+    "moss_i2i_width":    shared.OptionInfo(1024, "img2img width",                gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "moss_i2i_height":   shared.OptionInfo(1024, "img2img height",               gr.Slider, {"minimum": 64, "maximum": 3072, "step": 16}),
+    "moss_i2i_steps":    shared.OptionInfo(30, "img2img steps",                  gr.Slider, {"minimum": 1,  "maximum": 150, "step": 1}),
+    "moss_i2i_sampler":  shared.OptionInfo('Euler', "img2img sampler"),
+    "moss_i2i_scheduler": shared.OptionInfo('Simple', "img2img scheduler"),
+    "moss_i2i_cfg":      shared.OptionInfo(3.0, "img2img CFG",                   gr.Slider, {"minimum": 1,  "maximum": 30,   "step": 0.1}),
+    "moss_GPU_MB":       shared.OptionInfo(total_vram - 1024, "GPU Weights (MB)", gr.Slider, {"minimum": 0,  "maximum": total_vram,   "step": 1}),
+    "moss_shift_override": shared.OptionInfo(5.0, "Scheduler timestep shift (reference default 5.0)", gr.Slider, {"minimum": 0.5, "maximum": 10, "step": 0.1}),
+    "moss_skip_layers":  shared.OptionInfo('22', "Skip layers on the negative branch (comma separated, empty = none)", gr.Textbox, {}),
+    "moss_text_encoder_precision": shared.OptionInfo('Automatic', "MOSS Text Encoder Precision", gr.Dropdown, {"choices": ['Automatic', 'bfloat16', 'float16', 'float32', 'float8_e4m3fn', 'float8_e5m2', 'nf4', 'fp4']}),
 }))
 shared.options_templates.update(shared.options_section(('ui_z', "UI defaults 'z' (Z-Image)", "ui"), {
     "z_t2i_width":    shared.OptionInfo(1024,  "txt2img width",      gr.Slider, {"minimum": 64, "maximum": 3072, "step": 8}),

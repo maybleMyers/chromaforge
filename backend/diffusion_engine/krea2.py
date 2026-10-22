@@ -228,12 +228,16 @@ class Krea2(ForgeDiffusionEngine):
         if any(k.startswith('model.') for k in state_dict):
             state_dict = {k[len('model.'):]: v for k, v in state_dict.items() if k.startswith('model.')}
 
-        from transformers import AutoConfig, AutoTokenizer, Qwen3VLModel, modeling_utils
+        from transformers import AutoConfig, AutoTokenizer, Qwen3VLModel
+        try:
+            from transformers.initialization import no_init_weights
+        except ImportError:
+            from transformers.modeling_utils import no_init_weights
 
         text_encoder_dtype = memory_management.text_encoder_dtype()
         config = AutoConfig.from_pretrained(os.path.join(local_config_path, 'text_encoder'))
 
-        with modeling_utils.no_init_weights():
+        with no_init_weights():
             with using_forge_operations(device=memory_management.cpu, dtype=text_encoder_dtype, manual_cast_enabled=True):
                 model = Qwen3VLModel(config)
 

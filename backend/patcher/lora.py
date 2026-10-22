@@ -41,6 +41,23 @@ def model_lora_keys_clip(model, key_map={}):
 
 
 def model_lora_keys_unet(model, key_map={}):
+    # Krea2 (Krea2TransformerWrapper around SingleStreamDiT): map the mmdit-prefixed
+    # parameter names to the "diffusion_model."-prefixed aliases that krea2 LoRAs
+    # (e.g. Kroma) use, including the bare ".scale"/"mod.lin" parameter names that
+    # carry ".diff" RMSNorm/modulation deltas.
+    if hasattr(model, 'mmdit'):
+        for k in model.state_dict():
+            if not k.startswith('mmdit.'):
+                continue
+            base = k[len('mmdit.'):]
+            key_map[f'diffusion_model.{base}'] = k
+            key_map[base] = k
+            if base.endswith('.weight'):
+                b = base[:-len('.weight')]
+                key_map[f'diffusion_model.{b}'] = k
+                key_map['lora_unet_' + b.replace('.', '_')] = k
+        return key_map
+
     model_keys, key_maps = get_function('model_lora_keys_unet')(model, key_map)
 
     # TODO: OFT
